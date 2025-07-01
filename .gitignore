@@ -1,0 +1,9 @@
+exp
+/datasets
+wandb
+OUTPUT_DIR
+eval/log
+.gradio
+predict_results
+__pycache__
+prompts
