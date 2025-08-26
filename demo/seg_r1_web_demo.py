@@ -13,8 +13,9 @@ import base64
 import cv2
 from typing import List, Tuple, Optional
 from PIL import Image, ImageDraw, ImageFilter
+from pathlib import Path
 
-
+CACHE_DIR = "/root/autodl-tmp/models" 
 MODEL_PATH = "geshang/Seg-R1-7B" 
 DEVICE_QWEN = "cuda:0"
 DEVICE_SAM = "cuda:0"
@@ -25,6 +26,7 @@ model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
     torch_dtype=torch.bfloat16,
     attn_implementation="flash_attention_2",
     device_map=DEVICE_QWEN,
+    cache_dir=CACHE_DIR,
 )
 processor = AutoProcessor.from_pretrained(MODEL_PATH, use_fast=True)
 
