@@ -23,7 +23,7 @@ DS_CONFIG="seg-r1/local_scripts/zero1_no_optimizer.json"  # Note that other zero
 # e.g., the visible devices should be 0,1,2,3,4 for 5 cards, and  --nproc_per_node="4"
 
 CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7" torchrun \
-    --nproc_per_node="6" \
+    --nproc_per_node="1" \
     --nnodes="1" \
     --node_rank="0" \
     --master_addr="127.0.0.1" \
@@ -53,9 +53,10 @@ CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7" torchrun \
     --report_to wandb \
     --temperature 1.0 \
     --num_generations 4 \
-    --vllm_device "cuda:6" \
-    --sam_device "cuda:7" \
+    --vllm_device "cuda:0" \
+    --sam_device "cuda:0" \
     --vllm_gpu_memory_utilization 0.7 \
     --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
     --deepspeed ${DS_CONFIG} \
     2>&1 | tee "${OUTPUT_DIR}/training_log.txt"
+###  --nproc_per_node="6", --vllm_device cuda:6, --sam_device cuda:7
