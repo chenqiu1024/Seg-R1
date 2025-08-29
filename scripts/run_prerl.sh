@@ -9,7 +9,7 @@
 export DEBUG_MODE="true"
 export LOG_PATH="./vllm_run.txt"
 
-QWEN_PATH="Qwen/Qwen2.5-VL-7B-Instruct"
+QWEN_PATH="/root/autodl-tmp/works/Seg-Zero/pretrained_models/Qwen2.5-VL-7B-Instruct"
 HF_DATASET="DIS-5K" 
 
 OUTPUT_DIR="exp/grpo"
