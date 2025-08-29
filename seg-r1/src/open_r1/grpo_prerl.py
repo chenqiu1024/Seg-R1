@@ -130,6 +130,10 @@ class GRPOScriptArguments(ScriptArguments):
         default="train",
         metadata={"help": "Dataset split to use for training"}
     )
+    max_train_samples: Optional[int] = field(
+        default=None,
+        metadata={"help": "If set, limit the maximum number of input samples loaded from dataset_image."}
+    )
     sam_device: str = field(
         default=None,
         metadata={"help": "Device to use (e.g. 'cuda:0', 'cpu'). Auto-detects if None."}
@@ -333,6 +337,11 @@ def main(script_args: GRPOScriptArguments,
         data_dir=script_args.dataset_image,
         split=script_args.dataset_train_split,
     )
+    # Optionally cap the number of samples used for training
+    if script_args.max_train_samples is not None:
+        max_n = int(script_args.max_train_samples)
+        if max_n > 0:
+            dataset = dataset.select(range(min(max_n, len(dataset))))
     
     # Add ground truth paths and resize
     dataset = dataset.map(

@@ -143,6 +143,10 @@ class GRPOScriptArguments(ScriptArguments):
         default="train",
         metadata={"help": "Dataset split to use for training"}
     )
+    max_train_samples: Optional[int] = field(
+        default=None,
+        metadata={"help": "If set, limit the maximum number of input samples loaded from dataset_image."}
+    )
     sam_device: str = field(
         default=None,
         metadata={"help": "Device to use (e.g. 'cuda:0', 'cpu'). Auto-detects if None."}
@@ -440,6 +444,11 @@ def main(script_args, training_args, model_args):
         ds = load_dataset("imagefolder", data_files={"train": image_files}, split='train')
         image_datasets.append(ds)
     dataset = concatenate_datasets(image_datasets) 
+    # Optionally cap the number of samples used for training
+    if script_args.max_train_samples is not None:
+        max_n = int(script_args.max_train_samples)
+        if max_n > 0:
+            dataset = dataset.select(range(min(max_n, len(dataset))))
 
     def add_gt_paths(example):
         img_path = example["image"].filename

@@ -63,6 +63,16 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class SFTScriptArguments(ScriptArguments):
+    """
+    Extend base ScriptArguments with dataset sampling controls.
+    """
+    max_train_samples: Optional[int] = field(
+        default=None,
+        metadata={"help": "If set, limit the maximum number of training samples loaded from dataset."},
+    )
+
+@dataclass
 class SFTConfig(trl.SFTConfig):
     """
     args for callbacks, benchmarks etc
@@ -206,6 +216,11 @@ def main(script_args, training_args, model_args):
     ################
 
     dataset = load_dataset(script_args.dataset_name,split="train")
+    # Optionally cap the number of samples used for training
+    if getattr(script_args, "max_train_samples", None) is not None:
+        max_n = int(script_args.max_train_samples)
+        if max_n > 0:
+            dataset = dataset.select(range(min(max_n, len(dataset))))
 
     ################
     # Load tokenizer
@@ -312,6 +327,6 @@ def main(script_args, training_args, model_args):
 
 
 if __name__ == "__main__":
-    parser = TrlParser((ScriptArguments, SFTConfig, ModelConfig))
+    parser = TrlParser((SFTScriptArguments, SFTConfig, ModelConfig))
     script_args, training_args, model_args = parser.parse_args_and_config()
     main(script_args, training_args, model_args)
