@@ -364,8 +364,17 @@ def main(script_args: GRPOScriptArguments,
         raise ValueError("Dataset missing required 'image' field")
     dataset = dataset.map(create_conversation)
 
+    # Choose trainer class based on whether vLLM is enabled
+    TrainerClass = Qwen2VLGRPOVLLMTrainerModified if getattr(training_args, "use_vllm", False) else Qwen2VLGRPOTrainer
+
+    # For single-GPU (non-vLLM), ensure lower-precision weights to reduce memory
+    if not getattr(training_args, "use_vllm", False):
+        if not hasattr(training_args, "model_init_kwargs") or training_args.model_init_kwargs is None:
+            training_args.model_init_kwargs = {}
+        training_args.model_init_kwargs.setdefault("torch_dtype", "bfloat16")
+
     # Initialize and run trainer
-    trainer = SegR1Trainer(
+    trainer = TrainerClass(
         model=model_args.model_name_or_path,
         reward_funcs=reward_funcs,
         args=training_args,

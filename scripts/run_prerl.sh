@@ -19,26 +19,24 @@ fi
 RUN_NAME="Seg-R1"
 DS_CONFIG="seg-r1/local_scripts/zero1_no_optimizer.json"  # Note that other zero setting would meet bugs related to vllm at current stage.
 
-# NOTE: you are expected to use X + 1 cards for X training proc and 1 vLLM proc 
-# e.g., the visible devices should be 0,1,2,3,4 for 5 cards, and  --nproc_per_node="4"
-
-CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7" torchrun \
+# Single-GPU friendly defaults: use one visible device and disable vLLM
+CUDA_VISIBLE_DEVICES="0" torchrun \
     --nproc_per_node="1" \
     --nnodes="1" \
     --node_rank="0" \
     --master_addr="127.0.0.1" \
     --master_port="12345" \
     seg-r1/src/open_r1/grpo_prerl.py \
-    --use_vllm true \
+    --use_vllm false \
     --output_dir ${OUTPUT_DIR} \
     --model_name_or_path ${QWEN_PATH} \
     --dataset_name ${HF_DATASET} \
     --dataset_image datasets/DIS5K/DIS-TR/im \
     --dataset_gt datasets/DIS5K/DIS-TR/gt \
-    --max_prompt_length 6666 \
-    --max_completion_length 256 \
+    --max_prompt_length 2048 \
+    --max_completion_length 128 \
     --per_device_train_batch_size 1 \
-    --gradient_accumulation_steps 4 \
+    --gradient_accumulation_steps 8 \
     --learning_rate 1e-6 \
     --lr_scheduler_type "constant" \
     --logging_steps 1 \
@@ -52,11 +50,10 @@ CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7" torchrun \
     --save_only_model true \
     --report_to wandb \
     --temperature 1.0 \
-    --num_generations 4 \
-    --vllm_device "cuda:0" \
+    --num_generations 2 \
     --sam_device "cuda:0" \
-    --vllm_gpu_memory_utilization 0.7 \
     --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
-    --deepspeed ${DS_CONFIG} \
+    # For single-GPU, you can disable deepspeed to reduce overhead
+    # --deepspeed ${DS_CONFIG} \
     2>&1 | tee "${OUTPUT_DIR}/training_log.txt"
 ###  --nproc_per_node="6", --vllm_device cuda:6, --sam_device cuda:7
