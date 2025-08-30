@@ -918,3 +918,119 @@ Yes. Switching from FlashAttention 2 to SDPA increases memory use. On large VL m
 
 - If you want, I can try reinstalling a compatible flash-attn now and flip the script back to FlashAttention 2.
 
+///////////////////////////////////////
+
+============================================================
+(seg-r1) root@autodl-container-d7654382a6-9240b673:~/autodl-tmp/works/Seg-R1# python demo/seg_r1_web_demo.py 
+Loading checkpoint shards: 100%|████████████████████████████████████████████████████████████████████████| 4/4 [01:27<00:00, 21.86s/it]
+preprocessor_config.json: 100%|██████████████████████████████████████████████████████████████████████| 574/574 [00:00<00:00, 6.24MB/s]
+tokenizer_config.json: 5.88kB [00:00, 30.2MB/s]
+vocab.json: 2.78MB [00:00, 173MB/s]
+merges.txt: 100%|█████████████████████████████████████████████████████████████████████████████████| 1.67M/1.67M [00:00<00:00, 184MB/s]
+tokenizer.json: 100%|████████████████████████████████████████████████████████████████████████████| 11.4M/11.4M [00:02<00:00, 5.52MB/s]
+added_tokens.json: 100%|█████████████████████████████████████████████████████████████████████████████| 605/605 [00:00<00:00, 7.23MB/s]
+special_tokens_map.json: 100%|███████████████████████████████████████████████████████████████████████| 613/613 [00:00<00:00, 7.43MB/s]
+chat_template.json: 100%|████████████████████████████████████████████████████████████████████████| 1.05k/1.05k [00:00<00:00, 12.1MB/s]
+* Running on local URL:  http://127.0.0.1:7860
+2025/08/30 15:41:03 [W] [service.go:132] login to server failed: session shutdown
+
+Could not create share link. Please check your internet connection or our status page: https://status.gradio.app.
+
+
+
+
+
+
+
+Traceback (most recent call last):
+  File "/root/autodl-tmp/envs/seg-r1/lib/python3.11/site-packages/gradio/queueing.py", line 626, in process_events
+    response = await route_utils.call_process_api(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/autodl-tmp/envs/seg-r1/lib/python3.11/site-packages/gradio/route_utils.py", line 349, in call_process_api
+    output = await app.get_blocks().process_api(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/autodl-tmp/envs/seg-r1/lib/python3.11/site-packages/gradio/blocks.py", line 2274, in process_api
+    result = await self.call_function(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/autodl-tmp/envs/seg-r1/lib/python3.11/site-packages/gradio/blocks.py", line 1781, in call_function
+    prediction = await anyio.to_thread.run_sync(  # type: ignore
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/autodl-tmp/envs/seg-r1/lib/python3.11/site-packages/anyio/to_thread.py", line 56, in run_sync
+    return await get_async_backend().run_sync_in_worker_thread(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/autodl-tmp/envs/seg-r1/lib/python3.11/site-packages/anyio/_backends/_asyncio.py", line 2476, in run_sync_in_worker_thread
+    return await future
+           ^^^^^^^^^^^^
+  File "/root/autodl-tmp/envs/seg-r1/lib/python3.11/site-packages/anyio/_backends/_asyncio.py", line 967, in run
+    result = context.run(func, *args)
+             ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/autodl-tmp/envs/seg-r1/lib/python3.11/site-packages/gradio/utils.py", line 909, in wrapper
+    response = f(*args, **kwargs)
+               ^^^^^^^^^^^^^^^^^^
+  File "/root/autodl-tmp/works/Seg-R1/demo/seg_r1_web_demo.py", line 196, in run_pipeline
+    output_text = answer_question(messages)[0]
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/autodl-tmp/works/Seg-R1/demo/seg_r1_web_demo.py", line 146, in answer_question
+    outputs = model.generate(**inputs, use_cache=True, max_new_tokens=1024)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/autodl-tmp/envs/seg-r1/lib/python3.11/site-packages/torch/utils/_contextlib.py", line 116, in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/root/autodl-tmp/envs/seg-r1/lib/python3.11/site-packages/transformers/generation/utils.py", line 2223, in generate
+    result = self._sample(
+             ^^^^^^^^^^^^^
+  File "/root/autodl-tmp/envs/seg-r1/lib/python3.11/site-packages/transformers/generation/utils.py", line 3211, in _sample
+    outputs = self(**model_inputs, return_dict=True)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/autodl-tmp/envs/seg-r1/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/autodl-tmp/envs/seg-r1/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/autodl-tmp/envs/seg-r1/lib/python3.11/site-packages/transformers/models/qwen2_5_vl/modeling_qwen2_5_vl.py", line 1795, in forward
+    image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/autodl-tmp/envs/seg-r1/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/autodl-tmp/envs/seg-r1/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/autodl-tmp/envs/seg-r1/lib/python3.11/site-packages/transformers/models/qwen2_5_vl/modeling_qwen2_5_vl.py", line 558, in forward
+    hidden_states = blk(hidden_states, cu_seqlens=cu_seqlens_now, position_embeddings=position_embeddings)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/autodl-tmp/envs/seg-r1/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/autodl-tmp/envs/seg-r1/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/autodl-tmp/envs/seg-r1/lib/python3.11/site-packages/transformers/models/qwen2_5_vl/modeling_qwen2_5_vl.py", line 351, in forward
+    hidden_states = hidden_states + self.attn(
+                                    ^^^^^^^^^^
+  File "/root/autodl-tmp/envs/seg-r1/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/autodl-tmp/envs/seg-r1/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/autodl-tmp/envs/seg-r1/lib/python3.11/site-packages/transformers/models/qwen2_5_vl/modeling_qwen2_5_vl.py", line 201, in forward
+    q, k = apply_rotary_pos_emb_flashatt(q.unsqueeze(0), k.unsqueeze(0), cos, sin)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/autodl-tmp/envs/seg-r1/lib/python3.11/site-packages/transformers/models/qwen2_5_vl/modeling_qwen2_5_vl.py", line 168, in apply_rotary_pos_emb_flashatt
+    q_embed = apply_rotary_emb(q.float(), cos, sin).type_as(q)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/autodl-tmp/envs/seg-r1/lib/python3.11/site-packages/flash_attn/layers/rotary.py", line 121, in apply_rotary_emb
+    return ApplyRotaryEmb.apply(
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/root/autodl-tmp/envs/seg-r1/lib/python3.11/site-packages/torch/autograd/function.py", line 575, in apply
+    return super().apply(*args, **kwargs)  # type: ignore[misc]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/autodl-tmp/envs/seg-r1/lib/python3.11/site-packages/flash_attn/layers/rotary.py", line 51, in forward
+    out = apply_rotary(
+          ^^^^^^^^^^^^^
+  File "/root/autodl-tmp/envs/seg-r1/lib/python3.11/site-packages/flash_attn/ops/triton/rotary.py", line 159, in apply_rotary
+    torch.library.wrap_triton(rotary_kernel)[grid](
+    ^^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: module 'torch.library' has no attribute 'wrap_triton'
