@@ -8,6 +8,7 @@
 
 export DEBUG_MODE="true"
 export LOG_PATH="./vllm_run.txt"
+export WANDB_DISABLED="true"
 
 QWEN_PATH="/root/autodl-tmp/works/Seg-Zero/pretrained_models/Qwen2.5-VL-7B-Instruct"
 HF_DATASET="DIS-5K" 
@@ -48,7 +49,7 @@ CUDA_VISIBLE_DEVICES="0" torchrun \
     --save_steps 200 \
     --save_total_limit 10 \
     --save_only_model true \
-    --report_to wandb \
+    --report_to none \
     --temperature 1.0 \
     --num_generations 2 \
     --sam_device "cuda:0" \
