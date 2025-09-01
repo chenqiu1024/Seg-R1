@@ -1,0 +1,35 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python Debugger: Current File with Arguments",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "args": "${command:pickArgs}"
+        },
+        {
+            "name": "Seg-R1: Convert Medical Decathlon Task",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "/root/autodl-tmp/envs/seg-r1/bin/python",
+            "program": "${workspaceFolder}/utils/mddecathlon_to_segr1.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "args": [
+                "--input_root", "datasets/medical_decathlon/Task02_Heart",
+                "--output_root", "datasets/seg_r1_md",
+                "--task_name", "Task02_Heart",
+                "--slice_axis", "2",
+                "--keep_empty", "False",
+                "--size_variants", "canonical,512",
+                "--intensity", "percentiles:1,99"
+            ]
+        }
+    ]
+}
