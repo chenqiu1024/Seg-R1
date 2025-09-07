@@ -35,6 +35,15 @@ accelerate launch --config_file=configs/zero3.yaml src/open_r1/sft.py \
     --output_dir data/Qwen2.5-1.5B-Open-R1-Distill
 """
 
+# -------------------------------------------------------------------------------------
+# Seg-R1 paper mapping (SFT stage):
+# - Before GRPO, SFT distills the output format and task priors into the VLM policy using
+#   curated conversations with images, problems, and solutions that already follow the
+#   required schema: <think> ... </think> <bbox>...</bbox> <points>...</points> <labels>...</labels>.
+# - Processor/model: Qwen2.5-VL variants as policy backbone, matching the paper’s VLM setup.
+# - Collate logic: applies chat template and integrates images to produce tensors for SFT.
+# - Outcome: initializes a policy that can emit valid structured prompts, easing subsequent GRPO.
+# -------------------------------------------------------------------------------------
 import logging
 import os
 import sys
@@ -119,6 +128,8 @@ def convert_example(example):
 #         )
 
         #think prompt
+        # Paper alignment: enforce latent reasoning (<think>) + structured output schema (<bbox>, <points>, <labels>)
+        # so the policy learns to produce actions that the SAM2 environment can consume during RL.
         SYSTEM_PROMPT = (
     "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant "
     "first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning "
@@ -153,6 +164,8 @@ def convert_example(example):
 
 
 def collate_fn(examples):
+    # Paper alignment: wrap messages with chat template and image inputs so SFT conditions the policy on
+    # multimodal inputs and trains it to output the exact structured format required by the RL stage.
     texts = [
         processor.apply_chat_template( convert_example(example)["messages"], tokenize=False, add_generation_prompt=True)
         for example in examples
@@ -212,7 +225,9 @@ def main(script_args, training_args, model_args):
         logger.info(f"Checkpoint detected, resuming training at {last_checkpoint=}.")
 
     ################
-    # Load datasets
+    # Load datasets (SFT corpus)
+    # Paper alignment: distillation data provides messages with images and target outputs matching
+    # the Seg-R1 schema, teaching the policy to format outputs pre-RL.
     ################
 
     dataset = load_dataset(script_args.dataset_name,split="train")
@@ -223,7 +238,8 @@ def main(script_args, training_args, model_args):
             dataset = dataset.select(range(min(max_n, len(dataset))))
 
     ################
-    # Load tokenizer
+    # Load tokenizer/processor
+    # Paper alignment: use AutoProcessor for VL models to ingest pixel inputs along with text.
     ################
     global processor
     if "vl" in model_args.model_name_or_path.lower():
@@ -243,6 +259,7 @@ def main(script_args, training_args, model_args):
     
     ###################
     # Model init kwargs
+    # Paper alignment: ensure attention implementation/quant settings compatible with training hardware.
     ###################
     logger.info("*** Initializing model kwargs ***")
     torch_dtype = (
@@ -265,6 +282,7 @@ def main(script_args, training_args, model_args):
     )
     ############################
     # Initialize the SFT Trainer
+    # Paper alignment: prepares policy for GRPO by training on schema-consistent supervised targets.
     ############################
     training_args.dataset_kwargs = {
         "skip_prepare_dataset": True,

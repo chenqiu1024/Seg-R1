@@ -1,6 +1,11 @@
 # -------------------------------------------------------------------------------------------------
 # Reference: https://github.com/NiFangBaAGe/Explicit-Visual-Prompt/blob/latest_branch/sod_metric.py
 # Modified by Zuyao You (https://github.com/geshang777)
+#
+# Seg-R1 paper mapping:
+# - S-measure (structure), Weighted F-measure, MAE are classic saliency/segmentation metrics.
+# - In Seg-R1, IoU and S-measure are combined for RL reward to reflect overlap + structure quality.
+# - This module provides numpy implementations used by reward fns in open_r1/grpo*.py.
 # -------------------------------------------------------------------------------------------------
 
 import numpy as np
@@ -61,6 +66,7 @@ class Fmeasure(object):
         self.changeable_fms = []
 
     def step(self, pred: np.ndarray, gt: np.ndarray):
+        # Paper alignment: normalize inputs before computing thresholded precision/recall curves.
         pred, gt = _prepare_data(pred, gt)
 
         adaptive_fm = self.cal_adaptive_fm(pred=pred, gt=gt)
@@ -152,6 +158,7 @@ class MAE(object):
         self.maes = []
 
     def step(self, pred: np.ndarray, gt: np.ndarray):
+        # Paper alignment: MAE serves as auxiliary metric; not used directly in GRPO reward.
         pred, gt = _prepare_data(pred, gt)
 
         mae = self.cal_mae(pred, gt)
@@ -193,6 +200,7 @@ class Smeasure(object):
         self.alpha = alpha
 
     def step(self, pred: np.ndarray, gt: np.ndarray):
+        # Paper alignment: core component of RL reward alongside IoU in Seg-R1.
         pred, gt = _prepare_data(pred=pred, gt=gt)
 
         sm = self.cal_sm(pred, gt)
@@ -345,6 +353,7 @@ class Emeasure(object):
         self.changeable_ems = []
 
     def step(self, pred: np.ndarray, gt: np.ndarray):
+        # Paper alignment: E-measure is not part of reward but useful for evaluation.
         pred, gt = _prepare_data(pred=pred, gt=gt)
 
         self.gt_fg_numel = np.count_nonzero(gt)
@@ -508,6 +517,7 @@ class WeightedFmeasure(object):
         self.weighted_fms = []
 
     def step(self, pred: np.ndarray, gt: np.ndarray):
+        # Paper alignment: weighted F-measure emphasizes boundary/structure errors; eval-only here.
         pred, gt = _prepare_data(pred=pred, gt=gt)
 
         if np.all(~gt):

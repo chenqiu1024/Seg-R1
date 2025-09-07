@@ -139,6 +139,13 @@ class Qwen2VLGRPOVLLMTrainer(Trainer):
         attn_implementation: str = "flash_attention_2",
     ):
 
+        # ---------------------------------------------------------------------------------
+        # Seg-R1 paper mapping (GRPO with vLLM generation):
+        # - Same GRPO objective as the non-vLLM trainer, but completions are sampled via vLLM
+        #   for efficiency and scalability (n generations per prompt).
+        # - Processing: AutoProcessor packs images; prompts are chat-templated conversations.
+        # - Grouped rewards and KL regularization mirror the paper’s GRPO setup.
+        # ---------------------------------------------------------------------------------
         # Args
         if args is None:
             model_name = model if isinstance(model, str) else model.config._name_or_path
@@ -240,7 +247,7 @@ class Qwen2VLGRPOVLLMTrainer(Trainer):
                 )
                 pad_token_id = processing_class.pad_token_id
 
-        # Reward functions
+        # Reward functions (e.g., IoU + S-measure custom callables) used to compute scalar rewards.
         if not isinstance(reward_funcs, list):
             reward_funcs = [reward_funcs]
         for i, reward_func in enumerate(reward_funcs):
@@ -279,7 +286,7 @@ class Qwen2VLGRPOVLLMTrainer(Trainer):
                 reward_processing_classes[i] = reward_processing_class
         self.reward_processing_classes = reward_processing_classes
 
-        # Data collator
+        # Data collator: pass-through; inputs are already materialized per sample.
         def data_collator(features):  # No data collation is needed in GRPO
             return features
 
@@ -306,11 +313,11 @@ class Qwen2VLGRPOVLLMTrainer(Trainer):
         # This acts as a flag to indicate that the warning has already been issued.
         model.warnings_issued["estimate_tokens"] = True
 
-        # Initialize the metrics
+        # Initialize the metrics buffer for logging GRPO stats (reward, KL, completion length, etc.).
         self._metrics = defaultdict(list)
         self.use_vllm = args.use_vllm
 
-        # rewrite the processing AutoTokenizer -> AutoProcessor
+        # Rewrite the processing AutoTokenizer -> AutoProcessor for VL models to include image tensors.
         model_id = model if isinstance(model, str) else model.config._name_or_path
         if processing_class is None:
             if "Qwen2-VL" in model_id or "Aria" in model_id:
@@ -473,11 +480,11 @@ class Qwen2VLGRPOVLLMTrainer(Trainer):
         if self._signature_columns is None:
             self._signature_columns = ["prompt"]
 
-    # We need a custom sampler that samples the same prompt multiple times
+    # Sample the same prompt multiple times to form GRPO groups.
     def _get_train_sampler(self):
         return RepeatRandomSampler(self.train_dataset, self.num_generations)
 
-    # Get the per-token log probabilities for the completions for the model and the reference model
+    # Per-token log-probs for policy/ref used to compute GRPO loss and KL term.
     def _get_per_token_logps(
         self,
         model,
@@ -512,8 +519,7 @@ class Qwen2VLGRPOVLLMTrainer(Trainer):
             per_token_logps.append(token_log_prob)
         return torch.stack(per_token_logps)
 
-    # Trainer "prepares" the inputs before calling `compute_loss`. It converts to tensor and move to device.
-    # Since we preprocess the data in `compute_loss`, we need to override this method to skip this step.
+    # Prepare multimodal inputs and sample n completions via vLLM. Broadcast and slice to each process.
     def _prepare_inputs(
         self, inputs: dict[str, Union[torch.Tensor, Any]]
     ) -> dict[str, Union[torch.Tensor, Any]]:
@@ -600,7 +606,7 @@ class Qwen2VLGRPOVLLMTrainer(Trainer):
         else:
             raise ValueError("Only vLLM generation is supported in this version ")
 
-        # below are the same with yifan's code
+        # Mask everything after the first EOS token and build attention mask for completion tokens only.
         # Mask everything after the first EOS token
         is_eos = completion_ids == self.processing_class.eos_token_id
         device = self.accelerator.device
@@ -660,7 +666,7 @@ class Qwen2VLGRPOVLLMTrainer(Trainer):
                 for completion in completions
             ]
 
-        # Compute the rewards
+        # Compute scalar rewards from custom reward functions and group-normalize for GRPO advantages.
         rewards_per_func = torch.zeros(
             len(prompts), len(self.reward_funcs), device=device
         )

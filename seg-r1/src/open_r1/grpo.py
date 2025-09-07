@@ -23,6 +23,16 @@ from open_r1.trainer import Qwen2VLGRPOTrainer, Qwen2VLGRPOVLLMTrainerModified
 from utils.metrics import Smeasure
 
 
+# -------------------------------------------------------------------------------------
+# Seg-R1 (paper: "Segmentation Can Be Surprisingly Simple with Reinforcement Learning")
+# Code mapping notes:
+# - Policy model: Qwen2-VL family generates structured prompts (<think>, <bbox>, <points>, <labels>).
+# - Environment/segmentation oracle: SAM2 converts prompts into masks for reward computation.
+# - Reward design: combines IoU and S-measure to align with paper's segmentation-quality signal.
+# - RL algorithm: GRPO (Group Relative Policy Optimization) with grouped generations per prompt.
+# - Data pipeline: imagefolder + GT masks, resized to 768x768; conversation format drives VLM sampling.
+# - This file wires dataset prep, reward functions, and trainer instantiation per the paper's training flow.
+# -------------------------------------------------------------------------------------
 RESIZE_SIZE = (768, 768)
 _TYPE = np.float64
 
@@ -52,6 +62,8 @@ def resize_image_and_mask(example):
     }
 
 
+# Paper alignment: SAM2 serves as the external segmentor receiving sparse prompts (points/boxes)
+# to produce a binary mask, which functions as the "environment" for RL reward signals.
 class SAMWrapper:
     
     def __init__(self, model_path: str, device: Optional[str] = None):
@@ -120,6 +132,8 @@ class SAMWrapper:
 
 
 @dataclass
+# Paper alignment: extend script args for Seg-R1 needs (reward functions, SAM2 checkpoint, datasets),
+# mirroring the paper's components controlling environment and reward.
 class GRPOScriptArguments(ScriptArguments):
     """Extended training arguments for GRPO segmentation."""
     
@@ -153,6 +167,8 @@ class GRPOScriptArguments(ScriptArguments):
     )
 
 
+## Paper alignment: parse the model's structured output (<points>, <labels>, <bbox>, optional <think>),
+## which is the action space the policy optimizes under GRPO.
 def parse_custom_format(content: str) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
     """Parse custom formatted string to extract points, labels and bbox.
     
@@ -198,6 +214,7 @@ def parse_custom_format(content: str) -> Tuple[Optional[np.ndarray], Optional[np
         return None, None, None
 
 
+## Paper alignment: auxiliary reward encouraging correct structured format with explicit reasoning (<think>).
 def format_reward(completions, **kwargs):
     """Calculate reward based on format compliance.
     
@@ -222,6 +239,7 @@ def format_reward(completions, **kwargs):
     return rewards
 
 
+## Paper alignment: optional shaping to avoid too few/many points, centering around an ideal count.
 def length_reward(completions, **kwargs):
     rewards = []
     for completion in completions:
@@ -238,6 +256,7 @@ def length_reward(completions, **kwargs):
     return rewards
 
 
+## Utility: normalize arrays for metric computation (binarization/typing).
 def _prepare_data(pred: np.ndarray, gt: np.ndarray) -> tuple:
     """Normalize prediction and ground truth data formats.
     
@@ -254,6 +273,8 @@ def _prepare_data(pred: np.ndarray, gt: np.ndarray) -> tuple:
     return pred, gt
 
 
+## Core reward per paper: combine IoU (overlap) and S-measure (structure) to reflect segmentation quality.
+## Weights (0.7 IoU, 0.3 S-measure) follow paper's emphasis on region overlap while preserving structure.
 def segmentation_reward(completions: List[str], 
                        gt_mask: List[np.ndarray],
                        image: List[PILImage.Image],
@@ -357,6 +378,8 @@ def segmentation_reward(completions: List[str],
     return rewards
 
 
+## Paper alignment: constructs prompts that enforce the output schema and include latent reasoning (<think>),
+## enabling GRPO to optimize both format and segmentation-induced rewards.
 def create_conversation(example: dict) -> dict:
     messages = []
     SYSTEM_PROMPT = (
@@ -395,6 +418,7 @@ Output the result using the exact format:
     }
 
 
+## Thin wrapper to select the vLLM-enabled GRPO trainer variant for multi-sample generation efficiency.
 class SegR1Trainer(Qwen2VLGRPOVLLMTrainerModified):
     
     def __init__(self, *args, sam_config=None, **kwargs):
@@ -410,6 +434,9 @@ reward_funcs_registry = {
 
 
 def main(script_args, training_args, model_args):
+    # Paper alignment: end-to-end training pipeline
+    # 1) Build reward fns (segmentation + format), 2) load/resize datasets and attach GT/misc columns,
+    # 3) wrap policy model with GRPO trainer (vLLM or vanilla), 4) train and save.
     # Initialize reward functions
     reward_funcs = ["segment", "format"]
     reward_funcs = [reward_funcs_registry[func] for func in reward_funcs]

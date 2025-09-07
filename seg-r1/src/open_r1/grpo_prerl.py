@@ -22,6 +22,15 @@ from utils.metrics import Smeasure
 import warnings
 warnings.filterwarnings("ignore")
 
+# -------------------------------------------------------------------------------------
+# Seg-R1 paper mapping (Pre-RL / PRERL stage):
+# - This variant keeps only point prompts (no bbox), mirroring a simplified action space used
+#   in the paper’s pre-RL or curriculum settings where the policy first learns sparse points.
+# - The environment is still SAM2; reward mixes IoU and S-measure as in the main RL stage.
+# - Data pipeline: load imagefolder, attach GT path, resize to 768x768, create conversation to
+#   enforce the structured output schema (<points>, <labels>), acting as the policy output.
+# - Trainer: GRPO-based trainer (Qwen2-VL), optionally with vLLM for parallel generations.
+# -------------------------------------------------------------------------------------
 RESIZE_SIZE = (768, 768)
 _TYPE = np.float64  
 
@@ -49,6 +58,7 @@ def resize_image_and_mask(example: dict) -> dict:
     }
 
 
+## Paper alignment: SAM2 used as external segmentation oracle, consuming sparse prompts as actions.
 class SAMWrapper:
     
     def __init__(self, model_path: str, device: Optional[str] = None):
@@ -107,6 +117,7 @@ class SAMWrapper:
 
 
 @dataclass
+## Paper alignment: extend script args to configure reward fns, SAM2 checkpoint, and datasets for PRERL.
 class GRPOScriptArguments(ScriptArguments):
     """Extended training arguments for GRPO segmentation."""
     
@@ -140,6 +151,7 @@ class GRPOScriptArguments(ScriptArguments):
     )
 
 
+## Paper alignment: parse the policy’s structured output (<points>, <labels>) for PRERL.
 def parse_custom_format(content: str) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
     """Parse point coordinates and labels from formatted string.
     
@@ -171,6 +183,7 @@ def parse_custom_format(content: str) -> Tuple[Optional[np.ndarray], Optional[np
     return None, None
 
 
+## Paper alignment: auxiliary formatting reward to stabilize policy outputs during PRERL.
 def format_reward(completions: List[dict], **kwargs) -> List[float]:
     """Calculate reward based on format compliance.
     
@@ -186,6 +199,7 @@ def format_reward(completions: List[dict], **kwargs) -> List[float]:
     ]
 
 
+## Utility: normalize arrays and binarize masks for metric computation.
 def _prepare_data(pred: np.ndarray, gt: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """Normalize prediction and ground truth data formats.
     
@@ -201,6 +215,7 @@ def _prepare_data(pred: np.ndarray, gt: np.ndarray) -> Tuple[np.ndarray, np.ndar
     return pred, (gt > 128).astype(_TYPE)
 
 
+## Core reward per paper: combine IoU and S-measure to reflect segmentation quality under PRERL.
 def segmentation_reward(
     completions: List[str],
     gt_mask: List[np.ndarray],
@@ -271,6 +286,7 @@ def segmentation_reward(
     return rewards
 
 
+## Paper alignment: constructs a user prompt that explicitly demands (<points>, <labels>) schema.
 def create_conversation(example: dict) -> dict:
     """Create training prompt with instructions for segmentation task."""
     return {
@@ -304,6 +320,7 @@ Where 1 indicates a foreground (object) point, and 0 indicates a background poin
         # "image": example["image"],
     }
 
+## Wrapper for the vLLM-enabled GRPO trainer; used to optimize PRERL policy.
 class SegR1Trainer(Qwen2VLGRPOVLLMTrainerModified):
     
     def __init__(self, *args, sam_config=None, **kwargs):
@@ -311,7 +328,7 @@ class SegR1Trainer(Qwen2VLGRPOVLLMTrainerModified):
 
 
 
-# Reward function registry
+# Reward function registry: segment + format as described in the paper.
 REWARD_FUNCS = {
     "segment": segmentation_reward,
     "format": format_reward,
