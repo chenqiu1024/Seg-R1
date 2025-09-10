@@ -130,7 +130,8 @@ def prepare_test_messages(image, prompt, ratio: float = None, epsilon: float = E
             "<think> reasoning process here </think> <bbox>[x1,y1,x2,y2]</bbox>, <points>[[x3,y3],[x4,y4],...]</points>, <labels>[1,0,...]</labels>"
             "Where 1 indicates a foreground (object) point, and 0 indicates a background point. There could be multiple bbox blocks. "
             "Constraints: The number of individual labels and points should be the same. "
-            f"Generate approximately {desired_bboxes} separate <bbox> blocks (one per object), so that the ratio points_tag_count/bbox_tag_count ≈ {safe_ratio:.3f} within ±{epsilon:.2f}. "
+            # f"Make sure the ratio of #point / #bbox is roughly {safe_ratio:.3f} within ±{epsilon:.2f}. "
+            "Make sure the number of items in <points> block is only 2. "
             "Do NOT include any extra text outside these tags."
         )
     else:
@@ -298,7 +299,7 @@ def run_pipeline(image: PILImage.Image, prompt: str, ratio: float):
     visualized_img_orig = compute_visualization(points_orig, labels_orig, bbox_orig)
     visualized_img_ratio = compute_visualization(points_ratio, labels_ratio, bbox_ratio)
 
-    return output_text_orig, visualized_img_orig, output_text_ratio, visualized_img_ratio
+    return output_text_orig, visualized_img_orig, messages_ratio[0][0], output_text_ratio, visualized_img_ratio
 
 gr.Interface(
     fn=run_pipeline,
@@ -310,6 +311,7 @@ gr.Interface(
     outputs=[
         gr.Textbox(label="Model Output (Original)"),
         gr.Image(type="pil", label="Mask Prediction (Original)"),
+        gr.Textbox(label="Model System Prompt (Ratio)"),
         gr.Textbox(label="Model Output (Ratio)"),
         gr.Image(type="pil", label="Mask Prediction (Ratio)")
     ],
