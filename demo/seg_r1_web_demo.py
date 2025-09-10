@@ -218,12 +218,12 @@ def run_pipeline(image: PILImage.Image, prompt: str, ratio: float):
 
     # Prepare original and ratio-enforced messages (batched for one forward)
     messages_orig, messages_ratio = prepare_test_messages(img_resized, prompt, ratio=ratio, epsilon=EPSILON_DEFAULT)
-    ## outputs_text = answer_question(messages_orig + messages_ratio)
-    # output_text_orig = outputs_text[0] if len(outputs_text) > 0 else ""
-    # output_text_ratio = outputs_text[1] if len(outputs_text) > 1 else ""
-    outputs_text = answer_question(messages_orig)[0] ## For debug
-    output_text_orig = outputs_text ## For debug
-    output_text_ratio = outputs_text ## For debug
+    outputs_text = answer_question(messages_orig + messages_ratio)
+    output_text_orig = outputs_text[0] if len(outputs_text) > 0 else ""
+    output_text_ratio = outputs_text[1] if len(outputs_text) > 1 else ""
+    # outputs_text = answer_question(messages_orig)[0] ## For debug
+    # output_text_orig = outputs_text ## For debug
+    # output_text_ratio = outputs_text ## For debug
 
     points_orig, labels_orig, bbox_orig = parse_custom_format(output_text_orig)
     print(f"[ORIG] Output text: {output_text_orig}")
@@ -298,7 +298,7 @@ def run_pipeline(image: PILImage.Image, prompt: str, ratio: float):
     visualized_img_orig = compute_visualization(points_orig, labels_orig, bbox_orig)
     visualized_img_ratio = compute_visualization(points_ratio, labels_ratio, bbox_ratio)
 
-    return output_text_orig, visualized_img_orig, visualized_img_ratio
+    return output_text_orig, visualized_img_orig, output_text_ratio, visualized_img_ratio
 
 gr.Interface(
     fn=run_pipeline,
@@ -308,8 +308,9 @@ gr.Interface(
         gr.Slider(0.0, 1.0, step=0.01, value=0.5, label="Ratio")
     ],
     outputs=[
-        gr.Textbox(label="Model Output"),
+        gr.Textbox(label="Model Output (Original)"),
         gr.Image(type="pil", label="Mask Prediction (Original)"),
+        gr.Textbox(label="Model Output (Ratio)"),
         gr.Image(type="pil", label="Mask Prediction (Ratio)")
     ],
     title="Seg-R1",
