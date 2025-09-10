@@ -217,9 +217,12 @@ def run_pipeline(image: PILImage.Image, prompt: str, ratio: float):
 
     # Prepare original and ratio-enforced messages (batched for one forward)
     messages_orig, messages_ratio = prepare_test_messages(img_resized, prompt, ratio=ratio, epsilon=EPSILON_DEFAULT)
-    outputs_text = answer_question(messages_orig + messages_ratio)
-    output_text_orig = outputs_text[0] if len(outputs_text) > 0 else ""
-    output_text_ratio = outputs_text[1] if len(outputs_text) > 1 else ""
+    ## outputs_text = answer_question(messages_orig + messages_ratio)
+    # output_text_orig = outputs_text[0] if len(outputs_text) > 0 else ""
+    # output_text_ratio = outputs_text[1] if len(outputs_text) > 1 else ""
+    outputs_text = answer_question(messages_orig)[0] ## For debug
+    output_text_orig = outputs_text ## For debugt
+    output_text_ratio = outputs_text ## For debugt
 
     points_orig, labels_orig, bbox_orig = parse_custom_format(output_text_orig)
     print(f"[ORIG] Output text: {output_text_orig}")
