@@ -160,7 +160,7 @@ def prepare_test_messages(image, prompt, ratio: float = None, epsilon: float = E
             ],
         },
     ]
-    return [messages_orig, messages_ratio]
+    return messages_orig, messages_ratio
 
 def answer_question(batch_messages):
     text = [processor.apply_chat_template(msg, tokenize=False, add_generation_prompt=True) for msg in batch_messages]
