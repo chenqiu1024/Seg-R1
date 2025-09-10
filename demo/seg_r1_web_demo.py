@@ -20,6 +20,7 @@ MODEL_PATH = "geshang/Seg-R1-7B"
 DEVICE_QWEN = "cuda:0"
 DEVICE_SAM = "cuda:0"
 RESIZE_SIZE = (1024, 1024)
+EPSILON_DEFAULT = 0.1
 
 model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
     MODEL_PATH,
@@ -105,30 +106,42 @@ def parse_custom_format(content: str):
         print("Error parsing content:", e)
         return None, None, None
 
-def prepare_test_messages(image, prompt):
+def prepare_test_messages(image, prompt, ratio: float = None, epsilon: float = EPSILON_DEFAULT):
     buffered = io.BytesIO()
     image = TF.resize(image, RESIZE_SIZE)
     image.save(buffered, format="JPEG")
     img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
 
     if "segment" in prompt or "mask" in prompt:
-
-        SYSTEM_PROMPT = (
-    "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant "
-    "first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning "
-    "process should enclosed within <think> </think> tags, and the bounding box, points and points labels should be enclosed within <bbox></bbox>, <points></points>, and <labels></labels>, respectively. i.e., "
-    "<think> reasoning process here </think> <bbox>[x1,y1,x2,y2]</bbox>, <points>[[x3,y3],[x4,y4],...]</points>, <labels>[1,0,...]</labels>"
-    "Where 1 indicates a foreground (object) point, and 0 indicates a background point."
-
+        SYSTEM_PROMPT_ORIG = (
+            "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant "
+            "first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning "
+            "process should enclosed within <think> </think> tags, and the bounding box, points and points labels should be enclosed within <bbox></bbox>, <points></points>, and <labels></labels>, respectively. i.e., "
+            "<think> reasoning process here </think> <bbox>[x1,y1,x2,y2]</bbox>, <points>[[x3,y3],[x4,y4],...]</points>, <labels>[1,0,...]</labels>"
+            "Where 1 indicates a foreground (object) point, and 0 indicates a background point."
+        )
+        safe_ratio = max(1e-6, min(1.0, float(ratio)))
+        # Single <points> block by design; choose number of <bbox> blocks to target ratio ≈ 1 / N
+        desired_bboxes = max(1, int(round(1.0 / safe_ratio)))
+        SYSTEM_PROMPT_RATIO = (
+            "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant "
+            "first thinks about the reasoning process in the mind and then provides the user with the answer.\n"
+            "Strictly follow this structured output format: "
+            "<think>...</think> <bbox>[x1,y1,x2,y2]</bbox> (repeated), <points>[[x,y],...]]</points>, <labels>[1,0,...]</labels>.\n"
+            "Constraints: Generate EXACTLY ONE <points> block and EXACTLY ONE matching <labels> block (same length as points). "
+            f"Generate approximately {desired_bboxes} separate <bbox> blocks (one per object), so that the ratio points_tag_count/bbox_tag_count ≈ {safe_ratio:.3f} within ±{epsilon:.2f}. "
+            "Do NOT include any extra text outside these tags."
         )
     else:
-        SYSTEM_PROMPT = (
-    "You're a helpful visual assistant."
-
+        SYSTEM_PROMPT_ORIG = (
+            "You're a helpful visual assistant."
+        )
+        SYSTEM_PROMPT_RATIO = (
+            "You're a helpful visual assistant."
         )
 
-    messages = [
-        {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT}]},
+    messages_orig = [
+        {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT_ORIG}]},
         {
             "role": "user",
             "content": [
@@ -137,7 +150,17 @@ def prepare_test_messages(image, prompt):
             ],
         },
     ]
-    return [messages]
+    messages_ratio = [
+        {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT_RATIO}]},
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": f"data:image/jpeg;base64,{img_base64}"},
+                {"type": "text", "text": prompt},
+            ],
+        },
+    ]
+    return [messages_orig, messages_ratio]
 
 def answer_question(batch_messages):
     text = [processor.apply_chat_template(msg, tokenize=False, add_generation_prompt=True) for msg in batch_messages]
@@ -192,80 +215,86 @@ def run_pipeline(image: PILImage.Image, prompt: str, ratio: float):
     img_original = image.copy()
     img_resized = TF.resize(image, RESIZE_SIZE)
 
-    messages = prepare_test_messages(img_resized, prompt)
-    output_text = answer_question(messages)[0]
+    # Prepare original and ratio-enforced messages (batched for one forward)
+    messages_orig, messages_ratio = prepare_test_messages(img_resized, prompt, ratio=ratio, epsilon=EPSILON_DEFAULT)
+    outputs_text = answer_question(messages_orig + messages_ratio)
+    output_text_orig = outputs_text[0] if len(outputs_text) > 0 else ""
+    output_text_ratio = outputs_text[1] if len(outputs_text) > 1 else ""
 
-    points, labels, bbox = parse_custom_format(output_text)
-    print(f"Output text: {output_text}")
-    print(f"Parsed points: {points}, labels: {labels}, bbox: {bbox}")
+    points_orig, labels_orig, bbox_orig = parse_custom_format(output_text_orig)
+    print(f"[ORIG] Output text: {output_text_orig}")
+    print(f"[ORIG] Parsed points: {points_orig}, labels: {labels_orig}, bbox: {bbox_orig}")
+
+    points_ratio, labels_ratio, bbox_ratio = parse_custom_format(output_text_ratio)
+    print(f"[RATIO] Output text: {output_text_ratio}")
+    print(f"[RATIO] Parsed points: {points_ratio}, labels: {labels_ratio}, bbox: {bbox_ratio}")
 
     # if points is None or labels is None or bbox is None:
     #     return output_text, None
     img = img_resized
-    mask_pred = None
-    final_mask = np.zeros(RESIZE_SIZE[::-1], dtype=bool)
+    def compute_visualization(points, labels, bbox):
+        local_img = img
+        mask_pred_local = None
+        final_mask_local = np.zeros(RESIZE_SIZE[::-1], dtype=bool)
 
-    if (points is not None and labels is not None) or (bbox is not None):
-        if not isinstance(img, PILImage.Image):
-            img = PILImage.fromarray(img)
+        if (points is not None and labels is not None) or (bbox is not None):
+            if not isinstance(local_img, PILImage.Image):
+                local_img = PILImage.fromarray(local_img)
 
-        if bbox is not None and len(bbox.shape) == 2: 
-            for b in bbox:
-                b = b.tolist()
-                if points is not None and labels is not None:
-                    in_bbox_mask = (
-                        (points[:, 0] >= b[0]) & (points[:, 0] <= b[2]) &
-                        (points[:, 1] >= b[1]) & (points[:, 1] <= b[3])
-                    )
-                    selected_points = points[in_bbox_mask]
-                    selected_labels = labels[in_bbox_mask]
-                else:
-                    selected_points, selected_labels = None, None
+            if bbox is not None and len(bbox.shape) == 2:
+                for b in bbox:
+                    b = b.tolist()
+                    if points is not None and labels is not None:
+                        in_bbox_mask = (
+                            (points[:, 0] >= b[0]) & (points[:, 0] <= b[2]) &
+                            (points[:, 1] >= b[1]) & (points[:, 1] <= b[3])
+                        )
+                        selected_points = points[in_bbox_mask]
+                        selected_labels = labels[in_bbox_mask]
+                    else:
+                        selected_points, selected_labels = None, None
 
+                    try:
+                        mask, _ = sam_wrapper.predict(
+                            local_img,
+                            selected_points.tolist() if selected_points is not None and len(selected_points) > 0 else None,
+                            selected_labels.tolist() if selected_labels is not None and len(selected_labels) > 0 else None,
+                            b
+                        )
+                        final_mask_local |= (mask > 0)
+                    except Exception as e:
+                        print(f"Error in mask prediction for bbox {b}: {str(e)}")
+                        continue
+
+                mask_pred_local = final_mask_local
+
+            else:
                 try:
-                    mask, _ = sam_wrapper.predict(
-                        img,
-                        selected_points.tolist() if selected_points is not None and len(selected_points) > 0 else None,
-                        selected_labels.tolist() if selected_labels is not None and len(selected_labels) > 0 else None,
-                        b
+                    mask_pred_local, _ = sam_wrapper.predict(
+                        local_img,
+                        points.tolist() if points is not None else None,
+                        labels.tolist() if labels is not None else None,
+                        bbox.tolist() if bbox is not None else None
                     )
-                    final_mask |= (mask > 0)
+                    mask_pred_local = mask_pred_local > 0
                 except Exception as e:
-                    print(f"Error in mask prediction for bbox {b}: {str(e)}")
-                    continue
-
-            mask_pred = final_mask
-
+                    print(f"Error in mask prediction: {str(e)}")
+                    mask_pred_local = np.zeros(RESIZE_SIZE[::-1], dtype=bool)
         else:
-            try:
-                mask_pred, _ = sam_wrapper.predict(
-                    img,
-                    points.tolist() if points is not None else None,
-                    labels.tolist() if labels is not None else None,
-                    bbox.tolist() if bbox is not None else None
-                )
-                mask_pred = mask_pred > 0
-            except Exception as e:
-                print(f"Error in mask prediction: {str(e)}")
-                mask_pred = np.zeros(RESIZE_SIZE[::-1], dtype=bool)
-    else:
-        return output_text, None, None
-    mask_np = mask_pred
-    mask_img = PILImage.fromarray((mask_np * 255).astype(np.uint8)).resize(img_original.size)
-    mask_img = mask_img.convert("L")
-    resized_w, resized_h = img_resized.size
-    original_w, original_h = img_original.size
+            return None
 
-    scale_x = original_w / resized_w
-    scale_y = original_h / resized_h
-    visualized_img = visualize_masks_on_image_v2(
-        image, 
-        masks_np=[mask_np],
-        alpha=0.6
-    )
-    # For now, use the same visualization for the ratio-based output.
-    visualized_img_ratio = visualized_img.copy()
-    return output_text, visualized_img, visualized_img_ratio
+        mask_np_local = mask_pred_local
+        vis_img_local = visualize_masks_on_image_v2(
+            image,
+            masks_np=[mask_np_local],
+            alpha=0.6
+        )
+        return vis_img_local
+
+    visualized_img_orig = compute_visualization(points_orig, labels_orig, bbox_orig)
+    visualized_img_ratio = compute_visualization(points_ratio, labels_ratio, bbox_ratio)
+
+    return output_text_orig, visualized_img_orig, visualized_img_ratio
 
 gr.Interface(
     fn=run_pipeline,
