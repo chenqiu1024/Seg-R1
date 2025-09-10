@@ -114,21 +114,22 @@ def prepare_test_messages(image, prompt, ratio: float = None, epsilon: float = E
 
     if "segment" in prompt or "mask" in prompt:
         SYSTEM_PROMPT_ORIG = (
-            "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant "
-            "first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning "
-            "process should enclosed within <think> </think> tags, and the bounding box, points and points labels should be enclosed within <bbox></bbox>, <points></points>, and <labels></labels>, respectively. i.e., "
-            "<think> reasoning process here </think> <bbox>[x1,y1,x2,y2]</bbox>, <points>[[x3,y3],[x4,y4],...]</points>, <labels>[1,0,...]</labels>"
-            "Where 1 indicates a foreground (object) point, and 0 indicates a background point."
+          "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant "
+          "first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning "
+          "process should enclosed within <think> </think> tags, and the bounding box, points and points labels should be enclosed within <bbox></bbox>, <points></points>, and <labels></labels>, respectively. i.e., "
+          "<think> reasoning process here </think> <bbox>[x1,y1,x2,y2]</bbox>, <points>[[x3,y3],[x4,y4],...]</points>, <labels>[1,0,...]</labels>"
+          "Where 1 indicates a foreground (object) point, and 0 indicates a background point."
         )
         safe_ratio = max(1e-6, min(1.0, float(ratio)))
         # Single <points> block by design; choose number of <bbox> blocks to target ratio ≈ 1 / N
         desired_bboxes = max(1, int(round(1.0 / safe_ratio)))
         SYSTEM_PROMPT_RATIO = (
             "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant "
-            "first thinks about the reasoning process in the mind and then provides the user with the answer.\n"
-            "Strictly follow this structured output format: "
-            "<think>...</think> <bbox>[x1,y1,x2,y2]</bbox> (repeated), <points>[[x,y],...]]</points>, <labels>[1,0,...]</labels>.\n"
-            "Constraints: Generate EXACTLY ONE <points> block and EXACTLY ONE matching <labels> block (same length as points). "
+            "first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning "
+            "process should enclosed within <think> </think> tags, and the bounding box, points and points labels should be enclosed within <bbox></bbox>, <points></points>, and <labels></labels>, respectively. i.e., "
+            "<think> reasoning process here </think> <bbox>[x1,y1,x2,y2]</bbox>, <points>[[x3,y3],[x4,y4],...]</points>, <labels>[1,0,...]</labels>"
+            "Where 1 indicates a foreground (object) point, and 0 indicates a background point. There could be multiple bbox blocks. "
+            "Constraints: The number of individual labels and points should be the same. "
             f"Generate approximately {desired_bboxes} separate <bbox> blocks (one per object), so that the ratio points_tag_count/bbox_tag_count ≈ {safe_ratio:.3f} within ±{epsilon:.2f}. "
             "Do NOT include any extra text outside these tags."
         )
@@ -160,7 +161,7 @@ def prepare_test_messages(image, prompt, ratio: float = None, epsilon: float = E
             ],
         },
     ]
-    return messages_orig, messages_ratio
+    return [messages_orig], [messages_ratio]
 
 def answer_question(batch_messages):
     text = [processor.apply_chat_template(msg, tokenize=False, add_generation_prompt=True) for msg in batch_messages]
@@ -221,8 +222,8 @@ def run_pipeline(image: PILImage.Image, prompt: str, ratio: float):
     # output_text_orig = outputs_text[0] if len(outputs_text) > 0 else ""
     # output_text_ratio = outputs_text[1] if len(outputs_text) > 1 else ""
     outputs_text = answer_question(messages_orig)[0] ## For debug
-    output_text_orig = outputs_text ## For debugt
-    output_text_ratio = outputs_text ## For debugt
+    output_text_orig = outputs_text ## For debug
+    output_text_ratio = outputs_text ## For debug
 
     points_orig, labels_orig, bbox_orig = parse_custom_format(output_text_orig)
     print(f"[ORIG] Output text: {output_text_orig}")
