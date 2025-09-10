@@ -14,6 +14,7 @@ import cv2
 from typing import List, Tuple, Optional
 from PIL import Image, ImageDraw, ImageFilter
 from pathlib import Path
+import random
 
 CACHE_DIR = "/root/autodl-tmp/models" 
 MODEL_PATH = "geshang/Seg-R1-7B" 
@@ -121,17 +122,19 @@ def prepare_test_messages(image, prompt, ratio: float = None, epsilon: float = E
           "Where 1 indicates a foreground (object) point, and 0 indicates a background point."
         )
         safe_ratio = max(1e-6, min(1.0, float(ratio)))
-        # Single <points> block by design; choose number of <bbox> blocks to target ratio ≈ 1 / N
-        desired_bboxes = max(1, int(round(1.0 / safe_ratio)))
+        # Choose concrete counts: random bboxes in [1,20], points derived from ratio and clamped to [1,20]
+        num_bboxes = random.randint(1, 10)
+        num_points = max(1, min(20, int(round(safe_ratio * num_bboxes))))
         SYSTEM_PROMPT_RATIO = (
             "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant "
             "first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning "
             "process should enclosed within <think> </think> tags, and the bounding box, points and points labels should be enclosed within <bbox></bbox>, <points></points>, and <labels></labels>, respectively. i.e., "
-            "<think> reasoning process here </think> <bbox>[x1,y1,x2,y2]</bbox>, <points>[[x3,y3],[x4,y4],...]</points>, <labels>[1,0,...]</labels>"
-            "Where 1 indicates a foreground (object) point, and 0 indicates a background point. There could be multiple bbox blocks. "
-            "Constraints: The number of individual labels and points should be the same. "
-            # f"Make sure the ratio of #point / #bbox is roughly {safe_ratio:.3f} within ±{epsilon:.2f}. "
-            "Make sure the number of items in <points> block is only 2. "
+            "<think> reasoning process here </think> <bbox>[x1,y1,x2,y2]</bbox>, <points>[[x3,y3],[x4,y4],...]</points>, <labels>[1,0,...]</labels>. "
+            "There could be multiple <bbox> blocks. "
+            "Constraints: "
+            f"Generate EXACTLY {num_bboxes} separate <bbox> blocks. "
+            f"Generate EXACTLY ONE <points> block containing EXACTLY {num_points} coordinate pairs. "
+            f"Generate EXACTLY ONE <labels> block containing EXACTLY {num_points} labels (1 or 0), matching the points order. "
             "Do NOT include any extra text outside these tags."
         )
     else:
