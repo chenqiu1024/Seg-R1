@@ -188,7 +188,7 @@ def visualize_masks_on_image_v2(
     
     return blended_pil.convert("RGB")
 
-def run_pipeline(image: PILImage.Image, prompt: str):
+def run_pipeline(image: PILImage.Image, prompt: str, ratio: float):
     img_original = image.copy()
     img_resized = TF.resize(image, RESIZE_SIZE)
 
@@ -249,7 +249,7 @@ def run_pipeline(image: PILImage.Image, prompt: str):
                 print(f"Error in mask prediction: {str(e)}")
                 mask_pred = np.zeros(RESIZE_SIZE[::-1], dtype=bool)
     else:
-        return output_text, None
+        return output_text, None, None
     mask_np = mask_pred
     mask_img = PILImage.fromarray((mask_np * 255).astype(np.uint8)).resize(img_original.size)
     mask_img = mask_img.convert("L")
@@ -263,17 +263,21 @@ def run_pipeline(image: PILImage.Image, prompt: str):
         masks_np=[mask_np],
         alpha=0.6
     )
-    return output_text, visualized_img
+    # For now, use the same visualization for the ratio-based output.
+    visualized_img_ratio = visualized_img.copy()
+    return output_text, visualized_img, visualized_img_ratio
 
 gr.Interface(
     fn=run_pipeline,
     inputs=[
         gr.Image(type="pil", label="Image"),
-        gr.Textbox(lines=2, label="Text")
+        gr.Textbox(lines=2, label="Text"),
+        gr.Slider(0.0, 1.0, step=0.01, value=0.5, label="Ratio")
     ],
     outputs=[
         gr.Textbox(label="Model Output"),
-        gr.Image(type="pil", label="Mask Prediction")
+        gr.Image(type="pil", label="Mask Prediction (Original)"),
+        gr.Image(type="pil", label="Mask Prediction (Ratio)")
     ],
     title="Seg-R1",
 ).launch(share=True)
