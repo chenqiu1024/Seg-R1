@@ -357,6 +357,16 @@ def run_pipeline(image: PILImage.Image, prompt: str, ratio: float):
             masks_np=[mask_np_local],
             alpha=0.6
         )
+          # Overlay annotations (boxes & points) on top of the highlighted masks
+        try:
+            vis_img_local = visualize_annotations_on_image(
+                vis_img_local,
+                points,
+                labels,
+                bbox,
+            )
+        except Exception as e:
+            print(f"Error overlaying annotations: {str(e)}")
         return vis_img_local
 
     # Compute mask visualizations; if mask generation fails, fall back to drawing annotations on original image
