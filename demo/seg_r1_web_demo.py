@@ -309,7 +309,7 @@ gr.Interface(
     inputs=[
         gr.Image(type="pil", label="Image"),
         gr.Textbox(lines=2, label="Text"),
-        gr.Slider(0.0, 1.0, step=0.01, value=0.5, label="Ratio")
+        gr.Slider(0.0, 10.0, step=0.01, value=1.0, label="Ratio")
     ],
     outputs=[
         gr.Textbox(label="Model Output (Original)"),

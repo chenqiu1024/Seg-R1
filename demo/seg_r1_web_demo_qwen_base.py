@@ -3,7 +3,7 @@ from PIL import Image as PILImage
 import torchvision.transforms.functional as TF
 import numpy as np
 import torch
-from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+from transformers import AutoProcessor, AutoModelForVision2Seq
 from qwen_vl_utils import process_vision_info
 from sam2.build_sam import build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
@@ -19,12 +19,13 @@ import random
 CACHE_DIR = "/root/autodl-tmp/models"
 # Use base Qwen2.5-VL instruct model instead of Seg-R1-7B
 MODEL_PATH = "Qwen/Qwen2.5-VL-7B-Instruct"
+# MODEL_PATH = "Qwen/Qwen2.5-VL-7B-Instruct-Q8_0"
 DEVICE_QWEN = "cuda:0"
 DEVICE_SAM = "cuda:0"
 RESIZE_SIZE = (1024, 1024)
 EPSILON_DEFAULT = 0.1
 
-model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+model = AutoModelForVision2Seq.from_pretrained(
     MODEL_PATH,
     torch_dtype=torch.bfloat16,
     attn_implementation="flash_attention_2",
