@@ -119,25 +119,20 @@ def prepare_test_messages(image, prompt, ratio: float = None, epsilon: float = E
 
     if "segment" in prompt or "mask" in prompt:
         SYSTEM_PROMPT_ORIG = (
-            "You are a vision assistant. Follow the OUTPUT FORMAT ONLY.\n"
-            "Return ONLY these XML tags, nothing else (no explanations, no extra words):\n"
-            "- <bbox>[x1,y1,x2,y2]</bbox> — integers only; include one or more blocks.\n"
-            "- <points>[[x,y],[x,y],...]</points> — exactly one block; integers only.\n"
-            "- <labels>[l1,l2,...]</labels> — exactly one block; each l is 1 or 0; length equals number of point pairs.\n\n"
-            "Hard rules:\n"
-            "1) Do NOT add attributes to any tag (e.g., <points x1=\"...\" y1=\"...\"> is FORBIDDEN).\n"
-            "2) Do NOT add units or words inside values (no \"px\", no \"animal\").\n"
-            "3) Values must be plain integers (no quotes).\n"
-            "4) At least one <bbox> must be present.\n"
-            "5) The number of labels must equal the number of point pairs.\n\n"
-            "Valid example:\n"
-            "<bbox>[10,20,200,220]</bbox>\n"
-            "<points>[[568,993]]</points>\n"
-            "<labels>[1]</labels>\n\n"
-            "Invalid examples (never do these):\n"
-            "<points x1=\"568\" y1=\"993\">animal</points>\n"
-            "<points>[{\"x\":568,\"y\":993}]</points>\n"
-            "<labels>foreground</labels>\n"
+            "You are a vision assistant. OUTPUT FORMAT ONLY. Return ONLY these XML tags, nothing else:\n"
+            "- <think>REASONING PROCESS</think> - The reasoning process guiding the following segmentation prompt generation.\n"
+            "- <bbox>[x1,y1,x2,y2]</bbox> — integers only.\n"
+            "- <points>[[x,y],[x,y],...]</points> — integers only.\n"
+            "- <labels>[l1,l2,...]</labels> — each l is 1 or 0.\n\n"
+            "Constraints (MUST satisfy all):\n"
+            "- Do NOT add attributes to tags; values must be plain integers (no quotes).\n"
+            "- Do NOT include any extra text outside these tags.\n\n"
+            "Valid example (counts will vary by constraints above):\n"
+            "<bbox>[12,34,256,300]</bbox>\n"
+            "<bbox>[100,120,200,240]</bbox>\n"
+            "<points>[[15,40],[180,220]]</points>\n"
+            "<labels>[1,0]</labels>\n\n"
+            "Invalid: <points x1=\"15\" y1=\"40\">cat</points> (attributes/text forbidden)\n"
         )
         safe_ratio = max(1e-6, min(1.0, float(ratio)))
         # Choose concrete counts: random bboxes in [1,10], points derived from ratio and clamped to [1,20]
@@ -145,6 +140,7 @@ def prepare_test_messages(image, prompt, ratio: float = None, epsilon: float = E
         num_points = max(1, min(20, int(round(safe_ratio * num_bboxes))))
         SYSTEM_PROMPT_RATIO = (
             "You are a vision assistant. OUTPUT FORMAT ONLY. Return ONLY these XML tags, nothing else:\n"
+            "- <think>REASONING PROCESS</think> - The reasoning process guiding the following segmentation prompt generation.\n"
             "- <bbox>[x1,y1,x2,y2]</bbox> — integers only.\n"
             "- <points>[[x,y],[x,y],...]</points> — integers only.\n"
             "- <labels>[l1,l2,...]</labels> — each l is 1 or 0.\n\n"
@@ -333,7 +329,7 @@ gr.Interface(
     inputs=[
         gr.Image(type="pil", label="Image"),
         gr.Textbox(lines=2, label="Text"),
-        gr.Slider(0.0, 1.0, step=0.01, value=0.5, label="Ratio")
+        gr.Slider(0.0, 10.0, step=0.01, value=1.0, label="Ratio")
     ],
     outputs=[
         gr.Textbox(label="Model Output (Original)"),
