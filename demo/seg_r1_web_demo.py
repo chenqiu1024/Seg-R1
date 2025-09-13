@@ -81,24 +81,37 @@ def parse_custom_format(content: str):
     label_pattern = r"<labels>\s*(\[\s*(?:\d+\s*,?\s*)+\])\s*</labels>"
     bbox_pattern  = r"<bbox>\s*(\[\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*\d+\s*\])\s*</bbox>"
 
-    point_match = re.search(point_pattern, content)
-    label_match = re.search(label_pattern, content)
+    point_matches = re.findall(point_pattern, content)
+    label_matches = re.findall(label_pattern, content)
     bbox_matches = re.findall(bbox_pattern, content)
 
     try:
-        points = np.array(eval(point_match.group(1))) if point_match else None
-        labels = np.array(eval(label_match.group(1))) if label_match else None
+        # Collect all points blocks
+        points_list = []
+        for pm in point_matches:
+            arr = np.array(eval(pm))
+            if len(arr.shape) == 2 and arr.shape[1] == 2:
+                points_list.append(arr)
+        points = np.concatenate(points_list, axis=0) if points_list else None
 
+        # Collect all labels blocks
+        labels_list = []
+        for lm in label_matches:
+            arr = np.array(eval(lm)).reshape(-1)
+            labels_list.append(arr)
+        labels = np.concatenate(labels_list, axis=0) if labels_list else None
+
+        # Validate lengths if both present
         if points is not None and labels is not None:
-            if not (len(points.shape) == 2 and points.shape[1] == 2 and len(labels) == points.shape[0]):
-                points, labels = None, None
+            if len(labels) != points.shape[0]:
+                labels = None
 
+        # BBoxes (already multiple)
         bboxes = []
         for bbox_str in bbox_matches:
             bbox = np.array(eval(bbox_str))
             if len(bbox.shape) == 1 and bbox.shape[0] == 4:
                 bboxes.append(bbox)
-        
         bboxes = np.stack(bboxes, axis=0) if bboxes else None
 
         return points, labels, bboxes
