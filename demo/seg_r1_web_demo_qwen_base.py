@@ -376,18 +376,34 @@ def run_pipeline(image: PILImage.Image, prompt: str, ratio: float):
             masks_np=[mask_np_local],
             alpha=0.6
         )
+        # Overlay annotations (boxes & points) on top of the highlighted masks
+        try:
+            vis_img_local = visualize_annotations_on_image(
+                vis_img_local,
+                points,
+                labels,
+                bbox,
+            )
+        except Exception as e:
+            print(f"Error overlaying annotations: {str(e)}")
         return vis_img_local
 
-    vis_ann_orig = None
-    if (points_orig is not None and len(points_orig) > 0) or (bbox_orig is not None and len(bbox_orig) > 0):
-        vis_ann_orig = visualize_annotations_on_image(image, points_orig, labels_orig, bbox_orig)
+    # Compute mask visualizations; if mask generation fails, fall back to drawing annotations on original image
+    visualized_img_orig = compute_visualization(points_orig, labels_orig, bbox_orig)
+    if visualized_img_orig is None:
+        if (points_orig is not None and len(points_orig) > 0) or (bbox_orig is not None and len(bbox_orig) > 0):
+            try:
+                visualized_img_orig = visualize_annotations_on_image(image, points_orig, labels_orig, bbox_orig)
+            except Exception as e:
+                print(f"Error visualizing annotations (orig): {str(e)}")
 
-    vis_ann_ratio = None
-    if (points_ratio is not None and len(points_ratio) > 0) or (bbox_ratio is not None and len(bbox_ratio) > 0):
-        vis_ann_ratio = visualize_annotations_on_image(image, points_ratio, labels_ratio, bbox_ratio)
-
-    visualized_img_orig = vis_ann_orig if vis_ann_orig is not None else compute_visualization(points_orig, labels_orig, bbox_orig)
-    visualized_img_ratio = vis_ann_ratio if vis_ann_ratio is not None else compute_visualization(points_ratio, labels_ratio, bbox_ratio)
+    visualized_img_ratio = compute_visualization(points_ratio, labels_ratio, bbox_ratio)
+    if visualized_img_ratio is None:
+        if (points_ratio is not None and len(points_ratio) > 0) or (bbox_ratio is not None and len(bbox_ratio) > 0):
+            try:
+                visualized_img_ratio = visualize_annotations_on_image(image, points_ratio, labels_ratio, bbox_ratio)
+            except Exception as e:
+                print(f"Error visualizing annotations (ratio): {str(e)}")
 
     return output_text_orig, visualized_img_orig, messages_ratio[0][0], output_text_ratio, visualized_img_ratio
 
