@@ -216,6 +216,51 @@ def visualize_masks_on_image_v2(
     
     return blended_pil.convert("RGB")
 
+def visualize_annotations_on_image(
+    image: PILImage.Image,
+    points=None,
+    labels=None,
+    bboxes=None,
+):
+    img_draw = image.copy()
+    draw = ImageDraw.Draw(img_draw)
+    width, height = img_draw.size
+    scale_x = width / RESIZE_SIZE[0]
+    scale_y = height / RESIZE_SIZE[1]
+
+    if bboxes is not None:
+        if isinstance(bboxes, np.ndarray):
+            if len(bboxes.shape) == 1 and len(bboxes) == 4:
+                b_iter = [bboxes.tolist()]
+            else:
+                b_iter = bboxes.tolist()
+        else:
+            b_iter = bboxes
+        for b in b_iter:
+            x1 = int(b[0] * scale_x)
+            y1 = int(b[1] * scale_y)
+            x2 = int(b[2] * scale_x)
+            y2 = int(b[3] * scale_y)
+            draw.rectangle([x1, y1, x2, y2], outline=(255, 215, 0), width=4)
+
+    if points is not None:
+        pts = points.tolist() if isinstance(points, np.ndarray) else points
+        lbls = labels.tolist() if (labels is not None and isinstance(labels, np.ndarray)) else labels
+        for idx, (x, y) in enumerate(pts):
+            xi = int(x * scale_x)
+            yi = int(y * scale_y)
+            r = 6
+            is_fg = False
+            if lbls is not None:
+                try:
+                    is_fg = int(lbls[idx]) == 1
+                except Exception:
+                    is_fg = False
+            color = (0, 255, 0) if is_fg else (255, 0, 0)
+            draw.ellipse([xi - r, yi - r, xi + r, yi + r], fill=color, outline=(0, 0, 0))
+
+    return img_draw
+
 def run_pipeline(image: PILImage.Image, prompt: str, ratio: float):
     img_original = image.copy()
     img_resized = TF.resize(image, RESIZE_SIZE)
@@ -299,8 +344,16 @@ def run_pipeline(image: PILImage.Image, prompt: str, ratio: float):
         )
         return vis_img_local
 
-    visualized_img_orig = compute_visualization(points_orig, labels_orig, bbox_orig)
-    visualized_img_ratio = compute_visualization(points_ratio, labels_ratio, bbox_ratio)
+    vis_ann_orig = None
+    if (points_orig is not None and len(points_orig) > 0) or (bbox_orig is not None and len(bbox_orig) > 0):
+        vis_ann_orig = visualize_annotations_on_image(image, points_orig, labels_orig, bbox_orig)
+
+    vis_ann_ratio = None
+    if (points_ratio is not None and len(points_ratio) > 0) or (bbox_ratio is not None and len(bbox_ratio) > 0):
+        vis_ann_ratio = visualize_annotations_on_image(image, points_ratio, labels_ratio, bbox_ratio)
+
+    visualized_img_orig = vis_ann_orig if vis_ann_orig is not None else compute_visualization(points_orig, labels_orig, bbox_orig)
+    visualized_img_ratio = vis_ann_ratio if vis_ann_ratio is not None else compute_visualization(points_ratio, labels_ratio, bbox_ratio)
 
     return output_text_orig, visualized_img_orig, messages_ratio[0][0], output_text_ratio, visualized_img_ratio
 
