@@ -141,8 +141,8 @@ def prepare_test_messages(image, prompt, ratio: float = None, epsilon: float = E
           "Points MUST be an array of 2D pairs only (e.g., [[459,263],[228,352]]). Do NOT output a flat list like [x1,y1,x2,y2] or a single item like [[x1,y1,x2,y2]]. There is only one points block."
           "Labels MUST be binary (0 or 1) and the number of labels MUST equal the number of point pairs. Each label indicates the foreground (1) or background (0) of the corresponding point.There is only one labels block."
           "Use only integers and commas inside the arrays; no units or decimals. Do NOT add any words outside the tags. "
-          "Valid: <think>We locate the objects and pick foreground/background points</think><bbox>[215,192,830,960]</bbox><points>[[459,263],[228,352]]</points><labels>[1,0]</labels>. "
-          "Invalid: <think>REASONING</think><bbox>215,192,830,960</bbox><points>[[136,51,190,174]]</points><labels>[1,0,245,637]</labels>. "
+          "Valid example: <think>The image shows a hummingbird interacting with a bird feeder. The bird is the main focus, with its green and blue plumage and long beak clearly visible. There's also a small insect, possibly a bee, on the feeder, which is not part of the animal category but rather an object in the scene.</think><bbox>[215,191,830,960]</bbox><points>[[270,508],[380,699],[618,580]]</points><labels>[1,1,1]</labels>"
+          "Invalid example: <think>REASONING</think><bbox>215,192,830,960</bbox><points>[[136,51,190,174]]</points><labels>[1,0,245,637]</labels>. "
           "Self-check BEFORE sending: single line; exact tag order; bbox uses [....]; points are [[x,y],...]; labels are 0/1 and match point count."
         )
         safe_ratio = max(1e-6, min(1.0, float(ratio)))
@@ -161,8 +161,8 @@ def prepare_test_messages(image, prompt, ratio: float = None, epsilon: float = E
             "BBoxes MUST include brackets inside the tag. Points MUST be 2D pairs only (no flat lists). There can be multiple bbox blocks. There is only one points block."
             "Labels MUST be binary and the count MUST match the number of point pairs. Each label indicates the foreground (1) or background (0) of the corresponding point. There is only one labels block."
             "Use only integers and commas inside arrays; no extra characters; no markdown; no newlines. "
-            "Valid: <think>We find targets and select points</think><bbox>[215,192,830,960]</bbox><points>[[459,263],[228,352]]</points><labels>[1,0]</labels>. "
-            "Invalid: <think>REASONING</think><bbox>215,192,830,960</bbox><points>[[136,51,190,174]]</points><labels>[1,0,245,637]</labels>. "
+            "Valid example: <think>The image shows a hummingbird interacting with a bird feeder. The bird is the main focus, with its green and blue plumage and long beak clearly visible. There's also a small insect, possibly a bee, on the feeder, which is not part of the animal category but rather an object in the scene.</think><bbox>[215,191,830,960]</bbox><points>[[270,508],[380,699],[618,580]]</points><labels>[1,1,1]</labels>"
+            "Invalid example: <think>REASONING</think><bbox>215,192,830,960</bbox><points>[[136,51,190,174]]</points><labels>[1,0,245,637]</labels>. "
             f"Self-check BEFORE sending: count(<bbox>)=={num_bboxes}; exactly one <points>; exactly one <labels>; "
             f"len(points)=={num_points}; len(labels)=={num_points}; labels in {{0,1}}; points are [[x,y],...]."
         )
