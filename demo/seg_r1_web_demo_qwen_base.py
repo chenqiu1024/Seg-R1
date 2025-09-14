@@ -138,6 +138,11 @@ def prepare_test_messages(image, prompt, ratio: float = None, epsilon: float = E
           "process should enclosed within <think> </think> tags, and the bounding box, points and points labels should be enclosed within <bbox></bbox>, <points></points>, and <labels></labels>, respectively. i.e., "
           "<think> reasoning process here </think> <bbox>[x1,y1,x2,y2]</bbox>, <points>[[x3,y3],[x4,y4],...]</points>, <labels>[1,0,...]</labels>"
           "Where 1 indicates a foreground (object) point, and 0 indicates a background point."
+          "Valid example of points block: <points>[[459, 263],[228, 352]]</points>"
+          "Valid example of bbox block: <bbox>[215,192,830,960]</bbox><bbox>[132,72,258,663]</bbox>"
+          "Invalid example(s) of points block #1: <points x1=\"459\" y1=\"468\" alt=\"animals\">animals</points>"
+          "Invalid example(s) of points block #2: <points>[[137,51,191,175]]</points>"
+          "Invalid example(s) of bbox block #1: <bbox>[215,192,830,960]\">[215,192,830,960]</bbox>"
         )
         safe_ratio = max(1e-6, min(1.0, float(ratio)))
         # Choose concrete counts: random bboxes in [1,20], points derived from ratio and clamped to [1,20]
@@ -154,6 +159,11 @@ def prepare_test_messages(image, prompt, ratio: float = None, epsilon: float = E
             f"Generate EXACTLY ONE <points> block containing EXACTLY {num_points} coordinate pairs. "
             f"Generate EXACTLY ONE <labels> block containing EXACTLY {num_points} labels (1 or 0), matching the points order. "
             "Do NOT include any extra text outside these tags."
+            "Valid example of points block: <points>[[459, 263],[228, 352]]</points>"
+            "Valid example of bbox block: <bbox>[215,192,830,960]</bbox><bbox>[132,72,258,663]</bbox>"
+            "Invalid example(s) of points block #1: <points x1=\"459\" y1=\"468\" alt=\"animals\">animals</points>"
+            "Invalid example(s) of points block #2: <points>[[137,51,191,175]]</points>"
+            "Invalid example(s) of bbox block #1: <bbox>[215,192,830,960]\">[215,192,830,960]</bbox>"
         )
     else:
         SYSTEM_PROMPT_ORIG = (
