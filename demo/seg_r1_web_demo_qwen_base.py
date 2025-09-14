@@ -132,38 +132,34 @@ def prepare_test_messages(image, prompt, ratio: float = None, epsilon: float = E
     img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
 
     if "segment" in prompt or "mask" in prompt:
+        max_x, max_y = RESIZE_SIZE
         SYSTEM_PROMPT_ORIG = (
-          "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant "
-          "first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning "
-          "process should enclosed within <think> </think> tags, and the bounding box, points and points labels should be enclosed within <bbox></bbox>, <points></points>, and <labels></labels>, respectively. i.e., "
-          "<think> reasoning process here </think> <bbox>[x1,y1,x2,y2]</bbox>, <points>[[x3,y3],[x4,y4],...]</points>, <labels>[1,0,...]</labels>"
-          "Where 1 indicates a foreground (object) point, and 0 indicates a background point."
-          "Valid example of points block: <points>[[459, 263],[228, 352]]</points>"
-          "Valid example of bbox block: <bbox>[215,192,830,960]</bbox><bbox>[132,72,258,663]</bbox>"
-          "Invalid example(s) of points block #1: <points x1=\"459\" y1=\"468\" alt=\"animals\">animals</points>"
-          "Invalid example(s) of points block #2: <points>[[137,51,191,175]]</points>"
-          "Invalid example(s) of bbox block #1: <bbox>[215,192,830,960]\">[215,192,830,960]</bbox>"
+          "You are a visual segmentation assistant. First, think privately inside <think>...</think>. "
+          "Then output ONLY the required tags on ONE SINGLE LINE with NO extra text or newlines. "
+          "Exact order: <think>REASONING</think><bbox>[x1,y1,x2,y2]</bbox>...<points>[[x,y],...]</points><labels>[l1,l2,...]</labels>. "
+          f"Coordinates are INTEGERS with 0<=x<{max_x} and 0<=y<{max_y}. "
+          "If <points> appears, include EXACTLY one matching <labels> with 0/1 values. "
+          "Tag order must be exact; no markdown; no quotes. Start with <think> and end with </labels> if labels are present, "
+          "otherwise end with the last </bbox>. Self-check before sending: single line, integer ranges, lengths match, exact order."
         )
         safe_ratio = max(1e-6, min(1.0, float(ratio)))
         # Choose concrete counts: random bboxes in [1,20], points derived from ratio and clamped to [1,20]
         num_bboxes = random.randint(1, 10)
         num_points = max(1, min(20, int(round(safe_ratio * num_bboxes))))
         SYSTEM_PROMPT_RATIO = (
-            "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant "
-            "first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning "
-            "process should enclosed within <think> </think> tags, and the bounding box, points and points labels should be enclosed within <bbox></bbox>, <points></points>, and <labels></labels>, respectively. i.e., "
-            "<think> reasoning process here </think> <bbox>[x1,y1,x2,y2]</bbox>, <points>[[x3,y3],[x4,y4],...]</points>, <labels>[1,0,...]</labels>. "
-            "There could be multiple <bbox> blocks. "
-            "Constraints: "
-            f"Generate EXACTLY {num_bboxes} separate <bbox> blocks. "
-            f"Generate EXACTLY ONE <points> block containing EXACTLY {num_points} coordinate pairs. "
-            f"Generate EXACTLY ONE <labels> block containing EXACTLY {num_points} labels (1 or 0), matching the points order. "
-            "Do NOT include any extra text outside these tags."
-            "Valid example of points block: <points>[[459, 263],[228, 352]]</points>"
-            "Valid example of bbox block: <bbox>[215,192,830,960]</bbox><bbox>[132,72,258,663]</bbox>"
-            "Invalid example(s) of points block #1: <points x1=\"459\" y1=\"468\" alt=\"animals\">animals</points>"
-            "Invalid example(s) of points block #2: <points>[[137,51,191,175]]</points>"
-            "Invalid example(s) of bbox block #1: <bbox>[215,192,830,960]\">[215,192,830,960]</bbox>"
+            "You are a visual segmentation assistant. First, think privately inside <think>...</think>. "
+            "Then output ONLY the required tags on ONE SINGLE LINE with NO extra text or newlines. "
+            "Follow this EXACT template and counts: "
+            "<think>REASONING</think>"
+            f"<bbox>[x1,y1,x2,y2]</bbox> repeated EXACTLY {num_bboxes} times"
+            f"<points>[[x,y],...]</points> with EXACTLY {num_points} coordinate pairs"
+            f"<labels>[v1,...]</labels> with EXACTLY {num_points} values (each 0 or 1). "
+            f"Coordinates are INTEGERS with 0<=x<{max_x} and 0<=y<{max_y}. "
+            "Tag order is EXACT: all <bbox> blocks first, then ONE <points>, then ONE <labels>. "
+            "No other tags or text; no markdown; single line only. Start with <think> and end with </labels>. "
+            f"Self-check BEFORE sending: count(<bbox>)=={num_bboxes}, count(<points>)==1, count(<labels>)==1, "
+            f"len(points)=={num_points}, len(labels)=={num_points}, "
+            "labels in {0,1}, integer coordinates in range. If any rule fails, regenerate internally and send ONLY the valid final line."
         )
     else:
         SYSTEM_PROMPT_ORIG = (
