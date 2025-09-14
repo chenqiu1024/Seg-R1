@@ -138,12 +138,14 @@ def prepare_test_messages(image, prompt, ratio: float = None, epsilon: float = E
           "Then output ONLY the required tags on ONE SINGLE LINE with NO extra text. "
           "Exact order: <think>...</think><bbox>[x1,y1,x2,y2]</bbox>...<points>[[x,y],[x,y],...]</points><labels>[l1,l2,...]</labels>. "
           "BBoxes MUST include brackets inside the tag: <bbox>[x1,y1,x2,y2]</bbox>. There can be multiple bbox blocks. "
-          "Points MUST be an array of 2D pairs only (e.g., [[459,263],[228,352]]). Do NOT output a flat list like [x1,y1,x2,y2] or a single item like [[x1,y1,x2,y2]]. There is only one points block."
-          "Labels MUST be binary (0 or 1) and the number of labels MUST equal the number of point pairs. Each label indicates the foreground (1) or background (0) of the corresponding point.There is only one labels block."
+          "Points MUST be an array of 2D pairs only. Each inner item MUST be exactly two integers: [[x,y],[x,y],...]. "
+          "Never output any inner item with 3 or 4 numbers like [x1,y1,x2,y2]; if you think in that way, SPLIT it into two 2D pairs: [x1,y1],[x2,y2]. There is only one points block. "
+          "Labels MUST be binary (0 or 1) and the number of labels MUST equal the number of point pairs. Each label indicates the foreground (1) or background (0) of the corresponding point. There is only one labels block. "
           "Use only integers and commas inside the arrays; no units or decimals. Do NOT add any words outside the tags. "
           "Valid example: <think>The image shows a hummingbird interacting with a bird feeder. The bird is the main focus, with its green and blue plumage and long beak clearly visible. There's also a small insect, possibly a bee, on the feeder, which is not part of the animal category but rather an object in the scene.</think><bbox>[215,191,830,960]</bbox><points>[[270,508],[380,699],[618,580]]</points><labels>[1,1,1]</labels>"
-          "Invalid example: <think>REASONING</think><bbox>215,192,830,960</bbox><points>[[136,51,190,174]]</points><labels>[1,0,245,637]</labels>. "
-          "Self-check BEFORE sending: single line; exact tag order; bbox uses [....]; points are [[x,y],...]; labels are 0/1 and match point count."
+          "Invalid example 1: <points>[[142,52,188,174],[213,191,830,958]]</points> (items have 4 numbers) "
+          "Invalid example 2: <think>REASONING</think><bbox>215,192,830,960</bbox><points>[[136,51,190,174]]</points><labels>[1,0,245,637]</labels>. "
+          "Self-check BEFORE sending: single line; exact tag order; bbox uses [....]; points are a list of 2-integer pairs only; labels are 0/1 and match point count; zero extra text."
         )
         safe_ratio = max(1e-6, min(1.0, float(ratio)))
         # Choose concrete counts: random bboxes in [1,20], points derived from ratio and clamped to [1,20]
@@ -158,13 +160,14 @@ def prepare_test_messages(image, prompt, ratio: float = None, epsilon: float = E
             f"<bbox>[x1,y1,x2,y2]</bbox> repeated EXACTLY {num_bboxes} times"
             f"<points>[[x,y],[x,y],...]</points> with EXACTLY {num_points} coordinate pairs"
             f"<labels>[v1,v2,...]</labels> with EXACTLY {num_points} values, each 0 or 1. "
-            "BBoxes MUST include brackets inside the tag. Points MUST be 2D pairs only (no flat lists). There can be multiple bbox blocks. There is only one points block."
-            "Labels MUST be binary and the count MUST match the number of point pairs. Each label indicates the foreground (1) or background (0) of the corresponding point. There is only one labels block."
+            "BBoxes MUST include brackets inside the tag. Points MUST be 2D pairs only (no flat lists). There can be multiple bbox blocks. There is only one points block. "
+            "Labels MUST be binary and the count MUST match the number of point pairs. Each label indicates the foreground (1) or background (0) of the corresponding point. There is only one labels block. "
             "Use only integers and commas inside arrays; no extra characters; no markdown; no newlines. "
             "Valid example: <think>The image shows a hummingbird interacting with a bird feeder. The bird is the main focus, with its green and blue plumage and long beak clearly visible. There's also a small insect, possibly a bee, on the feeder, which is not part of the animal category but rather an object in the scene.</think><bbox>[215,191,830,960]</bbox><points>[[270,508],[380,699],[618,580]]</points><labels>[1,1,1]</labels>"
-            "Invalid example: <think>REASONING</think><bbox>215,192,830,960</bbox><points>[[136,51,190,174]]</points><labels>[1,0,245,637]</labels>. "
+            "Invalid example 1: <points>[[142,52,188,174],[213,191,830,958]]</points> (items have 4 numbers) "
+            "Invalid example 2: <think>REASONING</think><bbox>215,192,830,960</bbox><points>[[136,51,190,174]]</points><labels>[1,0,245,637]</labels>. "
             f"Self-check BEFORE sending: count(<bbox>)=={num_bboxes}; exactly one <points>; exactly one <labels>; "
-            f"len(points)=={num_points}; len(labels)=={num_points}; labels in {{0,1}}; points are [[x,y],...]."
+            f"len(points)=={num_points}; len(labels)=={num_points}; labels in {{0,1}}; and EVERY inner item in points has exactly two integers [x,y]."
         )
     else:
         SYSTEM_PROMPT_ORIG = (
