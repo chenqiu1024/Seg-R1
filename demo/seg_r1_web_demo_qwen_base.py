@@ -135,16 +135,16 @@ def prepare_test_messages(image, prompt, ratio: float = None, epsilon: float = E
         SYSTEM_PROMPT_ORIG = (
           "You are a visual segmentation assistant. First, write a brief 10–30 word reasoning inside <think>...</think> in natural language about how you will choose boxes and points as prompts for SAM2 to answer user's question wrt the image input. "
           "Do NOT use placeholders like 'REASONING', 'THINKING', or '...'. "
-          "Then output ONLY the required tags on ONE SINGLE LINE with NO extra text. "
-          "Exact order: <think>...</think><bbox>[x1,y1,x2,y2]</bbox>...<points>[[x,y],[x,y],...]</points><labels>[l1,l2,...]</labels>. "
-          "BBoxes MUST include brackets inside the tag: <bbox>[x1,y1,x2,y2]</bbox>. There can be multiple bbox blocks. "
-          "Points MUST be an array of 2D pairs only. Each inner item MUST be exactly two integers: [[x,y],[x,y],...]. "
-          "Never output any inner item with 3 or 4 numbers like [x1,y1,x2,y2]; if you think in that way, SPLIT it into two 2D pairs: [x1,y1],[x2,y2]. There is only one points block. "
+          "Then output ONLY the required tags on ONE SINGLE LINE with NO extra text. \n"
+          "Exact format: <think>...</think><bbox>[XL,YT,XR,YB]</bbox>...<points>[[X1,Y1],[X2,Y2],...]</points><labels>[L1,L2,...]</labels>. \n"
+          "BBoxes MUST include brackets inside the tag: <bbox>[XL,YT,XR,YB]</bbox>. There can be multiple bbox blocks. \n"
+          "Points MUST be an array of 2D pairs only. Each inner item MUST be exactly two integers: [[X1,Y1],[X2,Y2],...]. \n"
+          "Never output any inner item with 3 or 4 numbers like [X1,Y1,X2,Y2]; if you think in that way, SPLIT it into two 2D pairs: [X1,Y1],[X2,Y2]. There is only one points block. "
           "Labels MUST be binary (0 or 1) and the number of labels MUST equal the number of point pairs. Each label indicates the foreground (1) or background (0) of the corresponding point. There is only one labels block. "
           "Use only integers and commas inside the arrays; no units or decimals. Do NOT add any words outside the tags. "
-          "Valid example: <think>The image shows a hummingbird interacting with a bird feeder. The bird is the main focus, with its green and blue plumage and long beak clearly visible. There's also a small insect, possibly a bee, on the feeder, which is not part of the animal category but rather an object in the scene.</think><bbox>[215,191,830,960]</bbox><points>[[270,508],[380,699],[618,580]]</points><labels>[1,1,1]</labels>"
-          "Invalid example 1: <points>[[142,52,188,174],[213,191,830,958]]</points> (items have 4 numbers) "
-          "Invalid example 2: <think>REASONING</think><bbox>215,192,830,960</bbox><points>[[136,51,190,174]]</points><labels>[1,0,245,637]</labels>. "
+          "Valid example: <think>The image shows a hummingbird interacting with a bird feeder. The bird is the main focus, with its green and blue plumage and long beak clearly visible. There's also a small insect, possibly a bee, on the feeder, which is not part of the animal category but rather an object in the scene.</think><bbox>[XL,YT,XR,YB]</bbox><points>[[X1,Y1],[X2,Y2],[X3,Y3]]</points><labels>[1,0,1]</labels>"
+          "Invalid example 1: <think>...</think><bbox>[XL,YT,XR,YB]</bbox><points>[[X1,Y1,X2,Y2],[X3,Y3,X4,Y4]]</points><labels>[0,1,1,0]</labels> : items of points have 4 numbers"
+          "Invalid example 2: <think>REASONING</think><bbox>XL,YT,XR,YB</bbox><points>[[X1,Y1,X2,Y2]]</points><labels>[1,0]</labels> : multiple error types"
           "Self-check BEFORE sending: single line; exact tag order; bbox uses [....]; points are a list of 2-integer pairs only; labels are 0/1 and match point count; zero extra text."
         )
         safe_ratio = max(1e-6, min(1.0, float(ratio)))
@@ -156,16 +156,16 @@ def prepare_test_messages(image, prompt, ratio: float = None, epsilon: float = E
             "Do NOT use placeholders like 'REASONING', 'THINKING', or '...'. "
             "Then output ONLY the required tags on ONE SINGLE LINE with NO extra text. "
             "Follow this EXACT template and counts: "
-            "<think>...</think>"
-            f"<bbox>[x1,y1,x2,y2]</bbox> repeated EXACTLY {num_bboxes} times"
-            f"<points>[[x,y],[x,y],...]</points> with EXACTLY {num_points} coordinate pairs"
-            f"<labels>[v1,v2,...]</labels> with EXACTLY {num_points} values, each 0 or 1. "
+            "Exact format: <think>...</think><bbox>[XL,YT,XR,YB]</bbox>...<points>[[X1,Y1],[X2,Y2],...]</points><labels>[L1,L2,...]</labels>. \n"
+            f"<bbox>[XL,YT,XR,YB]</bbox> repeated EXACTLY {num_bboxes} times"
+            f"<points>[[X1,Y1],[X2,Y2],...]</points> with EXACTLY {num_points} coordinate pairs"
+            f"<labels>[L1,L2,...]</labels> with EXACTLY {num_points} values, each 0 or 1. "
             "BBoxes MUST include brackets inside the tag. Points MUST be 2D pairs only (no flat lists). There can be multiple bbox blocks. There is only one points block. "
             "Labels MUST be binary and the count MUST match the number of point pairs. Each label indicates the foreground (1) or background (0) of the corresponding point. There is only one labels block. "
             "Use only integers and commas inside arrays; no extra characters; no markdown; no newlines. "
-            "Valid example: <think>The image shows a hummingbird interacting with a bird feeder. The bird is the main focus, with its green and blue plumage and long beak clearly visible. There's also a small insect, possibly a bee, on the feeder, which is not part of the animal category but rather an object in the scene.</think><bbox>[215,191,830,960]</bbox><points>[[270,508],[380,699],[618,580]]</points><labels>[1,1,1]</labels>"
-            "Invalid example 1: <points>[[142,52,188,174],[213,191,830,958]]</points> (items have 4 numbers) "
-            "Invalid example 2: <think>REASONING</think><bbox>215,192,830,960</bbox><points>[[136,51,190,174]]</points><labels>[1,0,245,637]</labels>. "
+            "Valid example: <think>The image shows a hummingbird interacting with a bird feeder. The bird is the main focus, with its green and blue plumage and long beak clearly visible. There's also a small insect, possibly a bee, on the feeder, which is not part of the animal category but rather an object in the scene.</think><bbox>[XL,YT,XR,YB]</bbox><points>[[X1,Y1],[X2,Y2],[X3,Y3]]</points><labels>[1,0,1]</labels>"
+            "Invalid example 1: <think>...</think><bbox>[XL,YT,XR,YB]</bbox><points>[[X1,Y1,X2,Y2],[X3,Y3,X4,Y4]]</points><labels>[0,1,1,0]</labels> : items of points have 4 numbers"
+            "Invalid example 2: <think>REASONING</think><bbox>XL,YT,XR,YB</bbox><points>[[X1,Y1,X2,Y2]]</points><labels>[1,0]</labels> : multiple error types"
             f"Self-check BEFORE sending: count(<bbox>)=={num_bboxes}; exactly one <points>; exactly one <labels>; "
             f"len(points)=={num_points}; len(labels)=={num_points}; labels in {{0,1}}; and EVERY inner item in points has exactly two integers [x,y]."
         )
@@ -403,7 +403,7 @@ def run_pipeline(image: PILImage.Image, prompt: str, ratio: float):
             except Exception as e:
                 print(f"Error visualizing annotations (ratio): {str(e)}")
 
-    return output_text_orig, visualized_img_orig, messages_ratio[0][0], output_text_ratio, visualized_img_ratio
+    return messages_orig[0][0], output_text_orig, visualized_img_orig, messages_ratio[0][0], output_text_ratio, visualized_img_ratio
 
 gr.Interface(
     fn=run_pipeline,
@@ -413,6 +413,7 @@ gr.Interface(
         gr.Slider(0.0, 10.0, step=0.01, value=1.0, label="Ratio")
     ],
     outputs=[
+        gr.Textbox(label="Model System Prompt (Original)"),
         gr.Textbox(label="Model Output (Original)"),
         gr.Image(type="pil", label="Mask Prediction (Original)"),
         gr.Textbox(label="Model System Prompt (Ratio)"),
