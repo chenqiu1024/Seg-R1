@@ -145,7 +145,8 @@ def prepare_test_messages(image, prompt, ratio: float = None, epsilon: float = E
           "Valid example: <think>The image shows a hummingbird interacting with a bird feeder. The bird is the main focus, with its green and blue plumage and long beak clearly visible. There's also a small insect, possibly a bee, on the feeder, which is not part of the animal category but rather an object in the scene.</think><bbox>[XL,YT,XR,YB]</bbox><points>[[X1,Y1],[X2,Y2],[X3,Y3]]</points><labels>[1,0,1]</labels>"
           "Invalid example 1: <think>...</think><bbox>[XL,YT,XR,YB]</bbox><points>[[X1,Y1,X2,Y2],[X3,Y3,X4,Y4]]</points><labels>[0,1,1,0]</labels> : items of points have 4 numbers"
           "Invalid example 2: <think>REASONING</think><bbox>XL,YT,XR,YB</bbox><points>[[X1,Y1,X2,Y2]]</points><labels>[1,0]</labels> : multiple error types"
-          "Self-check BEFORE sending: single line; exact tag order; bbox uses [....]; points are a list of 2-integer pairs only; labels are 0/1 and match point count; zero extra text."
+          "Self-check BEFORE sending: single line; exact tag order; bbox uses [....]; points are a list of 2-integer pairs only; labels are 0/1 and match point count; zero extra text. "
+          "Critical rule: If ANY inner item like [X1,Y1,X2,Y2] appears in <points>, REWRITE it as [X1,Y1],[X2,Y2] BEFORE sending, and adjust <labels> to match the number of point pairs."
         )
         safe_ratio = max(1e-6, min(1.0, float(ratio)))
         # Choose concrete counts: random bboxes in [1,20], points derived from ratio and clamped to [1,20]
@@ -167,7 +168,8 @@ def prepare_test_messages(image, prompt, ratio: float = None, epsilon: float = E
             "Invalid example 1: <think>...</think><bbox>[XL,YT,XR,YB]</bbox><points>[[X1,Y1,X2,Y2],[X3,Y3,X4,Y4]]</points><labels>[0,1,1,0]</labels> : items of points have 4 numbers"
             "Invalid example 2: <think>REASONING</think><bbox>XL,YT,XR,YB</bbox><points>[[X1,Y1,X2,Y2]]</points><labels>[1,0]</labels> : multiple error types"
             f"Self-check BEFORE sending: count(<bbox>)=={num_bboxes}; exactly one <points>; exactly one <labels>; "
-            f"len(points)=={num_points}; len(labels)=={num_points}; labels in {{0,1}}; and EVERY inner item in points has exactly two integers [x,y]."
+            f"len(points)=={num_points}; len(labels)=={num_points}; labels in {{0,1}}; and EVERY inner item in points has exactly two integers [x,y]. "
+            "Critical rule: If ANY inner item like [X1,Y1,X2,Y2] appears in <points>, REWRITE it as [X1,Y1],[X2,Y2] BEFORE sending, and adjust <labels> to match the number of point pairs."
         )
     else:
         SYSTEM_PROMPT_ORIG = (
