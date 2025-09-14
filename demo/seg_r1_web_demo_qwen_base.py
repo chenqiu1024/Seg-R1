@@ -132,34 +132,39 @@ def prepare_test_messages(image, prompt, ratio: float = None, epsilon: float = E
     img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
 
     if "segment" in prompt or "mask" in prompt:
-        max_x, max_y = RESIZE_SIZE
         SYSTEM_PROMPT_ORIG = (
-          "You are a visual segmentation assistant. First, think privately inside <think>...</think>. "
-          "Then output ONLY the required tags on ONE SINGLE LINE with NO extra text or newlines. "
-          "Exact order: <think>REASONING</think><bbox>[x1,y1,x2,y2]</bbox>...<points>[[x,y],...]</points><labels>[l1,l2,...]</labels>. "
-          f"Coordinates are INTEGERS with 0<=x<{max_x} and 0<=y<{max_y}. "
-          "If <points> appears, include EXACTLY one matching <labels> with 0/1 values. "
-          "Tag order must be exact; no markdown; no quotes. Start with <think> and end with </labels> if labels are present, "
-          "otherwise end with the last </bbox>. Self-check before sending: single line, integer ranges, lengths match, exact order."
+          "You are a visual segmentation assistant. First, write a brief 10–30 word reasoning inside <think>...</think> in natural language about how you will choose boxes and points as prompts for SAM2 to answer user's question wrt the image input. "
+          "Do NOT use placeholders like 'REASONING', 'THINKING', or '...'. "
+          "Then output ONLY the required tags on ONE SINGLE LINE with NO extra text. "
+          "Exact order: <think>...</think><bbox>[x1,y1,x2,y2]</bbox>...<points>[[x,y],[x,y],...]</points><labels>[l1,l2,...]</labels>. "
+          "BBoxes MUST include brackets inside the tag: <bbox>[x1,y1,x2,y2]</bbox>. There can be multiple bbox blocks. "
+          "Points MUST be an array of 2D pairs only (e.g., [[459,263],[228,352]]). Do NOT output a flat list like [x1,y1,x2,y2] or a single item like [[x1,y1,x2,y2]]. There is only one points block."
+          "Labels MUST be binary (0 or 1) and the number of labels MUST equal the number of point pairs. Each label indicates the foreground (1) or background (0) of the corresponding point.There is only one labels block."
+          "Use only integers and commas inside the arrays; no units or decimals. Do NOT add any words outside the tags. "
+          "Valid: <think>We locate the objects and pick foreground/background points</think><bbox>[215,192,830,960]</bbox><points>[[459,263],[228,352]]</points><labels>[1,0]</labels>. "
+          "Invalid: <think>REASONING</think><bbox>215,192,830,960</bbox><points>[[136,51,190,174]]</points><labels>[1,0,245,637]</labels>. "
+          "Self-check BEFORE sending: single line; exact tag order; bbox uses [....]; points are [[x,y],...]; labels are 0/1 and match point count."
         )
         safe_ratio = max(1e-6, min(1.0, float(ratio)))
         # Choose concrete counts: random bboxes in [1,20], points derived from ratio and clamped to [1,20]
         num_bboxes = random.randint(1, 10)
         num_points = max(1, min(20, int(round(safe_ratio * num_bboxes))))
         SYSTEM_PROMPT_RATIO = (
-            "You are a visual segmentation assistant. First, think privately inside <think>...</think>. "
-            "Then output ONLY the required tags on ONE SINGLE LINE with NO extra text or newlines. "
+            "You are a visual segmentation assistant. First, write a brief 10–30 word reasoning inside <think>...</think> in natural language about how you will choose boxes and points as prompts for SAM2 to answer user's question wrt the image input. "
+            "Do NOT use placeholders like 'REASONING', 'THINKING', or '...'. "
+            "Then output ONLY the required tags on ONE SINGLE LINE with NO extra text. "
             "Follow this EXACT template and counts: "
-            "<think>REASONING</think>"
+            "<think>...</think>"
             f"<bbox>[x1,y1,x2,y2]</bbox> repeated EXACTLY {num_bboxes} times"
-            f"<points>[[x,y],...]</points> with EXACTLY {num_points} coordinate pairs"
-            f"<labels>[v1,...]</labels> with EXACTLY {num_points} values (each 0 or 1). "
-            f"Coordinates are INTEGERS with 0<=x<{max_x} and 0<=y<{max_y}. "
-            "Tag order is EXACT: all <bbox> blocks first, then ONE <points>, then ONE <labels>. "
-            "No other tags or text; no markdown; single line only. Start with <think> and end with </labels>. "
-            f"Self-check BEFORE sending: count(<bbox>)=={num_bboxes}, count(<points>)==1, count(<labels>)==1, "
-            f"len(points)=={num_points}, len(labels)=={num_points}, "
-            "labels in {0,1}, integer coordinates in range. If any rule fails, regenerate internally and send ONLY the valid final line."
+            f"<points>[[x,y],[x,y],...]</points> with EXACTLY {num_points} coordinate pairs"
+            f"<labels>[v1,v2,...]</labels> with EXACTLY {num_points} values, each 0 or 1. "
+            "BBoxes MUST include brackets inside the tag. Points MUST be 2D pairs only (no flat lists). There can be multiple bbox blocks. There is only one points block."
+            "Labels MUST be binary and the count MUST match the number of point pairs. Each label indicates the foreground (1) or background (0) of the corresponding point. There is only one labels block."
+            "Use only integers and commas inside arrays; no extra characters; no markdown; no newlines. "
+            "Valid: <think>We find targets and select points</think><bbox>[215,192,830,960]</bbox><points>[[459,263],[228,352]]</points><labels>[1,0]</labels>. "
+            "Invalid: <think>REASONING</think><bbox>215,192,830,960</bbox><points>[[136,51,190,174]]</points><labels>[1,0,245,637]</labels>. "
+            f"Self-check BEFORE sending: count(<bbox>)=={num_bboxes}; exactly one <points>; exactly one <labels>; "
+            f"len(points)=={num_points}; len(labels)=={num_points}; labels in {{0,1}}; points are [[x,y],...]."
         )
     else:
         SYSTEM_PROMPT_ORIG = (
