@@ -358,7 +358,7 @@ class Qwen2VLGRPOTrainer(Trainer):
         if self._signature_columns is None:
             self._signature_columns = ["prompt"]
 
-
+## Backpropagate will happen here to update the Policy Model:
     # Paper alignment: per-token log-probs for policy/ref used to compute GRPO loss and KL term.
     def _get_per_token_logps(self, model, input_ids, attention_mask, pixel_values, image_grid_thw):
         """Compute log p(x_t | x_{<t}) per token for a given model.
@@ -394,7 +394,7 @@ class Qwen2VLGRPOTrainer(Trainer):
         retain multimodal raw inputs because GRPO assembles model feeds inside
         compute_loss.
         """
-        return inputs
+        return inputs  # ← Just pass through unchanged!
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         """Compute GRPO loss for a batch.
@@ -422,7 +422,7 @@ class Qwen2VLGRPOTrainer(Trainer):
             padding=True,
             padding_side="left",
             add_special_tokens=False,
-        )
+        )  # Now we have tensors!
         prompt_inputs = super()._prepare_inputs(prompt_inputs)  # move to device, fp16/bf16 cast as needed
 
         prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]  # token ids + attn
@@ -433,11 +433,11 @@ class Qwen2VLGRPOTrainer(Trainer):
         if self.max_prompt_length is not None:
             prompt_ids = prompt_ids[:, -self.max_prompt_length :]  # truncate to last P tokens (left-pad kept)
             prompt_mask = prompt_mask[:, -self.max_prompt_length :]  # keep mask aligned to ids
-
+## Sample G actions in ActionSpace:
         # Paper alignment: sample G completions per prompt to construct groups for GRPO.
         with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
             prompt_completion_ids = unwrapped_model.generate(**prompt_inputs, generation_config=self.generation_config)  # shape (B*G, P+C)
-
+## P: max length of Prompt ; C : max length of Completion
             prompt_length = prompt_ids.size(1)  # number of prompt tokens per sample
             prompt_ids = prompt_completion_ids[:, :prompt_length]  # regenerated prompt tokens (aligned to completions)
             completion_ids = prompt_completion_ids[:, prompt_length:]  # only the generated part
@@ -470,7 +470,7 @@ class Qwen2VLGRPOTrainer(Trainer):
 
         # Paper alignment: KL(policy || ref) regularization to stabilize updates (as in GRPO).
         per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1  # reverse KL approx
-
+## Perform the actions
         # Decode the generated completions
         completions = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)  # strings per sample
         if is_conversational(inputs[0]):
@@ -494,6 +494,7 @@ class Qwen2VLGRPOTrainer(Trainer):
                     texts, return_tensors="pt", padding=True, padding_side="right", add_special_tokens=False
                 )
                 reward_inputs = super()._prepare_inputs(reward_inputs)
+## Actually perform action & compute rewards
                 with torch.inference_mode():
                     rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]  # (B*G,)
             else:
@@ -517,7 +518,7 @@ class Qwen2VLGRPOTrainer(Trainer):
         mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)  # expand to (B*G,)
         std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)  # expand to (B*G,)
         advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)  # normalized advantages
-
+## Loss compute
         # Paper alignment: token-wise policy gradient with KL penalty, masked by completion tokens only.
         per_token_loss = torch.exp(per_token_logps - per_token_logps.detach()) * advantages.unsqueeze(1)  # reinforce-like
         per_token_loss = -(per_token_loss - self.beta * per_token_kl)  # add KL penalty
