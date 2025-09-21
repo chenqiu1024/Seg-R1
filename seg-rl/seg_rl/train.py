@@ -6,7 +6,8 @@ from typing import Tuple, List
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
+from PIL import Image
 
 from .datasets import JsonlPointDataset, ImageSize, collate_fn
 from .model import ModelConfig, PointHeatmapModel, argmax_from_logits, soft_argmax_from_logits
@@ -14,11 +15,20 @@ from .losses import ce_over_pixels, kl_to_gaussian_targets
 from .utils import save_checkpoint
 from .utils import draw_cross, draw_triangle, overlay_heatmap, make_grid
 
+"""
+Sample usage:
 
+python -m seg_rl.train \
+  --data_jsonl /abs/all.jsonl \
+  --val_ratio 0.1 --test_ratio 0.1 --seed 42 \
+  --height 512 --width 512 --batch_size 16 --epochs 20 --loss ce --amp \
+  --eval_thresh 5.0 --save_every 2 --out_dir /abs/outputs \
+  --vis_mode sample --vis_count 16
+
+"""
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train heatmap classification point locator")
-    p.add_argument("--train_jsonl", type=str, required=True)
-    p.add_argument("--val_jsonl", type=str, default=None)
+    p.add_argument("--data_jsonl", type=str, required=True, help="JSONL containing all samples; splits done in-script")
     p.add_argument("--height", type=int, default=512)
     p.add_argument("--width", type=int, default=512)
     p.add_argument("--batch_size", type=int, default=16)
@@ -35,7 +45,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pretrained", action="store_true")
     p.add_argument("--resume", type=str, default=None)
     p.add_argument("--eval_thresh", type=float, default=5.0, help="PCK threshold in pixels")
-    p.add_argument("--test_jsonl", type=str, default=None)
+    p.add_argument("--val_ratio", type=float, default=0.1, help="Validation split ratio from the full dataset")
+    p.add_argument("--test_ratio", type=float, default=0.0, help="Test split ratio from the full dataset")
+    p.add_argument("--seed", type=int, default=42, help="Random seed for splitting")
     p.add_argument("--vis_mode", type=str, choices=["none", "sample", "all"], default="none", help="Visualization mode")
     p.add_argument("--vis_count", type=int, default=16, help="When vis_mode=sample, number of samples to visualize")
     p.add_argument("--vis_dir", type=str, default=None, help="Directory to save visualization images; default under out_dir/vis")
@@ -53,13 +65,32 @@ def main() -> None:
     os.makedirs(vis_dir, exist_ok=True)
 
     image_size = ImageSize(height=args.height, width=args.width)
-    train_ds = JsonlPointDataset(args.train_jsonl, image_size=image_size, training=True)
-    val_ds = JsonlPointDataset(args.val_jsonl, image_size=image_size, training=False) if args.val_jsonl else None
-    test_ds = JsonlPointDataset(args.test_jsonl, image_size=image_size, training=False) if args.test_jsonl else None
+    # Load once to get length for splitting
+    full_ds_for_len = JsonlPointDataset(args.data_jsonl, image_size=image_size, training=True)
+    n = len(full_ds_for_len)
+    assert 0.0 <= args.val_ratio < 1.0 and 0.0 <= args.test_ratio < 1.0 and args.val_ratio + args.test_ratio < 1.0, "Invalid split ratios"
+    n_test = int(round(n * args.test_ratio))
+    n_val = int(round(n * args.val_ratio))
+    n_train = n - n_val - n_test
+    g = torch.Generator()
+    g.manual_seed(args.seed)
+    perm = torch.randperm(n, generator=g).tolist()
+    idx_train = perm[:n_train]
+    idx_val = perm[n_train:n_train + n_val]
+    idx_test = perm[n_train + n_val:]
+
+    # Build datasets per split to control augmentation flag
+    train_base = JsonlPointDataset(args.data_jsonl, image_size=image_size, training=True)
+    val_base = JsonlPointDataset(args.data_jsonl, image_size=image_size, training=False) if n_val > 0 else None
+    test_base = JsonlPointDataset(args.data_jsonl, image_size=image_size, training=False) if n_test > 0 else None
+
+    train_ds = Subset(train_base, idx_train)
+    val_ds = Subset(val_base, idx_val) if val_base is not None else None
+    test_ds = Subset(test_base, idx_test) if test_base is not None else None
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.workers, pin_memory=True, collate_fn=collate_fn)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True, collate_fn=collate_fn) if val_ds else None
-    test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True, collate_fn=collate_fn) if test_ds else None
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True, collate_fn=collate_fn) if val_ds is not None else None
+    test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True, collate_fn=collate_fn) if test_ds is not None else None
 
     cfg = ModelConfig(pretrained=args.pretrained)
     model = PointHeatmapModel(cfg).to(device)
@@ -141,13 +172,17 @@ def main() -> None:
                 img_t = batch["image"]  # [B,3,H,W]
                 tgt = batch["target_xy"]  # [B,2]
                 logits = model(img_t.to(device))
-                probs = torch.softmax(logits, dim=2 if logits.dim() == 4 else 1)  # safe softmax over flattened handled later
                 # compute soft-argmax pred on CPU for simplicity
                 pred_xy = soft_argmax_from_logits(logits).cpu()
                 for i in range(img_t.size(0)):
                     if count >= max_count:
                         break
-                    pil_img = TF.to_pil_image(img_t[i])
+                    # unnormalize to [0,1] for visualization (ImageNet stats)
+                    mean = np.array([0.485, 0.456, 0.406]).reshape(3, 1, 1)
+                    std = np.array([0.229, 0.224, 0.225]).reshape(3, 1, 1)
+                    arr = img_t[i].cpu().float().numpy()
+                    arr = (arr * std + mean).clip(0.0, 1.0)
+                    pil_img = TF.to_pil_image(torch.from_numpy(arr))
                     hm = logits[i, 0].detach().cpu().float().numpy()
                     over = overlay_heatmap(pil_img, hm, alpha=0.5)
                     # draw GT and Pred

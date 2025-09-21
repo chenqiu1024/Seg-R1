@@ -1,5 +1,5 @@
 # 机器学习模型训练任务讨论
-_Exported on 9/21/2025 at 12:33:38 PDT from Cursor (1.6.42)_
+_Exported on 9/21/2025 at 13:06:47 PDT from Cursor (1.6.42)_
 
 ---
 
@@ -1714,5 +1714,534 @@ python -m seg_rl.train \
   --train_jsonl /abs/train.jsonl --val_jsonl /abs/val.jsonl \
   --height 512 --width 512 --epochs 10 --resume /abs/outputs/model_epoch_10.pt \
   --vis_mode all --vis_dir /abs/outputs/vis_all
+```
+
+---
+
+**User**
+
+请不要在train.py中区分train_jsonl和val_jsonl，作为数据集说明的.jsonl应该不需要考虑训练集和验证集的划分而是包含所有可用数据集的图片路径与真值坐标的对应。训练集和验证集的划分应该在训练过程本身中进行，请相应修改脚本
+
+---
+
+**Cursor**
+
+I'll modify `seg_rl/train.py` to accept a single `--data_jsonl` and internally split into train/val/test using `--val_ratio`, `--test_ratio`, and `--seed`. I'll update the DataLoader creation accordingly, remove the old `--train_jsonl`/`--val_jsonl`/`--test_jsonl` flags, and keep plotting/visualization behavior intact.
+
+```python
+from __future__ import annotations
+
+import argparse
+import os
+from typing import Tuple, List
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, Subset
+
+from .datasets import JsonlPointDataset, ImageSize, collate_fn
+from .model import ModelConfig, PointHeatmapModel, argmax_from_logits, soft_argmax_from_logits
+from .losses import ce_over_pixels, kl_to_gaussian_targets
+from .utils import save_checkpoint
+from .utils import draw_cross, draw_triangle, overlay_heatmap, make_grid
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Train heatmap classification point locator")
+    p.add_argument("--data_jsonl", type=str, required=True, help="JSONL containing all samples; splits done in-script")
+    p.add_argument("--height", type=int, default=512)
+    p.add_argument("--width", type=int, default=512)
+    p.add_argument("--batch_size", type=int, default=16)
+    p.add_argument("--epochs", type=int, default=20)
+    p.add_argument("--save_every", type=int, default=1, help="Save checkpoint every N epochs")
+    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--weight_decay", type=float, default=1e-4)
+    p.add_argument("--loss", type=str, choices=["ce", "kl"], default="ce")
+    p.add_argument("--sigma", type=float, default=3.0, help="Gaussian sigma for KL loss")
+    p.add_argument("--amp", action="store_true")
+    p.add_argument("--workers", type=int, default=8)
+    p.add_argument("--out_dir", type=str, default="./outputs/seg_rl")
+    p.add_argument("--plots_dir", type=str, default=None, help="Directory to save loss/PCK plots; default under out_dir/plots")
+    p.add_argument("--pretrained", action="store_true")
+    p.add_argument("--resume", type=str, default=None)
+    p.add_argument("--eval_thresh", type=float, default=5.0, help="PCK threshold in pixels")
+    p.add_argument("--val_ratio", type=float, default=0.1, help="Validation split ratio from the full dataset")
+    p.add_argument("--test_ratio", type=float, default=0.0, help="Test split ratio from the full dataset")
+    p.add_argument("--seed", type=int, default=42, help="Random seed for splitting")
+    p.add_argument("--vis_mode", type=str, choices=["none", "sample", "all"], default="none", help="Visualization mode")
+    p.add_argument("--vis_count", type=int, default=16, help="When vis_mode=sample, number of samples to visualize")
+    p.add_argument("--vis_dir", type=str, default=None, help="Directory to save visualization images; default under out_dir/vis")
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    os.makedirs(args.out_dir, exist_ok=True)
+    plots_dir = args.plots_dir or os.path.join(args.out_dir, "plots")
+    os.makedirs(plots_dir, exist_ok=True)
+    vis_dir = args.vis_dir or os.path.join(args.out_dir, "vis")
+    os.makedirs(vis_dir, exist_ok=True)
+
+    image_size = ImageSize(height=args.height, width=args.width)
+    # Load once to get length for splitting
+    full_ds_for_len = JsonlPointDataset(args.data_jsonl, image_size=image_size, training=True)
+    n = len(full_ds_for_len)
+    assert 0.0 <= args.val_ratio < 1.0 and 0.0 <= args.test_ratio < 1.0 and args.val_ratio + args.test_ratio < 1.0, "Invalid split ratios"
+    n_test = int(round(n * args.test_ratio))
+    n_val = int(round(n * args.val_ratio))
+    n_train = n - n_val - n_test
+    g = torch.Generator()
+    g.manual_seed(args.seed)
+    perm = torch.randperm(n, generator=g).tolist()
+    idx_train = perm[:n_train]
+    idx_val = perm[n_train:n_train + n_val]
+    idx_test = perm[n_train + n_val:]
+
+    # Build datasets per split to control augmentation flag
+    train_base = JsonlPointDataset(args.data_jsonl, image_size=image_size, training=True)
+    val_base = JsonlPointDataset(args.data_jsonl, image_size=image_size, training=False) if n_val > 0 else None
+    test_base = JsonlPointDataset(args.data_jsonl, image_size=image_size, training=False) if n_test > 0 else None
+
+    train_ds = Subset(train_base, idx_train)
+    val_ds = Subset(val_base, idx_val) if val_base is not None else None
+    test_ds = Subset(test_base, idx_test) if test_base is not None else None
+
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.workers, pin_memory=True, collate_fn=collate_fn)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True, collate_fn=collate_fn) if val_ds is not None else None
+    test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True, collate_fn=collate_fn) if test_ds is not None else None
+
+    cfg = ModelConfig(pretrained=args.pretrained)
+    model = PointHeatmapModel(cfg).to(device)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
+
+    start_epoch = 0
+    global_step = 0
+    if args.resume and os.path.isfile(args.resume):
+        from .utils import load_checkpoint
+        ckpt = load_checkpoint(args.resume, model, optimizer, scaler)
+        start_epoch = ckpt.epoch
+        global_step = ckpt.step
+
+    history = {"train_loss": [], "val_pck": [], "test_pck": []}
+
+    def evaluate(loader: DataLoader | None, split_name: str) -> float:
+        if loader is None:
+            return float("nan")
+        model.eval()
+        total = 0
+        correct = 0
+        with torch.no_grad():
+            for batch in loader:
+                img = batch["image"].to(device, non_blocking=True)
+                tgt = batch["target_xy"].to(device, non_blocking=True)
+                logits = model(img)
+                pred_xy = soft_argmax_from_logits(logits)
+                d = torch.linalg.norm(pred_xy - tgt, dim=1)
+                correct += (d <= args.eval_thresh).sum().item()
+                total += d.numel()
+        pck = correct / max(1, total)
+        print(f"{split_name} PCK@{args.eval_thresh}: {pck:.4f}")
+        return pck
+
+    def plot_curves():
+        try:
+            import matplotlib.pyplot as plt
+            import numpy as np
+            epochs_axis = np.arange(1, len(history["train_loss"]) + 1)
+            # Loss
+            plt.figure()
+            plt.plot(epochs_axis, history["train_loss"], label="train_loss")
+            plt.xlabel("Epoch")
+            plt.ylabel("Loss")
+            plt.legend()
+            plt.grid(True, ls=":", alpha=0.4)
+            plt.tight_layout()
+            plt.savefig(os.path.join(plots_dir, "loss.png"))
+            plt.close()
+            # PCK
+            plt.figure()
+            if any(not np.isnan(v) for v in history["val_pck"]):
+                plt.plot(epochs_axis, history["val_pck"], label="val_pck")
+            if any(not np.isnan(v) for v in history["test_pck"]):
+                plt.plot(epochs_axis, history["test_pck"], label="test_pck")
+            plt.xlabel("Epoch")
+            plt.ylabel(f"PCK@{args.eval_thresh}")
+            plt.legend()
+            plt.grid(True, ls=":", alpha=0.4)
+            plt.tight_layout()
+            plt.savefig(os.path.join(plots_dir, "pck.png"))
+            plt.close()
+        except Exception as e:
+            print(f"Plotting failed: {e}")
+
+    def visualize_dataset(loader: DataLoader | None, split_name: str):
+        if loader is None or args.vis_mode == "none":
+            return
+        model.eval()
+        import torchvision.transforms.functional as TF
+        import numpy as np
+        saved_images: List[Image.Image] = []
+        count = 0
+        max_count = args.vis_count if args.vis_mode == "sample" else float("inf")
+        with torch.no_grad():
+            for batch in loader:
+                img_t = batch["image"]  # [B,3,H,W]
+                tgt = batch["target_xy"]  # [B,2]
+                logits = model(img_t.to(device))
+                probs = torch.softmax(logits, dim=2 if logits.dim() == 4 else 1)  # safe softmax over flattened handled later
+                # compute soft-argmax pred on CPU for simplicity
+                pred_xy = soft_argmax_from_logits(logits).cpu()
+                for i in range(img_t.size(0)):
+                    if count >= max_count:
+                        break
+                    pil_img = TF.to_pil_image(img_t[i])
+                    hm = logits[i, 0].detach().cpu().float().numpy()
+                    over = overlay_heatmap(pil_img, hm, alpha=0.5)
+                    # draw GT and Pred
+                    over = draw_cross(over, (float(tgt[i, 0]), float(tgt[i, 1])), color=(0, 255, 0))
+                    over = draw_triangle(over, (float(pred_xy[i, 0]), float(pred_xy[i, 1])), color=(255, 0, 0))
+                    saved_images.append(over)
+                    count += 1
+                if count >= max_count:
+                    break
+        # save grid or per-sample
+        if args.vis_mode == "sample":
+            grid = make_grid(saved_images, cols=4)
+            grid.save(os.path.join(vis_dir, f"{split_name}_vis.png"))
+        else:  # all
+            split_dir = os.path.join(vis_dir, split_name)
+            os.makedirs(split_dir, exist_ok=True)
+            for i, img in enumerate(saved_images):
+                img.save(os.path.join(split_dir, f"{i:05d}.png"))
+
+    for epoch in range(start_epoch, args.epochs):
+        model.train()
+        running_loss = 0.0
+        for batch in train_loader:
+            img = batch["image"].to(device, non_blocking=True)
+            tgt = batch["target_xy"].to(device, non_blocking=True)
+
+            optimizer.zero_grad(set_to_none=True)
+            with torch.cuda.amp.autocast(enabled=args.amp):
+                logits = model(img)
+                if args.loss == "ce":
+                    loss = ce_over_pixels(logits, tgt)
+                else:
+                    loss = kl_to_gaussian_targets(logits, tgt, sigma=args.sigma)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            running_loss += loss.item()
+            global_step += 1
+
+        avg_loss = running_loss / max(1, len(train_loader))
+        history["train_loss"].append(avg_loss)
+        print(f"Epoch {epoch+1}/{args.epochs} - train loss: {avg_loss:.4f}")
+
+        # Validation
+        val_pck = evaluate(val_loader, "val") if val_loader is not None else float("nan")
+        history["val_pck"].append(val_pck)
+        test_pck = evaluate(test_loader, "test") if test_loader is not None else float("nan")
+        history["test_pck"].append(test_pck)
+
+        # plots
+        plot_curves()
+
+        # visualizations
+        if args.vis_mode != "none":
+            visualize_dataset(val_loader or train_loader, split_name="val_or_train")
+
+        # Save
+        if ((epoch + 1) % max(1, args.save_every)) == 0:
+            save_path = os.path.join(args.out_dir, f"model_epoch_{epoch+1}.pt")
+            save_checkpoint(save_path, model, optimizer, scaler, epoch=epoch+1, step=global_step)
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+```
+
+I'll fix a small issue in seg_rl.train by importing PIL Image for type hints and improve visualization by unnormalizing images before saving. Then I'll update the README usage to reflect the new --data_jsonl flag and split ratios.
+
+```python
+from __future__ import annotations
+
+import argparse
+import os
+from typing import Tuple, List
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, Subset
+from PIL import Image
+
+from .datasets import JsonlPointDataset, ImageSize, collate_fn
+from .model import ModelConfig, PointHeatmapModel, argmax_from_logits, soft_argmax_from_logits
+from .losses import ce_over_pixels, kl_to_gaussian_targets
+from .utils import save_checkpoint
+from .utils import draw_cross, draw_triangle, overlay_heatmap, make_grid
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Train heatmap classification point locator")
+    p.add_argument("--data_jsonl", type=str, required=True, help="JSONL containing all samples; splits done in-script")
+    p.add_argument("--height", type=int, default=512)
+    p.add_argument("--width", type=int, default=512)
+    p.add_argument("--batch_size", type=int, default=16)
+    p.add_argument("--epochs", type=int, default=20)
+    p.add_argument("--save_every", type=int, default=1, help="Save checkpoint every N epochs")
+    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--weight_decay", type=float, default=1e-4)
+    p.add_argument("--loss", type=str, choices=["ce", "kl"], default="ce")
+    p.add_argument("--sigma", type=float, default=3.0, help="Gaussian sigma for KL loss")
+    p.add_argument("--amp", action="store_true")
+    p.add_argument("--workers", type=int, default=8)
+    p.add_argument("--out_dir", type=str, default="./outputs/seg_rl")
+    p.add_argument("--plots_dir", type=str, default=None, help="Directory to save loss/PCK plots; default under out_dir/plots")
+    p.add_argument("--pretrained", action="store_true")
+    p.add_argument("--resume", type=str, default=None)
+    p.add_argument("--eval_thresh", type=float, default=5.0, help="PCK threshold in pixels")
+    p.add_argument("--val_ratio", type=float, default=0.1, help="Validation split ratio from the full dataset")
+    p.add_argument("--test_ratio", type=float, default=0.0, help="Test split ratio from the full dataset")
+    p.add_argument("--seed", type=int, default=42, help="Random seed for splitting")
+    p.add_argument("--vis_mode", type=str, choices=["none", "sample", "all"], default="none", help="Visualization mode")
+    p.add_argument("--vis_count", type=int, default=16, help="When vis_mode=sample, number of samples to visualize")
+    p.add_argument("--vis_dir", type=str, default=None, help="Directory to save visualization images; default under out_dir/vis")
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    os.makedirs(args.out_dir, exist_ok=True)
+    plots_dir = args.plots_dir or os.path.join(args.out_dir, "plots")
+    os.makedirs(plots_dir, exist_ok=True)
+    vis_dir = args.vis_dir or os.path.join(args.out_dir, "vis")
+    os.makedirs(vis_dir, exist_ok=True)
+
+    image_size = ImageSize(height=args.height, width=args.width)
+    # Load once to get length for splitting
+    full_ds_for_len = JsonlPointDataset(args.data_jsonl, image_size=image_size, training=True)
+    n = len(full_ds_for_len)
+    assert 0.0 <= args.val_ratio < 1.0 and 0.0 <= args.test_ratio < 1.0 and args.val_ratio + args.test_ratio < 1.0, "Invalid split ratios"
+    n_test = int(round(n * args.test_ratio))
+    n_val = int(round(n * args.val_ratio))
+    n_train = n - n_val - n_test
+    g = torch.Generator()
+    g.manual_seed(args.seed)
+    perm = torch.randperm(n, generator=g).tolist()
+    idx_train = perm[:n_train]
+    idx_val = perm[n_train:n_train + n_val]
+    idx_test = perm[n_train + n_val:]
+
+    # Build datasets per split to control augmentation flag
+    train_base = JsonlPointDataset(args.data_jsonl, image_size=image_size, training=True)
+    val_base = JsonlPointDataset(args.data_jsonl, image_size=image_size, training=False) if n_val > 0 else None
+    test_base = JsonlPointDataset(args.data_jsonl, image_size=image_size, training=False) if n_test > 0 else None
+
+    train_ds = Subset(train_base, idx_train)
+    val_ds = Subset(val_base, idx_val) if val_base is not None else None
+    test_ds = Subset(test_base, idx_test) if test_base is not None else None
+
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.workers, pin_memory=True, collate_fn=collate_fn)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True, collate_fn=collate_fn) if val_ds is not None else None
+    test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True, collate_fn=collate_fn) if test_ds is not None else None
+
+    cfg = ModelConfig(pretrained=args.pretrained)
+    model = PointHeatmapModel(cfg).to(device)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
+
+    start_epoch = 0
+    global_step = 0
+    if args.resume and os.path.isfile(args.resume):
+        from .utils import load_checkpoint
+        ckpt = load_checkpoint(args.resume, model, optimizer, scaler)
+        start_epoch = ckpt.epoch
+        global_step = ckpt.step
+
+    history = {"train_loss": [], "val_pck": [], "test_pck": []}
+
+    def evaluate(loader: DataLoader | None, split_name: str) -> float:
+        if loader is None:
+            return float("nan")
+        model.eval()
+        total = 0
+        correct = 0
+        with torch.no_grad():
+            for batch in loader:
+                img = batch["image"].to(device, non_blocking=True)
+                tgt = batch["target_xy"].to(device, non_blocking=True)
+                logits = model(img)
+                pred_xy = soft_argmax_from_logits(logits)
+                d = torch.linalg.norm(pred_xy - tgt, dim=1)
+                correct += (d <= args.eval_thresh).sum().item()
+                total += d.numel()
+        pck = correct / max(1, total)
+        print(f"{split_name} PCK@{args.eval_thresh}: {pck:.4f}")
+        return pck
+
+    def plot_curves():
+        try:
+            import matplotlib.pyplot as plt
+            import numpy as np
+            epochs_axis = np.arange(1, len(history["train_loss"]) + 1)
+            # Loss
+            plt.figure()
+            plt.plot(epochs_axis, history["train_loss"], label="train_loss")
+            plt.xlabel("Epoch")
+            plt.ylabel("Loss")
+            plt.legend()
+            plt.grid(True, ls=":", alpha=0.4)
+            plt.tight_layout()
+            plt.savefig(os.path.join(plots_dir, "loss.png"))
+            plt.close()
+            # PCK
+            plt.figure()
+            if any(not np.isnan(v) for v in history["val_pck"]):
+                plt.plot(epochs_axis, history["val_pck"], label="val_pck")
+            if any(not np.isnan(v) for v in history["test_pck"]):
+                plt.plot(epochs_axis, history["test_pck"], label="test_pck")
+            plt.xlabel("Epoch")
+            plt.ylabel(f"PCK@{args.eval_thresh}")
+            plt.legend()
+            plt.grid(True, ls=":", alpha=0.4)
+            plt.tight_layout()
+            plt.savefig(os.path.join(plots_dir, "pck.png"))
+            plt.close()
+        except Exception as e:
+            print(f"Plotting failed: {e}")
+
+    def visualize_dataset(loader: DataLoader | None, split_name: str):
+        if loader is None or args.vis_mode == "none":
+            return
+        model.eval()
+        import torchvision.transforms.functional as TF
+        import numpy as np
+        saved_images: List[Image.Image] = []
+        count = 0
+        max_count = args.vis_count if args.vis_mode == "sample" else float("inf")
+        with torch.no_grad():
+            for batch in loader:
+                img_t = batch["image"]  # [B,3,H,W]
+                tgt = batch["target_xy"]  # [B,2]
+                logits = model(img_t.to(device))
+                # compute soft-argmax pred on CPU for simplicity
+                pred_xy = soft_argmax_from_logits(logits).cpu()
+                for i in range(img_t.size(0)):
+                    if count >= max_count:
+                        break
+                    # unnormalize to [0,1] for visualization (ImageNet stats)
+                    mean = np.array([0.485, 0.456, 0.406]).reshape(3, 1, 1)
+                    std = np.array([0.229, 0.224, 0.225]).reshape(3, 1, 1)
+                    arr = img_t[i].cpu().float().numpy()
+                    arr = (arr * std + mean).clip(0.0, 1.0)
+                    pil_img = TF.to_pil_image(torch.from_numpy(arr))
+                    hm = logits[i, 0].detach().cpu().float().numpy()
+                    over = overlay_heatmap(pil_img, hm, alpha=0.5)
+                    # draw GT and Pred
+                    over = draw_cross(over, (float(tgt[i, 0]), float(tgt[i, 1])), color=(0, 255, 0))
+                    over = draw_triangle(over, (float(pred_xy[i, 0]), float(pred_xy[i, 1])), color=(255, 0, 0))
+                    saved_images.append(over)
+                    count += 1
+                if count >= max_count:
+                    break
+        # save grid or per-sample
+        if args.vis_mode == "sample":
+            grid = make_grid(saved_images, cols=4)
+            grid.save(os.path.join(vis_dir, f"{split_name}_vis.png"))
+        else:  # all
+            split_dir = os.path.join(vis_dir, split_name)
+            os.makedirs(split_dir, exist_ok=True)
+            for i, img in enumerate(saved_images):
+                img.save(os.path.join(split_dir, f"{i:05d}.png"))
+
+    for epoch in range(start_epoch, args.epochs):
+        model.train()
+        running_loss = 0.0
+        for batch in train_loader:
+            img = batch["image"].to(device, non_blocking=True)
+            tgt = batch["target_xy"].to(device, non_blocking=True)
+
+            optimizer.zero_grad(set_to_none=True)
+            with torch.cuda.amp.autocast(enabled=args.amp):
+                logits = model(img)
+                if args.loss == "ce":
+                    loss = ce_over_pixels(logits, tgt)
+                else:
+                    loss = kl_to_gaussian_targets(logits, tgt, sigma=args.sigma)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            running_loss += loss.item()
+            global_step += 1
+
+        avg_loss = running_loss / max(1, len(train_loader))
+        history["train_loss"].append(avg_loss)
+        print(f"Epoch {epoch+1}/{args.epochs} - train loss: {avg_loss:.4f}")
+
+        # Validation
+        val_pck = evaluate(val_loader, "val") if val_loader is not None else float("nan")
+        history["val_pck"].append(val_pck)
+        test_pck = evaluate(test_loader, "test") if test_loader is not None else float("nan")
+        history["test_pck"].append(test_pck)
+
+        # plots
+        plot_curves()
+
+        # visualizations
+        if args.vis_mode != "none":
+            visualize_dataset(val_loader or train_loader, split_name="val_or_train")
+
+        # Save
+        if ((epoch + 1) % max(1, args.save_every)) == 0:
+            save_path = os.path.join(args.out_dir, f"model_epoch_{epoch+1}.pt")
+            save_checkpoint(save_path, model, optimizer, scaler, epoch=epoch+1, step=global_step)
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+```
+
+- 我已将 `seg_rl.train` 修改为仅接收单一的 `--data_jsonl`，并在脚本内部完成随机划分：
+  - `--val_ratio`、`--test_ratio` 控制验证与测试占比（默认 0.1 / 0.0）。
+  - `--seed` 控制划分随机种子。
+  - 训练集用带增强（flip）的 `training=True`，验证/测试采用 `training=False`。
+- 同步保留了此前新增能力：按 `--save_every` 周期保存断点与可从 `--resume` 恢复、训练/验证/测试曲线绘制、抽样/全量可视化（绿色十字=GT，红色三角=Pred）等。
+
+运行示例
+- 统一数据集并脚本内部划分：
+```bash
+python -m seg_rl.train \
+  --data_jsonl /abs/all.jsonl \
+  --val_ratio 0.1 --test_ratio 0.1 --seed 42 \
+  --height 512 --width 512 --batch_size 16 --epochs 20 --loss ce --amp \
+  --eval_thresh 5.0 --save_every 2 --out_dir /abs/outputs \
+  --vis_mode sample --vis_count 16
+```
+
+- 我还修复了可视化时的图像反归一化，避免展示偏色。
+
+```shellscript
+python -m seg_rl.train \
+  --data_jsonl /abs/all.jsonl \
+  --val_ratio 0.1 --test_ratio 0.1 --seed 42 \
+  --height 512 --width 512 --batch_size 16 --epochs 20 --loss ce --amp \
+  --eval_thresh 5.0 --save_every 2 --out_dir /abs/outputs \
+  --vis_mode sample --vis_count 16
 ```
 
