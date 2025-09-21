@@ -81,7 +81,7 @@ sam_wrapper = SAMWrapper("third_party/sam2/checkpoints/sam2.1_hiera_large.pt", d
 
 def parse_custom_format(content: str):
 
-    point_pattern = r"<points>\s*(\[\s*(?:\[\s*\d+\s*,\s*\d+\s*\]\s*,?\s*)+\])\s*</points>"
+    point_pattern = r"<points>\s*(\[\s*(?:\[\s*\d+\s*,\s*\d+[,\d\s]*\]\s*,?\s*)+\])\s*</points>"
     label_pattern = r"<labels>\s*(\[\s*(?:\d+\s*,?\s*)+\])\s*</labels>"
     bbox_pattern  = r"<bbox>\s*(\[\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*\d+\s*\])\s*</bbox>"
 
@@ -94,8 +94,8 @@ def parse_custom_format(content: str):
         points_list = []
         for pm in point_matches:
             arr = np.array(eval(pm))
-            if len(arr.shape) == 2 and arr.shape[1] == 2:
-                points_list.append(arr)
+            if len(arr.shape) == 2 and arr.shape[1] >= 2:
+                points_list.append(arr[:, :2])
         points = np.concatenate(points_list, axis=0) if points_list else None
 
         # Collect all labels blocks
@@ -139,7 +139,7 @@ def prepare_test_messages(image, prompt, ratio: float = None, epsilon: float = E
           "Exact format: <think>...</think><bbox>[XL,YT,XR,YB]</bbox>...<points>[[X1,Y1],[X2,Y2],...]</points><labels>[L1,L2,...]</labels>. \n"
           "BBoxes MUST include brackets inside the tag: <bbox>[XL,YT,XR,YB]</bbox>. There can be multiple bbox blocks. \n"
           "Points MUST be an array of 2D pairs only. Each inner item MUST be exactly two integers: [[X1,Y1],[X2,Y2],...]. \n"
-          "Never output any inner item with 3 or 4 numbers like [X1,Y1,X2,Y2]; if you think in that way, SPLIT it into two 2D pairs: [X1,Y1],[X2,Y2]. There is only one points block. "
+          "((Never output any inner item with 3 or 4 numbers like [X1,Y1,X2,Y2]; if you think in that way, SPLIT it into two 2D pairs: [X1,Y1],[X2,Y2].)) There is only one points block. "
           "Labels MUST be binary (0 or 1) and the number of labels MUST equal the number of point pairs. Each label indicates the foreground (1) or background (0) of the corresponding point. There is only one labels block. "
           "Use only integers and commas inside the arrays; no units or decimals. Do NOT add any words outside the tags. "
           "Valid example: <think>The image shows a hummingbird interacting with a bird feeder. The bird is the main focus, with its green and blue plumage and long beak clearly visible. There's also a small insect, possibly a bee, on the feeder, which is not part of the animal category but rather an object in the scene.</think><bbox>[XL,YT,XR,YB]</bbox><points>[[X1,Y1],[X2,Y2],[X3,Y3]]</points><labels>[1,0,1]</labels>"
@@ -161,7 +161,8 @@ def prepare_test_messages(image, prompt, ratio: float = None, epsilon: float = E
             f"<bbox>[XL,YT,XR,YB]</bbox> repeated EXACTLY {num_bboxes} times"
             f"<points>[[X1,Y1],[X2,Y2],...]</points> with EXACTLY {num_points} coordinate pairs"
             f"<labels>[L1,L2,...]</labels> with EXACTLY {num_points} values, each 0 or 1. "
-            "BBoxes MUST include brackets inside the tag. Points MUST be 2D pairs only (no flat lists). There can be multiple bbox blocks. There is only one points block. "
+            "BBoxes MUST include brackets inside the tag. There can be multiple bbox blocks."
+            "Points MUST be 2D pairs only (no flat lists). ((Never output any inner item with 3 or 4 numbers like [X1,Y1,X2,Y2]; if you think in that way, SPLIT it into two 2D pairs: [X1,Y1],[X2,Y2].)) There is only one points block. "
             "Labels MUST be binary and the count MUST match the number of point pairs. Each label indicates the foreground (1) or background (0) of the corresponding point. There is only one labels block. "
             "Use only integers and commas inside arrays; no extra characters; no markdown; no newlines. "
             "Valid example: <think>The image shows a hummingbird interacting with a bird feeder. The bird is the main focus, with its green and blue plumage and long beak clearly visible. There's also a small insect, possibly a bee, on the feeder, which is not part of the animal category but rather an object in the scene.</think><bbox>[XL,YT,XR,YB]</bbox><points>[[X1,Y1],[X2,Y2],[X3,Y3]]</points><labels>[1,0,1]</labels>"

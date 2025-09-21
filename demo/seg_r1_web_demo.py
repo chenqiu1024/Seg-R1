@@ -386,7 +386,7 @@ def run_pipeline(image: PILImage.Image, prompt: str, ratio: float):
             except Exception as e:
                 print(f"Error visualizing annotations (ratio): {str(e)}")
 
-    return output_text_orig, visualized_img_orig, messages_ratio[0][0], output_text_ratio, visualized_img_ratio
+    return messages_orig[0][0], output_text_orig, visualized_img_orig, messages_ratio[0][0], output_text_ratio, visualized_img_ratio
 
 gr.Interface(
     fn=run_pipeline,
@@ -396,6 +396,7 @@ gr.Interface(
         gr.Slider(0.0, 10.0, step=0.01, value=1.0, label="Ratio")
     ],
     outputs=[
+        gr.Textbox(label="Model System Prompt (Original)"),
         gr.Textbox(label="Model Output (Original)"),
         gr.Image(type="pil", label="Mask Prediction (Original)"),
         gr.Textbox(label="Model System Prompt (Ratio)"),

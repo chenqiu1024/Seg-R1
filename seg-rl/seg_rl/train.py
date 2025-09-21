@@ -17,13 +17,14 @@ from .utils import draw_cross, draw_triangle, overlay_heatmap, make_grid
 
 """
 Sample usage:
-
+cd seg-rl;
 python -m seg_rl.train \
-  --data_jsonl /abs/all.jsonl \
+  --data_jsonl /root/autodl-tmp/works/Seg-R0/datasets/seg_r1_md/Task01_BrainTumour/points_canonical.jsonl \
   --val_ratio 0.1 --test_ratio 0.1 --seed 42 \
-  --height 512 --width 512 --batch_size 16 --epochs 20 --loss ce --amp \
-  --eval_thresh 5.0 --save_every 2 --out_dir /abs/outputs \
-  --vis_mode sample --vis_count 16
+  --height 240 --width 240 --batch_size 16 --epochs 10000 --loss ce --amp \
+  --eval_thresh 5.0 --save_every 100 \
+  --out_dir /root/autodl-tmp/works/Seg-R0/outputs/seg_r1_md/Task01_BrainTumour/pretrain \
+  --vis_mode all --vis_count 16
 
 """
 def parse_args() -> argparse.Namespace:

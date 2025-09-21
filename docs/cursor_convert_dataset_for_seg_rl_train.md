@@ -1,5 +1,5 @@
 # Convert dataset for Seg-R1 training
-_Exported on 9/21/2025 at 12:06:30 PDT from Cursor (1.6.42)_
+_Exported on 9/21/2025 at 13:16:34 PDT from Cursor (1.6.42)_
 
 ---
 
