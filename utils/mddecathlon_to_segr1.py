@@ -27,6 +27,18 @@ Example
     --slice_axis 2 --keep_empty False --size_variants  \
     canonical,512 --intensity percentiles:1,99
 
+  python utils/mddecathlon_to_segr1.py \
+    --input_root /root/autodl-tmp/works/Seg-R0/datasets/medical_decathlon/Task04_Hippocampus \
+    --output_root /root/autodl-tmp/works/Seg-R0/datasets/seg_r1_md \
+    --task_name Task04_Hippocampus \
+    --images_subdir imagesTr \
+    --labels_subdir labelsTr \
+    --slice_axis 2 \
+    --keep_empty False \
+    --size_variants canonical,256,512 \
+    --intensity percentiles:2,98 \
+    --case_id_regex "hippocampus_(\d+)"
+
 After running, you can point scripts to the created views, e.g.:
 - Pre-RL:   --dataset_image datasets/seg_r1_md/Task09_Spleen/views/prerl/im \
             --dataset_gt    datasets/seg_r1_md/Task09_Spleen/views/prerl/gt
