@@ -373,8 +373,8 @@ class Qwen2VLGRPOTrainer(Trainer):
         Returns:
             Tensor of per-token log probabilities aligned to input_ids[... , 1:]. Shape (B, L-1).
         """
-        logits = model(input_ids, attention_mask=attention_mask, pixel_values=pixel_values, image_grid_thw=image_grid_thw).logits  # (B, L, V)
-        logits = logits[:, :-1, :]  # (B, L-1, V), shift to align each logit with the token actually chosen at t
+        logits = model(input_ids, attention_mask=attention_mask, pixel_values=pixel_values, image_grid_thw=image_grid_thw).logits  # (B, L, V) ###???
+        logits = logits[:, :-1, :]  # (B, L-1, V), shift to align each logit with the token actually chosen at t ###???
         input_ids = input_ids[:, 1:]  # (B, L-1), drop first token (no preceding logit for it)
         # Compute the log probabilities for the input tokens. Use a loop to reduce memory peak.
         per_token_logps = []
@@ -412,9 +412,9 @@ class Qwen2VLGRPOTrainer(Trainer):
             raise ValueError("The GRPOTrainer does not support returning outputs")
 
         # 1) Build processed prompt inputs (text tokens + vision tensors)
-        prompts = [x["prompt"] for x in inputs]  # raw conversational dicts or plain strings
-        prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]  # chat templating if conversational
-        images = [x["image"] for x in inputs]  # images aligned with prompts
+        prompts = [x["prompt"] for x in inputs]  # raw conversational dicts or plain strings  # list length B
+        prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]  # chat templating if conversational  # list length B
+        images = [x["image"] for x in inputs]  # images aligned with prompts  # list length B
         prompt_inputs = self.processing_class(
             text=prompts_text,
             images=images,
@@ -423,62 +423,62 @@ class Qwen2VLGRPOTrainer(Trainer):
             padding_side="left",
             add_special_tokens=False,
         )  # Now we have tensors!
-        prompt_inputs = super()._prepare_inputs(prompt_inputs)  # move to device, fp16/bf16 cast as needed
+        prompt_inputs = super()._prepare_inputs(prompt_inputs)  # move to device, fp16/bf16 cast as needed (shapes unchanged)
 
-        prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]  # token ids + attn
-        pixel_values = prompt_inputs["pixel_values"]  # vision features
-        image_grid_thw = prompt_inputs["image_grid_thw"]  # image grid sizes per sample
+        prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]  # token ids + attn  # (B, P), (B, P)
+        pixel_values = prompt_inputs["pixel_values"]  # vision features  # (B, ...)
+        image_grid_thw = prompt_inputs["image_grid_thw"]  # image grid sizes per sample  # (B, ...)
 
         
         if self.max_prompt_length is not None:
-            prompt_ids = prompt_ids[:, -self.max_prompt_length :]  # truncate to last P tokens (left-pad kept)
-            prompt_mask = prompt_mask[:, -self.max_prompt_length :]  # keep mask aligned to ids
+            prompt_ids = prompt_ids[:, -self.max_prompt_length :]  # truncate to last P tokens (left-pad kept)  # (B, P)
+            prompt_mask = prompt_mask[:, -self.max_prompt_length :]  # keep mask aligned to ids  # (B, P)
 ## Sample G actions in ActionSpace:
         # Paper alignment: sample G completions per prompt to construct groups for GRPO.
         with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
-            prompt_completion_ids = unwrapped_model.generate(**prompt_inputs, generation_config=self.generation_config)  # shape (B*G, P+C)
+            prompt_completion_ids = unwrapped_model.generate(**prompt_inputs, generation_config=self.generation_config)  # (B*G, P+C) ###??? How to guarantee the sampling distribution?
 ## P: max length of Prompt ; C : max length of Completion
-            prompt_length = prompt_ids.size(1)  # number of prompt tokens per sample
-            prompt_ids = prompt_completion_ids[:, :prompt_length]  # regenerated prompt tokens (aligned to completions)
-            completion_ids = prompt_completion_ids[:, prompt_length:]  # only the generated part
-            prompt_mask = prompt_mask.repeat_interleave(self.num_generations, dim=0)  # expand masks for G samples
+            prompt_length = prompt_ids.size(1)  # number of prompt tokens per sample  # scalar P
+            prompt_ids = prompt_completion_ids[:, :prompt_length]  # regenerated prompt tokens (aligned to completions)  # (B*G, P)
+            completion_ids = prompt_completion_ids[:, prompt_length:]  # only the generated part  # (B*G, C)
+            prompt_mask = prompt_mask.repeat_interleave(self.num_generations, dim=0)  # expand masks for G samples  # (B*G, P)
 
         # Mask everything after the first EOS token
-        is_eos = completion_ids == self.processing_class.eos_token_id  # detect EOS positions per row
+        is_eos = completion_ids == self.processing_class.eos_token_id  # detect EOS positions per row  # (B*G, C) bool
         device = self.accelerator.device
-        eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)  # default: no EOS, take full length
-        eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]  # first EOS index if exists
-        sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)  # 0..C-1 tiled
-        completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()  # keep tokens up to first EOS inclusive
+        eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)  # default: no EOS, take full length  # (B*G,)
+        eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]  # first EOS index if exists  # (B*G,) ###???
+        sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)  # 0..C-1 tiled  # (B*G, C)
+        completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()  # keep tokens up to first EOS inclusive  # (B*G, C)
 
         # Concatenate prompt_mask with completion_mask for logit computation
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)  # (B*G, P+C)
-        pixel_values = prompt_inputs["pixel_values"].repeat(self.num_generations, 1)  # tile images for G samples
-        image_grid_thw = prompt_inputs["image_grid_thw"].repeat_interleave(self.num_generations, dim=0)  # tile grids
+        pixel_values = prompt_inputs["pixel_values"].repeat(self.num_generations, 1)  # tile images for G samples  # (B*G, ...)
+        image_grid_thw = prompt_inputs["image_grid_thw"].repeat_interleave(self.num_generations, dim=0)  # tile grids  # (B*G, ...) ###???
 
-        per_token_logps = self._get_per_token_logps(model, prompt_completion_ids, attention_mask, pixel_values, image_grid_thw)  # policy log p
+        per_token_logps = self._get_per_token_logps(model, prompt_completion_ids, attention_mask, pixel_values, image_grid_thw)  # policy log p  # (B*G, P+C-1)
         # Get rid of the prompt (-1 because of the shift done in get_per_token_logps)
-        per_token_logps = per_token_logps[:, prompt_length - 1 :]  # keep only completion tokens' log p
+        per_token_logps = per_token_logps[:, prompt_length - 1 :]  # keep only completion tokens' log p  # (B*G, C)
 
         with torch.inference_mode():
             if self.ref_model is not None:
-                ref_per_token_logps = self._get_per_token_logps(self.ref_model, prompt_completion_ids, attention_mask, pixel_values, image_grid_thw)  # reference log p
+                ref_per_token_logps = self._get_per_token_logps(self.ref_model, prompt_completion_ids, attention_mask, pixel_values, image_grid_thw)  # reference log p  # (B*G, P+C-1)
             else:
                 with self.accelerator.unwrap_model(model).disable_adapter():
-                    ref_per_token_logps = self._get_per_token_logps(model, prompt_completion_ids, attention_mask, pixel_values, image_grid_thw)  # fallback: same model without adapters
-        ref_per_token_logps = ref_per_token_logps[:, prompt_length - 1 :]  # align to completion tokens
+                    ref_per_token_logps = self._get_per_token_logps(model, prompt_completion_ids, attention_mask, pixel_values, image_grid_thw)  # fallback: same model without adapters  # (B*G, P+C-1)
+        ref_per_token_logps = ref_per_token_logps[:, prompt_length - 1 :]  # align to completion tokens  # (B*G, C)
 
         # Paper alignment: KL(policy || ref) regularization to stabilize updates (as in GRPO).
-        per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1  # reverse KL approx
+        per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1  # reverse KL approx  # (B*G, C)
 ## Perform the actions
         # Decode the generated completions
-        completions = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)  # strings per sample
+        completions = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)  # strings per sample  # list length B*G
         if is_conversational(inputs[0]):
-            completions = [[{"role": "assistant", "content": completion}] for completion in completions]  # wrap as assistant turns if chat
+            completions = [[{"role": "assistant", "content": completion}] for completion in completions]  # wrap as assistant turns if chat  # list length B*G
 
         # Paper alignment: compute scalar rewards via custom reward fns (e.g., IoU+S-measure), then
         # group-normalize to obtain advantages per GRPO.
-        prompts = [prompt for prompt in prompts for _ in range(self.num_generations)]  # repeat prompts to match G
+        prompts = [prompt for prompt in prompts for _ in range(self.num_generations)]  # repeat prompts to match G  # list length B*G
 
         rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), device=device)  # (B*G, F)
         for i, (reward_func, reward_processing_class) in enumerate(
@@ -486,43 +486,43 @@ class Qwen2VLGRPOTrainer(Trainer):
         ):
             if isinstance(reward_func, PreTrainedModel):
                 if is_conversational(inputs[0]):
-                    messages = [{"messages": p + c} for p, c in zip(prompts, completions)]  # combine dialogue turns
-                    texts = [apply_chat_template(x, reward_processing_class)["text"] for x in messages]  # RM text inputs
+                    messages = [{"messages": p + c} for p, c in zip(prompts, completions)]  # combine dialogue turns  # list length B*G
+                    texts = [apply_chat_template(x, reward_processing_class)["text"] for x in messages]  # RM text inputs  # list length B*G
                 else:
-                    texts = [p + c for p, c in zip(prompts, completions)]  # concatenate prompt+completion
+                    texts = [p + c for p, c in zip(prompts, completions)]  # concatenate prompt+completion  # list length B*G
                 reward_inputs = reward_processing_class(
                     texts, return_tensors="pt", padding=True, padding_side="right", add_special_tokens=False
-                )
-                reward_inputs = super()._prepare_inputs(reward_inputs)
+                )  # tokenizer outputs (e.g., input_ids/attention_mask): approx (B*G, L_rm)
+                reward_inputs = super()._prepare_inputs(reward_inputs)  # move to device (shapes unchanged)
 ## Actually perform action & compute rewards
                 with torch.inference_mode():
                     rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]  # (B*G,)
             else:
                 # Repeat all input columns (but "prompt" and "completion") to match the number of generations
-                reward_kwargs = {key: [] for key in inputs[0].keys() if key not in ["prompt", "completion"]}
+                reward_kwargs = {key: [] for key in inputs[0].keys() if key not in ["prompt", "completion"]}  # lists
                 for key in reward_kwargs:
                     for example in inputs:
                         # Repeat each value in the column for `num_generations` times
-                        reward_kwargs[key].extend([example[key]] * self.num_generations)
-                output_reward_func = reward_func(prompts=prompts, completions=completions, **reward_kwargs)
+                        reward_kwargs[key].extend([example[key]] * self.num_generations)  # each list length B*G
+                output_reward_func = reward_func(prompts=prompts, completions=completions, **reward_kwargs)  # list/np length B*G
                 rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)  # (B*G,)
 
         # Aggregate multi-reward signals
-        rewards = rewards_per_func.sum(dim=1)  # sum across reward heads → scalar per sample
+        rewards = rewards_per_func.sum(dim=1)  # sum across reward heads → scalar per sample  # (B*G,)
 
         # Compute grouped-wise rewards
-        mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)  # per-prompt mean over G
-        std_grouped_rewards = rewards.view(-1, self.num_generations).std(dim=1)  # per-prompt std over G
+        mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)  # per-prompt mean over G  # (B,)
+        std_grouped_rewards = rewards.view(-1, self.num_generations).std(dim=1)  # per-prompt std over G  # (B,)
 
         # Group-relative normalization (mean/std) to form advantages per GRPO.
         mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)  # expand to (B*G,)
         std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)  # expand to (B*G,)
-        advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)  # normalized advantages
+        advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)  # normalized advantages  # (B*G,)
 ## Loss compute
         # Paper alignment: token-wise policy gradient with KL penalty, masked by completion tokens only.
-        per_token_loss = torch.exp(per_token_logps - per_token_logps.detach()) * advantages.unsqueeze(1)  # reinforce-like
-        per_token_loss = -(per_token_loss - self.beta * per_token_kl)  # add KL penalty
-        loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()  # mask to completions
+        per_token_loss = torch.exp(per_token_logps - per_token_logps.detach()) * advantages.unsqueeze(1)  # reinforce-like  # (B*G, C)
+        per_token_loss = -(per_token_loss - self.beta * per_token_kl)  # add KL penalty  # (B*G, C)
+        loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()  # mask to completions  # scalar
 
         # Log the metrics
         completion_length = self.accelerator.gather_for_metrics(completion_mask.sum(1)).float().mean().item()  # avg len
