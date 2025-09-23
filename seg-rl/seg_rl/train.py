@@ -13,7 +13,7 @@ from .datasets import JsonlPointDataset, ImageSize, collate_fn
 from .model import ModelConfig, PointHeatmapModel, argmax_from_logits, soft_argmax_from_logits
 from .losses import ce_over_pixels, kl_to_gaussian_targets
 from .utils import save_checkpoint
-from .utils import draw_cross, draw_triangle, overlay_heatmap, make_grid
+from .utils import draw_cross, draw_triangle, draw_diagonal_cross, overlay_heatmap, make_grid
 
 """
 Sample usage:
@@ -21,10 +21,10 @@ cd seg-rl;
 python -m seg_rl.train \
   --data_jsonl /root/autodl-tmp/works/Seg-R0/datasets/seg_r1_md/Task01_BrainTumour/points_canonical.jsonl \
   --val_ratio 0.1 --test_ratio 0.1 --seed 42 \
-  --height 240 --width 240 --batch_size 16 --epochs 10000 --loss ce --amp \
-  --eval_thresh 5.0 --save_every 100 \
+  --height 240 --width 240 --batch_size 16 --epochs 100 --loss ce --amp \
+  --eval_thresh 5.0 --save_every 10 \
   --out_dir /root/autodl-tmp/works/Seg-R0/outputs/seg_r1_md/Task01_BrainTumour/pretrain \
-  --vis_mode all --vis_count 16
+  --vis_mode sample --vis_count 16
 
 """
 def parse_args() -> argparse.Namespace:
@@ -58,6 +58,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    amp_enabled = args.amp and (device.type == "cuda")
 
     os.makedirs(args.out_dir, exist_ok=True)
     plots_dir = args.plots_dir or os.path.join(args.out_dir, "plots")
@@ -97,7 +98,7 @@ def main() -> None:
     model = PointHeatmapModel(cfg).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
+    scaler = torch.amp.GradScaler(enabled=amp_enabled)
 
     start_epoch = 0
     global_step = 0
@@ -173,6 +174,13 @@ def main() -> None:
                 img_t = batch["image"]  # [B,3,H,W]
                 tgt = batch["target_xy"]  # [B,2]
                 logits = model(img_t.to(device))
+                # ensure logits match image resolution for precise overlay
+                _, _, H_img, W_img = img_t.shape
+                if logits.shape[-2] != H_img or logits.shape[-1] != W_img:
+                    logits = torch.nn.functional.interpolate(logits, size=(H_img, W_img), mode="bilinear", align_corners=False)
+                # probability heatmap for stable visualization
+                bsz, _, H, W = logits.shape
+                probs = torch.softmax(logits.view(bsz, -1), dim=1).view(bsz, 1, H, W)
                 # compute soft-argmax pred on CPU for simplicity
                 pred_xy = soft_argmax_from_logits(logits).cpu()
                 for i in range(img_t.size(0)):
@@ -184,11 +192,19 @@ def main() -> None:
                     arr = img_t[i].cpu().float().numpy()
                     arr = (arr * std + mean).clip(0.0, 1.0)
                     pil_img = TF.to_pil_image(torch.from_numpy(arr))
-                    hm = logits[i, 0].detach().cpu().float().numpy()
-                    over = overlay_heatmap(pil_img, hm, alpha=0.5)
-                    # draw GT and Pred
-                    over = draw_cross(over, (float(tgt[i, 0]), float(tgt[i, 1])), color=(0, 255, 0))
-                    over = draw_triangle(over, (float(pred_xy[i, 0]), float(pred_xy[i, 1])), color=(255, 0, 0))
+                    # overlay probability heatmap instead of raw logits
+                    hm = probs[i, 0].detach().cpu().float().numpy()
+                    # show base image in grayscale while keeping heatmap colored
+                    over = overlay_heatmap(pil_img.convert("L"), hm, alpha=0.5)
+                    # clamp coords to image bounds to ensure visibility
+                    h, w = img_t.size(-2), img_t.size(-1)
+                    gx = float(max(0.0, min(w - 1.0, float(tgt[i, 0]))))
+                    gy = float(max(0.0, min(h - 1.0, float(tgt[i, 1]))))
+                    px = float(max(0.0, min(w - 1.0, float(pred_xy[i, 0]))))
+                    py = float(max(0.0, min(h - 1.0, float(pred_xy[i, 1]))))
+                    # draw GT and Pred (GT + Pred both crosses; Pred is 45-degree red cross)
+                    over = draw_cross(over, (gx, gy), color=(0, 255, 0))
+                    over = draw_diagonal_cross(over, (px, py), color=(255, 0, 0), size=10)
                     saved_images.append(over)
                     count += 1
                 if count >= max_count:
@@ -211,7 +227,7 @@ def main() -> None:
             tgt = batch["target_xy"].to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=args.amp):
+            with torch.amp.autocast(device_type=device.type, enabled=amp_enabled):
                 logits = model(img)
                 if args.loss == "ce":
                     loss = ce_over_pixels(logits, tgt)

@@ -65,7 +65,7 @@ def draw_cross(image: Image.Image, xy: Tuple[float, float], color: Tuple[int, in
     return img
 
 
-def draw_triangle(image: Image.Image, xy: Tuple[float, float], color: Tuple[int, int, int] = (255, 0, 0), size: int = 7, width: int = 2) -> Image.Image:
+def draw_triangle(image: Image.Image, xy: Tuple[float, float], color: Tuple[int, int, int] = (255, 0, 0), size: int = 9, width: int = 2) -> Image.Image:
     img = image.copy()
     draw = ImageDraw.Draw(img)
     x, y = xy
@@ -74,7 +74,24 @@ def draw_triangle(image: Image.Image, xy: Tuple[float, float], color: Tuple[int,
         (x - size * 0.866, y + size * 0.5),
         (x + size * 0.866, y + size * 0.5),
     ]
-    draw.polygon(pts, outline=color)
+    # filled triangle with black outline to ensure visibility on any background
+    draw.polygon(pts, fill=color, outline=(0, 0, 0))
+    return img
+
+
+def draw_diagonal_cross(image: Image.Image, xy: Tuple[float, float], color: Tuple[int, int, int] = (255, 0, 0), size: int = 8, width: int = 2) -> Image.Image:
+    """Draw a 45-degree cross (X-shape). Renders a black stroke underlay for visibility."""
+    img = image.copy()
+    draw = ImageDraw.Draw(img)
+    x, y = xy
+    # black under-stroke
+    if width >= 2:
+        w2 = width + 2
+        draw.line((x - size, y - size, x + size, y + size), fill=(0, 0, 0), width=w2)
+        draw.line((x - size, y + size, x + size, y - size), fill=(0, 0, 0), width=w2)
+    # colored cross
+    draw.line((x - size, y - size, x + size, y + size), fill=color, width=width)
+    draw.line((x - size, y + size, x + size, y - size), fill=color, width=width)
     return img
 
 
