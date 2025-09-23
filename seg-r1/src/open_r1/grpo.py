@@ -9,18 +9,51 @@ from typing import Optional, List, Tuple
 import cv2
 import numpy as np
 import torch
-import datasets
 from PIL import Image as PILImage
-from datasets import DatasetDict, load_dataset, concatenate_datasets
-from torchvision.transforms import Resize
-import torchvision.transforms.functional as TF
-from transformers import Qwen2VLForConditionalGeneration, TrainingArguments
-from trl import GRPOConfig, GRPOTrainer, ModelConfig, ScriptArguments, TrlParser, get_peft_config
+
+# Optional heavy dependencies (only needed for training entrypoints)
+try:
+    import datasets  # type: ignore
+    from datasets import DatasetDict, load_dataset, concatenate_datasets  # type: ignore
+    from torchvision.transforms import Resize  # type: ignore
+    import torchvision.transforms.functional as TF  # type: ignore
+    from transformers import Qwen2VLForConditionalGeneration, TrainingArguments  # type: ignore
+    from trl import (  # type: ignore
+        GRPOConfig,
+        GRPOTrainer,
+        ModelConfig,
+        ScriptArguments,
+        TrlParser,
+        get_peft_config,
+    )
+    from .trainer import (
+        Qwen2VLGRPOTrainer,
+        Qwen2VLGRPOVLLMTrainerModified,
+    )
+except Exception:
+    datasets = None  # type: ignore
+    DatasetDict = None  # type: ignore
+    load_dataset = None  # type: ignore
+    concatenate_datasets = None  # type: ignore
+    Resize = None  # type: ignore
+    TF = None  # type: ignore
+    Qwen2VLForConditionalGeneration = None  # type: ignore
+    TrainingArguments = None  # type: ignore
+    GRPOConfig = None  # type: ignore
+    GRPOTrainer = None  # type: ignore
+    ModelConfig = None  # type: ignore
+    # Provide a minimal fallback so class definition below works if only SAMWrapper is used
+    class ScriptArguments:  # type: ignore
+        pass
+    TrlParser = None  # type: ignore
+    def get_peft_config(*args, **kwargs):  # type: ignore
+        raise ImportError("peft/trl not available")
+    Qwen2VLGRPOTrainer = None  # type: ignore
+    Qwen2VLGRPOVLLMTrainerModified = None  # type: ignore
 
 from sam2.build_sam import build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
-from open_r1.trainer import Qwen2VLGRPOTrainer, Qwen2VLGRPOVLLMTrainerModified
-from utils.metrics import Smeasure
+from .utils.metrics import Smeasure
 
 
 # -------------------------------------------------------------------------------------
@@ -419,10 +452,15 @@ Output the result using the exact format:
 
 
 ## Thin wrapper to select the vLLM-enabled GRPO trainer variant for multi-sample generation efficiency.
-class SegR1Trainer(Qwen2VLGRPOVLLMTrainerModified):
-    
-    def __init__(self, *args, sam_config=None, **kwargs):
-        super().__init__(*args, **kwargs)
+if Qwen2VLGRPOVLLMTrainerModified is not None:
+    class SegR1Trainer(Qwen2VLGRPOVLLMTrainerModified):
+        def __init__(self, *args, sam_config=None, **kwargs):
+            super().__init__(*args, **kwargs)
+else:
+    # Placeholder to avoid import-time errors when only SAMWrapper is needed
+    class SegR1Trainer:  # type: ignore
+        def __init__(self, *args, **kwargs):
+            raise ImportError("Training dependencies are not installed; SegR1Trainer unavailable.")
 
 
 # Reward functions registry

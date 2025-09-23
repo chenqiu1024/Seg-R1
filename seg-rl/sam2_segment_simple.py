@@ -6,10 +6,10 @@
 直接复用seg-r1/src/open_r1/grpo.py中的SAMWrapper类进行分割
 
 用法:
-    python seg-rl/sam2_segment_simple.py \\
-      --input_jsonl /path/to/points.jsonl \\
-      --output_dir /path/to/masks \\
-      --sam_checkpoint /path/to/sam2.1_hiera_large.pt \\
+    python seg-rl/sam2_segment_simple.py \
+      --input_jsonl /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/points_canonical.jsonl \
+      --output_dir /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/masks_step1 \
+      --sam_checkpoint /root/autodl-tmp/works/Seg-R0/third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
       --device cuda
 """
 
@@ -25,8 +25,11 @@ import numpy as np
 import torch
 from PIL import Image as PILImage
 
-# 添加seg-r1路径以导入SAMWrapper
-sys.path.insert(0, str(Path(__file__).parent.parent / "seg-r1" / "src"))
+# 添加seg-r1和third_party路径以导入SAMWrapper及sam2依赖
+project_root = Path(__file__).parent.parent
+sys.path.insert(0, str(project_root / "seg-r1" / "src"))
+# Ensure Python sees the inner package directory (third_party/sam2)
+sys.path.insert(0, str(project_root / "third_party" / "sam2"))
 
 try:
     from open_r1.grpo import SAMWrapper

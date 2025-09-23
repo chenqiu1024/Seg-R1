@@ -7,6 +7,17 @@ and visualization capabilities.
 
 Author: Generated for Seg-R1 project
 Date: 2025-09-23
+
+Example:
+    python seg-rl/mask_comparison.py \
+        --pred_dir /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/masks_step1 \
+        --gt_dir /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/canonical/masks \
+        --img_dir /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/canonical/images \
+        --output_dir /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/comparison_per_image_vis \
+        --summary_output /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/comparison_summary.png \
+        --summary_samples 12 \
+        --visualize_all \
+        --results_json /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/comparison_results.json
 """
 
 import os

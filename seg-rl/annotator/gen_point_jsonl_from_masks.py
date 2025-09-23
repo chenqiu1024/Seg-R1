@@ -11,10 +11,13 @@ Coordinates are in pixel space of the original image/mask pair.
 Designed for Seg-R1 heatmap-classification pretraining pipelines.
 
 Example usage:
-  python utils/gen_point_jsonl_from_masks.py \
-    --images_dir /abs/path/datasets/seg_r1_md/Task01_BrainTumour/canonical/canonical/images \
-    --masks_dir  /abs/path/datasets/seg_r1_md/Task01_BrainTumour/canonical/canonical/masks \
-    --output_jsonl /abs/path/datasets/seg_r1_md/Task01_BrainTumour/points_canonical.jsonl
+  python seg-rl/annotator/gen_point_jsonl_from_masks.py \
+    --images_dir /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/canonical/images \
+    --masks_dir  /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/canonical/masks \
+    --output_jsonl /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/points_canonical.jsonl \
+    --viz_dir /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/viz_canonical \
+    --viz_alpha 0.7 \
+    --viz_radius 6
 
 Notes:
 - Foreground is defined as any non-zero pixel in the mask.
