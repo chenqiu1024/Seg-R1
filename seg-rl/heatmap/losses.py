@@ -30,15 +30,20 @@ def gaussian_heatmap_targets(
     sigma: float = 3.0,
     normalize: bool = True,
 ) -> torch.Tensor:
-    """Create Gaussian target heatmaps centered at target_xy.
-
+    """生成以真值点为中心的高斯软目标热力图
+    
+    产生距离真值点逐渐衰减的概率分布，避免硬分类的类别不平衡问题。
+    
     Args:
-        target_xy: [B,2] (x,y)
-        height, width: output map size
-        sigma: std of Gaussian in pixels
-        normalize: make per-sample heatmap sum to 1
+        target_xy: [B,2] 真值坐标 (x,y)
+        height, width: 输出热力图尺寸
+        sigma: 高斯标准差(像素)
+            - 小图或精确目标: 3.0-5.0
+            - 大图或模糊目标: 6.0-12.0  
+            - 高分辨率(1024+): 8.0-15.0
+        normalize: 是否归一化为概率分布(和为1)
     Returns:
-        heatmaps: [B,1,H,W]
+        heatmaps: [B,1,H,W] 软目标热力图
     """
     device = target_xy.device
     b = target_xy.shape[0]
@@ -53,17 +58,51 @@ def gaussian_heatmap_targets(
     return heat
 
 
-def kl_to_gaussian_targets(logits: torch.Tensor, target_xy: torch.Tensor, sigma: float = 3.0) -> torch.Tensor:
-    """KL divergence between model distribution and Gaussian soft targets.
-
-    Treat p as soft target (Gaussian), q as model softmax over pixels, compute KL(p || q).
+def kl_to_gaussian_targets(logits: torch.Tensor, target_xy: torch.Tensor, sigma: float = 3.0, tau: float = 1.0) -> torch.Tensor:
+    """模型分布与高斯软目标间的KL散度损失
+    
+    让模型学习与真值距离衰减的概率分布，而非硬分类。
+    
+    Args:
+        logits: [B,1,H,W] 模型输出的未归一化分数
+        target_xy: [B,2] 真值坐标
+        sigma: 高斯目标的标准差，建议:
+            - 512x512: 6.0-8.0
+            - 1024x1024: 10.0-12.0
+        tau: 模型softmax的温度，控制分布尖锐度:
+            - tau=1.0: 标准softmax  
+            - tau>1.0: 更平缓分布
+            - tau<1.0: 更尖锐分布
+    Returns:
+        scalar loss
     """
     b, _, h, w = logits.shape
     with torch.no_grad():
         p = gaussian_heatmap_targets(target_xy, h, w, sigma=sigma, normalize=True)  # [B,1,H,W]
         p = p.clamp_min(1e-12)
-    log_q = F.log_softmax(logits.view(b, -1), dim=1).view(b, 1, h, w)
+    log_q = F.log_softmax((logits / max(tau, 1e-6)).view(b, -1), dim=1).view(b, 1, h, w)
     kl = (p * (p.log() - log_q)).sum(dim=(1, 2, 3))
     return kl.mean()
+
+
+def mse_to_gaussian_targets(logits: torch.Tensor, target_xy: torch.Tensor, sigma: float = 3.0) -> torch.Tensor:
+    """模型分布与高斯软目标间的MSE损失
+    
+    更稳定的形状匹配损失，鼓励平滑的距离衰减热力图。
+    相比KL散度，MSE对分布形状的匹配更直接，训练更稳定。
+    
+    Args:
+        logits: [B,1,H,W] 模型输出
+        target_xy: [B,2] 真值坐标  
+        sigma: 高斯目标标准差，建议值同KL损失
+    Returns:
+        scalar loss
+    """
+    b, _, h, w = logits.shape
+    with torch.no_grad():
+        target = gaussian_heatmap_targets(target_xy, h, w, sigma=sigma, normalize=True)  # [B,1,H,W]
+    # normalize predicted to probability via softmax over pixels
+    prob = F.softmax(logits.view(b, -1), dim=1).view(b, 1, h, w)
+    return F.mse_loss(prob, target)
 
 

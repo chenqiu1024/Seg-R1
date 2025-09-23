@@ -11,6 +11,31 @@ import torchvision.transforms.functional as TF
 
 from .model import ModelConfig, PointHeatmapModel, argmax_from_logits, soft_argmax_from_logits
 
+"""
+热力图点定位模型推理
+
+基础用法（与训练时保持架构一致）:
+python -m seg_rl.heatmap.infer \
+  --images /path/to/images_dir \
+  --ckpt /path/to/model_epoch_40.pt \
+  --height 512 --width 512 \
+  --arch unet_s \
+  --soft --temperature 1.0 \
+  --save_json results.json
+
+单张图片推理:
+python -m seg_rl.heatmap.infer \
+  --images /path/to/image.jpg \
+  --ckpt /path/to/checkpoint.pt \
+  --arch unet_s --soft
+
+批量处理多个路径:
+python -m seg_rl.heatmap.infer \
+  --images /path/to/dir1 /path/to/dir2 /path/to/image.png \
+  --ckpt /path/to/checkpoint.pt \
+  --arch unet_s --soft --save_json all_results.json
+"""
+
 
 def load_image(path: str, height: int, width: int):
     img = Image.open(path).convert("RGB")
@@ -26,6 +51,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ckpt", type=str, required=True)
     p.add_argument("--height", type=int, default=512)
     p.add_argument("--width", type=int, default=512)
+    p.add_argument("--arch", type=str, choices=["unet_s", "resnet18"], default="unet_s")
     p.add_argument("--soft", action="store_true", help="Use soft-argmax instead of argmax")
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--save_json", type=str, default=None)
@@ -48,7 +74,7 @@ def main() -> None:
     args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    cfg = ModelConfig(pretrained=False)
+    cfg = ModelConfig(backbone=args.arch, pretrained=False)
     model = PointHeatmapModel(cfg).to(device)
     state = torch.load(args.ckpt, map_location="cpu")
     # supports both raw model state and full checkpoint

@@ -11,25 +11,54 @@ from PIL import Image
 
 from .datasets import JsonlPointDataset, ImageSize, collate_fn
 from .model import ModelConfig, PointHeatmapModel, argmax_from_logits, soft_argmax_from_logits
-from .losses import ce_over_pixels, kl_to_gaussian_targets
+from .losses import ce_over_pixels, kl_to_gaussian_targets, mse_to_gaussian_targets
 from .utils import save_checkpoint
 from .utils import draw_cross, draw_triangle, draw_diagonal_cross, overlay_heatmap, make_grid
 
 """
-Sample usage:
-cd seg-rl;
-python -m heatmap.train \
-  --data_jsonl /root/autodl-tmp/works/Seg-R0/datasets/seg_r1_md/Task01_BrainTumour/points_canonical.jsonl \
+训练热力图分类点定位模型，支持软高斯目标分布
+
+数据准备 - 从mask生成训练数据:
+python seg-rl/annotator/gen_point_jsonl_from_masks.py \\
+  --images_dir /path/to/images \\
+  --masks_dir /path/to/masks \\
+  --output_jsonl /path/to/training_data.jsonl
+
+支持的JSONL格式:
+  新格式: {"image": "/path/img.jpg", "points": [[x,y]], "labels": [1]}
+  旧格式: {"image": "/path/img.jpg", "x": x, "y": y}
+
+推荐用法（UNet + KL软目标，更适合生成平滑的距离衰减热力图）:
+python -m seg_rl.heatmap.train \
+  --data_jsonl /path/to/your/data.jsonl \
+  --height 512 --width 512 \
+  --arch unet_s \
+  --loss kl --sigma 6.0 --tau 1.0 \
+  --batch_size 16 --epochs 40 --amp \
   --val_ratio 0.1 --test_ratio 0.1 --seed 42 \
-  --height 240 --width 240 --batch_size 16 --epochs 100 --loss ce --amp \
-  --eval_thresh 5.0 --save_every 10 \
-  --out_dir /root/autodl-tmp/works/Seg-R0/outputs/seg_r1_md/Task01_BrainTumour/pretrain \
+  --eval_thresh 5.0 --save_every 5 \
+  --out_dir /path/to/outputs \
   --vis_mode sample --vis_count 16
 
+高分辨率场景（增大sigma获得更软的分布）:
+python -m seg_rl.heatmap.train \
+  --data_jsonl /path/to/your/data.jsonl \
+  --height 1024 --width 1024 \
+  --arch unet_s \
+  --loss kl --sigma 10.0 --tau 1.2 \
+  --batch_size 8 --epochs 50 --amp \
+  --lr 1e-4 --weight_decay 1e-4 \
+  --out_dir /path/to/outputs
+
+MSE损失选项（更稳定的形状匹配）:
+python -m seg_rl.heatmap.train \
+  --data_jsonl /path/to/your/data.jsonl \
+  --arch unet_s --loss mse --sigma 8.0 \
+  --epochs 30 --amp
 """
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train heatmap classification point locator")
-    p.add_argument("--data_jsonl", type=str, required=True, help="JSONL containing all samples; splits done in-script")
+    p.add_argument("--data_jsonl", type=str, required=True, help="JSONL file with training samples (supports new points+labels format and legacy x+y format); splits done in-script")
     p.add_argument("--height", type=int, default=512)
     p.add_argument("--width", type=int, default=512)
     p.add_argument("--batch_size", type=int, default=16)
@@ -37,8 +66,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--save_every", type=int, default=1, help="Save checkpoint every N epochs")
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--weight_decay", type=float, default=1e-4)
-    p.add_argument("--loss", type=str, choices=["ce", "kl"], default="ce")
-    p.add_argument("--sigma", type=float, default=3.0, help="Gaussian sigma for KL loss")
+    p.add_argument("--arch", type=str, choices=["unet_s", "resnet18"], default="unet_s")
+    p.add_argument("--loss", type=str, choices=["ce", "kl", "mse"], default="kl")
+    p.add_argument("--sigma", type=float, default=3.0, help="Gaussian sigma for KL/MSE targets")
+    p.add_argument("--tau", type=float, default=1.0, help="Temperature for KL/model softmax")
     p.add_argument("--amp", action="store_true")
     p.add_argument("--workers", type=int, default=8)
     p.add_argument("--out_dir", type=str, default="./outputs/seg_rl")
@@ -94,7 +125,7 @@ def main() -> None:
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True, collate_fn=collate_fn) if val_ds is not None else None
     test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True, collate_fn=collate_fn) if test_ds is not None else None
 
-    cfg = ModelConfig(pretrained=args.pretrained)
+    cfg = ModelConfig(backbone=args.arch, pretrained=args.pretrained)
     model = PointHeatmapModel(cfg).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -231,8 +262,10 @@ def main() -> None:
                 logits = model(img)
                 if args.loss == "ce":
                     loss = ce_over_pixels(logits, tgt)
+                elif args.loss == "kl":
+                    loss = kl_to_gaussian_targets(logits, tgt, sigma=args.sigma, tau=args.tau)
                 else:
-                    loss = kl_to_gaussian_targets(logits, tgt, sigma=args.sigma)
+                    loss = mse_to_gaussian_targets(logits, tgt, sigma=args.sigma)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()

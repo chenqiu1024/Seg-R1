@@ -5,7 +5,7 @@ Generate JSONL supervision (image,x,y) by computing a "deep interior" point of
 binary masks using the Euclidean Distance Transform (EDT) maximum.
 
 Each output line is a JSON object like:
-  {"image": "/abs/path/to/image.jpg", "x": 123.4, "y": 456.7}
+  {"image": "/abs/path/to/image.jpg", "points": [[123.4,456.7], [124.5,457.8]], "labels": [1, 0]}
 
 Coordinates are in pixel space of the original image/mask pair.
 Designed for Seg-R1 heatmap-classification pretraining pipelines.
@@ -241,7 +241,7 @@ def main() -> None:
                 pass
 
             image_field = os.path.abspath(img_path) if args.abs_paths else img_path
-            record = {"image": image_field, "x": float(centroid[0]), "y": float(centroid[1])}
+            record = {"image": image_field, "points": [[float(centroid[0]), float(centroid[1])]], "labels": [1]}
             out_f.write(json.dumps(record, ensure_ascii=False) + "\n")
             num_written += 1
 
