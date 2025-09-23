@@ -18,7 +18,7 @@ from .utils import draw_cross, draw_triangle, draw_diagonal_cross, overlay_heatm
 """
 Sample usage:
 cd seg-rl;
-python -m seg_rl.train \
+python -m heatmap.train \
   --data_jsonl /root/autodl-tmp/works/Seg-R0/datasets/seg_r1_md/Task01_BrainTumour/points_canonical.jsonl \
   --val_ratio 0.1 --test_ratio 0.1 --seed 42 \
   --height 240 --width 240 --batch_size 16 --epochs 100 --loss ce --amp \

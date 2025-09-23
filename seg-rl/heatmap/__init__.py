@@ -1,4 +1,4 @@
-"""seg_rl: Heatmap-based point localization training and inference.
+"""seg_rl - heatmap: Heatmap-based point localization training and inference.
 
 Modules
 -------
