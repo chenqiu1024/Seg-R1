@@ -9,11 +9,23 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
 from PIL import Image
 
-from .datasets import JsonlPointDataset, ImageSize, collate_fn
-from .model import ModelConfig, PointHeatmapModel, argmax_from_logits, soft_argmax_from_logits
-from .losses import ce_over_pixels, kl_to_gaussian_targets, mse_to_gaussian_targets
-from .utils import save_checkpoint
-from .utils import draw_cross, draw_triangle, draw_diagonal_cross, overlay_heatmap, make_grid
+try:
+    from .datasets import JsonlPointDataset, ImageSize, collate_fn
+    from .model import ModelConfig, PointHeatmapModel, argmax_from_logits, soft_argmax_from_logits
+    from .losses import ce_over_pixels, kl_to_gaussian_targets, mse_to_gaussian_targets
+    from .utils import save_checkpoint
+    from .utils import draw_cross, draw_triangle, draw_diagonal_cross, overlay_heatmap, make_grid
+except ImportError:  # allow running as a script without package context
+    import sys as _sys
+    import os as _os
+    _pkg_root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    if _pkg_root not in _sys.path:
+        _sys.path.insert(0, _pkg_root)
+    from heatmap.datasets import JsonlPointDataset, ImageSize, collate_fn
+    from heatmap.model import ModelConfig, PointHeatmapModel, argmax_from_logits, soft_argmax_from_logits
+    from heatmap.losses import ce_over_pixels, kl_to_gaussian_targets, mse_to_gaussian_targets
+    from heatmap.utils import save_checkpoint
+    from heatmap.utils import draw_cross, draw_triangle, draw_diagonal_cross, overlay_heatmap, make_grid
 
 """
 训练热力图分类点定位模型，支持软高斯目标分布
@@ -41,17 +53,18 @@ python -m seg-rl.heatmap.train \
   --vis_mode sample --vis_count 16
 
 高分辨率场景（增大sigma获得更软的分布）:
-python -m seg_rl.heatmap.train \
-  --data_jsonl /path/to/your/data.jsonl \
+python -m seg-rl.heatmap.train \
+  --data_jsonl /root/autodl-tmp/works/Seg-R0/datasets/seg_r1_md/Task01_BrainTumour/mask_salient_points-0.jsonl \
   --height 1024 --width 1024 \
   --arch unet_s \
   --loss kl --sigma 10.0 --tau 1.2 \
   --batch_size 8 --epochs 50 --amp \
   --lr 1e-4 --weight_decay 1e-4 \
-  --out_dir /path/to/outputs
+  --out_dir /root/autodl-tmp/works/Seg-R0/outputs/seg_r1_md/Task01_BrainTumour/heatmap_train-0 \
+  --vis_mode sample --vis_count 16
 
 MSE损失选项（更稳定的形状匹配）:
-python -m seg_rl.heatmap.train \
+python -m seg-rl.heatmap.train \
   --data_jsonl /path/to/your/data.jsonl \
   --arch unet_s --loss mse --sigma 8.0 \
   --epochs 30 --amp

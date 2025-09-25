@@ -35,20 +35,20 @@
 
 基础用法:
     python seg-rl/sam2_segment_from_points.py \
-      --input_jsonl /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/points_canonical.jsonl \
-      --output_dir /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/masks_step1 \
+      --input_jsonl /root/autodl-tmp/works/Seg-R0/outputs/seg_r1_md/Task01_BrainTumour/heatmap_train-0/pred_salient_points.jsonl \
+      --output_dir /root/autodl-tmp/works/Seg-R0/outputs/seg_r1_md/Task01_BrainTumour/pred_masks-0 \
       --sam_checkpoint /root/autodl-tmp/works/Seg-R0/third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
       --device cuda
 
 带JSON输出:
     python seg-rl/sam2_segment_from_points.py \
-      --input_jsonl /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/points_canonical.jsonl \
-      --output_dir /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/masks_step1 \
+      --input_jsonl /root/autodl-tmp/works/Seg-R0/outputs/seg_r1_md/Task01_BrainTumour/heatmap_train-0/pred_salient_points.jsonl \
+      --output_dir /root/autodl-tmp/works/Seg-R0/outputs/seg_r1_md/Task01_BrainTumour/pred_masks-0 \
       --sam_checkpoint /root/autodl-tmp/works/Seg-R0/third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
       --device cuda \
       --resize 512 512 \
       --skip_existing \
-      --json_output /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/pred_masks-0.json
+      --json_output /root/autodl-tmp/works/Seg-R0/outputs/seg_r1_md/Task01_BrainTumour/pred_masks-0.jsonl
 
 JSON输出格式:
     [
@@ -97,16 +97,15 @@ class SAMWrapper:
         """
         # SAM2配置文件路径
         model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
-        
-        # 检查配置文件是否存在
-        config_path = Path(__file__).parent.parent / "third_party" / "sam2" / model_cfg
-        if not config_path.exists():
-            # 尝试相对于当前目录
-            config_path = Path(model_cfg)
-            if not config_path.exists():
-                raise FileNotFoundError(f"SAM2 config file not found: {model_cfg}")
-        
-        sam_model = build_sam2(str(config_path), model_path)
+        sam_model = build_sam2(model_cfg, model_path) 
+        # # 检查配置文件是否存在
+        # config_path = Path(__file__).parent.parent / "third_party" / "sam2" / "sam2" / model_cfg
+        # if not config_path.exists():
+        #     # 尝试相对于当前目录
+        #     config_path = Path(model_cfg)
+        #     if not config_path.exists():
+        #         raise FileNotFoundError(f"SAM2 config file not found: {model_cfg}")
+        # sam_model = build_sam2(str(config_path), model_path)
         
         # 自动检测设备
         if device is None:

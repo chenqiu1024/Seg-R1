@@ -33,7 +33,7 @@
       --image_dir /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/imagesTr \
       --json_file /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/pred_masks-0.json \
       --sam_checkpoint /root/autodl-tmp/works/Seg-R0/third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
-      --output_dir /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/evaluation_results \
+      --output_dir /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/sam_everything \
       --device cuda \
       --metric dice
 """

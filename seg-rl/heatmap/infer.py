@@ -9,7 +9,15 @@ import torch
 from PIL import Image
 import torchvision.transforms.functional as TF
 
-from .model import ModelConfig, PointHeatmapModel, argmax_from_logits, soft_argmax_from_logits
+try:
+    from .model import ModelConfig, PointHeatmapModel, argmax_from_logits, soft_argmax_from_logits
+except ImportError:  # allow running as a script without package context
+    import sys as _sys
+    import os as _os
+    _pkg_root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    if _pkg_root not in _sys.path:
+        _sys.path.insert(0, _pkg_root)
+    from heatmap.model import ModelConfig, PointHeatmapModel, argmax_from_logits, soft_argmax_from_logits
 
 """
 热力图点定位模型推理
