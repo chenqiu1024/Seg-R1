@@ -5,12 +5,34 @@
 
 直接复用seg-r1/src/open_r1/grpo.py中的SAMWrapper类进行分割
 
-用法:
+功能:
+- 从点提示生成图像分割mask
+- 自动计算每个mask的最小包围盒
+- 可选择输出包含mask路径和包围盒坐标的JSON文件
+
+基础用法:
     python seg-rl/sam2_segment_simple.py \
       --input_jsonl /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/mask_salient_points-0.jsonl \
       --output_dir /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/masks-1 \
       --sam_checkpoint /root/autodl-tmp/works/Seg-R0/third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
       --device cuda
+
+带JSON输出:
+    python seg-rl/sam2_segment_simple.py \
+      --input_jsonl /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/points_canonical.jsonl \
+      --output_dir /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/masks_step1 \
+      --sam_checkpoint /root/autodl-tmp/works/Seg-R0/third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
+      --device cuda \
+      --json_output /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/pred_masks-0.json
+
+JSON输出格式:
+    [
+      {
+        "mask_path": "/path/to/mask1.png",
+        "bbox": [10, 20, 100, 150]
+      },
+      ...
+    ]
 """
 
 import argparse
@@ -95,6 +117,33 @@ def get_output_path(image_path: str, output_dir: str) -> str:
     return os.path.join(output_dir, f"{image_name}.png")
 
 
+def calculate_bounding_box(mask: np.ndarray) -> Tuple[int, int, int, int]:
+    """计算mask的最小包围盒
+    
+    Args:
+        mask: 二值mask数组
+        
+    Returns:
+        (x_min, y_min, x_max, y_max) 包围盒坐标
+    """
+    # 确保mask是二值的
+    mask_binary = (mask > 0).astype(np.uint8)
+    
+    # 找到非零像素的坐标
+    y_indices, x_indices = np.where(mask_binary)
+    
+    if len(x_indices) == 0 or len(y_indices) == 0:
+        # 如果没有前景像素，返回空包围盒
+        return 0, 0, 0, 0
+    
+    x_min = int(np.min(x_indices))
+    x_max = int(np.max(x_indices))
+    y_min = int(np.min(y_indices))
+    y_max = int(np.max(y_indices))
+    
+    return x_min, y_min, x_max, y_max
+
+
 def save_mask_as_grayscale(mask: np.ndarray, output_path: str) -> None:
     """将mask保存为灰度图像"""
     # 确保mask是二值的
@@ -121,6 +170,8 @@ def parse_args() -> argparse.Namespace:
                    help="Skip processing if output file already exists")
     p.add_argument("--resize", type=int, nargs=2, default=None, metavar=("WIDTH", "HEIGHT"),
                    help="Resize input images to specified size [width height]")
+    p.add_argument("--json_output", type=str, default=None,
+                   help="Path to output JSON file containing mask paths and bounding boxes")
     return p.parse_args()
 
 
@@ -157,6 +208,9 @@ def main():
     num_processed = 0
     num_skipped = 0
     num_errors = 0
+    
+    # 用于存储JSON输出的列表
+    json_results = []
     
     with open(args.input_jsonl, "r", encoding="utf-8") as f:
         for line_num, line in enumerate(f, 1):
@@ -205,10 +259,20 @@ def main():
                 # 运行SAM2预测
                 mask, confidence = sam_wrapper.predict(image, points, labels)
                 
+                # 计算包围盒
+                x_min, y_min, x_max, y_max = calculate_bounding_box(mask)
+                
                 # 保存mask
                 save_mask_as_grayscale(mask, output_path)
                 
-                print(f"[OK] Line {line_num}: {image_path} -> {output_path} (confidence: {confidence:.3f})")
+                # 如果需要JSON输出，添加到结果列表
+                if args.json_output:
+                    json_results.append({
+                        "mask_path": output_path,
+                        "bbox": [x_min, y_min, x_max, y_max]
+                    })
+                
+                print(f"[OK] Line {line_num}: {image_path} -> {output_path} (confidence: {confidence:.3f}, bbox: [{x_min},{y_min},{x_max},{y_max}])")
                 num_processed += 1
                 
             except Exception as e:
@@ -216,12 +280,24 @@ def main():
                 num_errors += 1
                 continue
     
+    # 保存JSON输出
+    if args.json_output and json_results:
+        try:
+            with open(args.json_output, "w", encoding="utf-8") as json_file:
+                json.dump(json_results, json_file, indent=2, ensure_ascii=False)
+            print(f"JSON output saved to: {args.json_output}")
+        except Exception as e:
+            print(f"[ERROR] Failed to save JSON output: {e}")
+            return 1
+    
     # 打印总结
     print(f"\nProcessing completed:")
     print(f"  Processed: {num_processed}")
     print(f"  Skipped: {num_skipped}")
     print(f"  Errors: {num_errors}")
     print(f"  Output directory: {args.output_dir}")
+    if args.json_output:
+        print(f"  JSON output: {args.json_output}")
     
     return 0 if num_errors == 0 else 1
 
