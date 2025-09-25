@@ -15,13 +15,13 @@ from .model import ModelConfig, PointHeatmapModel, argmax_from_logits, soft_argm
 热力图点定位模型推理
 
 基础用法（与训练时保持架构一致）:
-python -m seg_rl.heatmap.infer \
-  --images /path/to/images_dir \
-  --ckpt /path/to/model_epoch_40.pt \
+python -m seg-rl.heatmap.infer \
+  --images /root/autodl-tmp/works/Seg-R0/datasets/seg_r1_md/Task01_BrainTumour/canonical/images \
+  --ckpt /root/autodl-tmp/works/Seg-R0/outputs/seg_r1_md/Task01_BrainTumour/heatmap_train-0/model_epoch_40.pt \
   --height 512 --width 512 \
   --arch unet_s \
   --soft --temperature 1.0 \
-  --save_json results.json
+  --save_json /root/autodl-tmp/works/Seg-R0/outputs/seg_r1_md/Task01_BrainTumour/heatmap_train-0/pred_salient_points.jsonl
 
 单张图片推理:
 python -m seg_rl.heatmap.infer \
@@ -95,11 +95,12 @@ def main() -> None:
                 xy = argmax_from_logits(logits)[0]
         x, y = float(xy[0].item()), float(xy[1].item())
         print(f"{p}: x={x:.1f}, y={y:.1f}")
-        results.append({"image": p, "x": x, "y": y})
+        results.append({"image": p, "points": [[x, y]], "labels": [1]})
 
     if args.save_json:
         with open(args.save_json, "w", encoding="utf-8") as f:
-            json.dump(results, f, ensure_ascii=False, indent=2)
+            for result in results:
+                f.write(json.dumps(result, ensure_ascii=False) + "\n")
 
 
 if __name__ == "__main__":

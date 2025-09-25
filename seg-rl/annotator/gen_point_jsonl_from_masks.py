@@ -14,8 +14,8 @@ Example usage:
   python seg-rl/annotator/gen_point_jsonl_from_masks.py \
     --images_dir /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/canonical/images \
     --masks_dir  /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/canonical/masks \
-    --output_jsonl /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/points_canonical.jsonl \
-    --viz_dir /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/viz_canonical \
+    --output_jsonl /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/mask_salient_points-0.jsonl \
+    --viz_dir /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/mask_salient_points-0 \
     --viz_alpha 0.7 \
     --viz_radius 6
 

@@ -29,15 +29,15 @@ python seg-rl/annotator/gen_point_jsonl_from_masks.py \\
   旧格式: {"image": "/path/img.jpg", "x": x, "y": y}
 
 推荐用法（UNet + KL软目标，更适合生成平滑的距离衰减热力图）:
-python -m seg_rl.heatmap.train \
-  --data_jsonl /path/to/your/data.jsonl \
+python -m seg-rl.heatmap.train \
+  --data_jsonl /root/autodl-tmp/works/Seg-R0/datasets/seg_r1_md/Task01_BrainTumour/mask_salient_points-0.jsonl \
   --height 512 --width 512 \
   --arch unet_s \
   --loss kl --sigma 6.0 --tau 1.0 \
   --batch_size 16 --epochs 40 --amp \
   --val_ratio 0.1 --test_ratio 0.1 --seed 42 \
   --eval_thresh 5.0 --save_every 5 \
-  --out_dir /path/to/outputs \
+  --out_dir /root/autodl-tmp/works/Seg-R0/outputs/seg_r1_md/Task01_BrainTumour/heatmap_train-0 \
   --vis_mode sample --vis_count 16
 
 高分辨率场景（增大sigma获得更软的分布）:

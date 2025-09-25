@@ -7,8 +7,8 @@
 
 用法:
     python seg-rl/sam2_segment_simple.py \
-      --input_jsonl /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/points_canonical.jsonl \
-      --output_dir /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/masks_step1 \
+      --input_jsonl /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/mask_salient_points-0.jsonl \
+      --output_dir /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/masks-1 \
       --sam_checkpoint /root/autodl-tmp/works/Seg-R0/third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
       --device cuda
 """
