@@ -84,6 +84,12 @@ except ImportError as e:
     sys.exit(1)
 
 
+def _print_progress(num_processed: int, num_skipped: int, num_errors: int, note: str) -> None:
+    """在同一行输出进度信息"""
+    msg = f"[Progress] processed={num_processed} skipped={num_skipped} errors={num_errors} | {note}"
+    print(f"\r{msg}", end="", flush=True)
+
+
 class SAMWrapper:
     """SAM2包装器，用于图像分割预测"""
     
@@ -369,39 +375,58 @@ def main():
             
             # 检查是否跳过已存在的文件
             if args.skip_existing and os.path.isfile(output_path):
-                print(f"[SKIP] Line {line_num}: Output already exists: {output_path}")
+                _print_progress(num_processed, num_skipped + 1, num_errors,
+                                f"skip line {line_num}: {Path(output_path).name} exists")
                 num_skipped += 1
                 continue
             
             try:
                 # 加载图像
                 image = PILImage.open(image_path).convert("RGB")
-                
-                # 调整大小（如果指定）
+                orig_w, orig_h = image.size
+
+                # 若指定resize，则按比例缩放点坐标并对图像进行resize
                 if args.resize:
-                    image = image.resize(args.resize, PILImage.BILINEAR)
-                
-                # 运行SAM2预测
-                mask, confidence = sam_wrapper.predict(image, points, labels)
-                
-                # 计算包围盒
-                x_min, y_min, x_max, y_max = calculate_bounding_box(mask)
-                
-                # 保存mask
-                save_mask_as_grayscale(mask, output_path)
-                
-                # 如果需要JSON输出，添加到结果列表
+                    resize_w, resize_h = int(args.resize[0]), int(args.resize[1])
+                    scale_x = float(resize_w) / float(orig_w)
+                    scale_y = float(resize_h) / float(orig_h)
+                    points_resized = [(px * scale_x, py * scale_y) for (px, py) in points]
+                    image_for_pred = image.resize((resize_w, resize_h), PILImage.BILINEAR)
+                else:
+                    points_resized = points
+                    image_for_pred = image
+                    scale_x = 1.0
+                    scale_y = 1.0
+
+                # 运行SAM2预测（在处理后的分辨率上）
+                mask, confidence = sam_wrapper.predict(image_for_pred, points_resized, labels)
+
+                # 如果做了resize，则将mask缩放回原图尺寸，并在原图尺寸上计算bbox
+                if args.resize:
+                    mask_binary = (mask > 0).astype(np.uint8)
+                    mask_orig_size = cv2.resize(mask_binary, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
+                    x_min, y_min, x_max, y_max = calculate_bounding_box(mask_orig_size)
+                    # 保存缩放回原尺寸的mask
+                    save_mask_as_grayscale(mask_orig_size, output_path)
+                else:
+                    # 未resize，直接使用原mask与bbox
+                    x_min, y_min, x_max, y_max = calculate_bounding_box(mask)
+                    save_mask_as_grayscale(mask, output_path)
+
+                # 如果需要JSON输出，添加到结果列表（bbox恒以原图坐标系表示）
                 if args.json_output:
                     json_results.append({
                         "mask_path": output_path,
                         "bbox": [x_min, y_min, x_max, y_max]
                     })
-                
-                print(f"[OK] Line {line_num}: {image_path} -> {output_path} (confidence: {confidence:.3f}, bbox: [{x_min},{y_min},{x_max},{y_max}])")
+
+                _print_progress(num_processed + 1, num_skipped, num_errors,
+                                f"ok line {line_num}: {Path(output_path).name} conf={confidence:.3f}")
                 num_processed += 1
                 
             except Exception as e:
-                print(f"[ERROR] Line {line_num}: Failed to process {image_path} - {e}")
+                _print_progress(num_processed, num_skipped, num_errors + 1,
+                                f"error line {line_num}: {Path(image_path).name}")
                 num_errors += 1
                 continue
     
@@ -415,8 +440,9 @@ def main():
             print(f"[ERROR] Failed to save JSON output: {e}")
             return 1
     
-    # 打印总结
-    print(f"\nProcessing completed:")
+    # 打印总结（先补换行清空进度行）
+    print()
+    print(f"Processing completed:")
     print(f"  Processed: {num_processed}")
     print(f"  Skipped: {num_skipped}")
     print(f"  Errors: {num_errors}")

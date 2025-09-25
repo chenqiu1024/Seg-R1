@@ -45,12 +45,18 @@ python -m seg_rl.heatmap.infer \
 """
 
 
+def _print_progress(note: str) -> None:
+    print(f"\r{note}", end="", flush=True)
+
+
 def load_image(path: str, height: int, width: int):
     img = Image.open(path).convert("RGB")
+    orig_w, orig_h = img.size
     img = img.resize((width, height), resample=Image.BILINEAR)
     t = TF.to_tensor(img)
     t = TF.normalize(t, mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
-    return img, t.unsqueeze(0)
+    # return original image size for coordinate scaling back to original space
+    return (orig_w, orig_h), t.unsqueeze(0)
 
 
 def parse_args() -> argparse.Namespace:
@@ -92,8 +98,9 @@ def main() -> None:
 
     paths = expand_paths(args.images)
     results = []
-    for p in paths:
-        _, t = load_image(p, args.height, args.width)
+    total = len(paths)
+    for idx, p in enumerate(paths, 1):
+        (orig_w, orig_h), t = load_image(p, args.height, args.width)
         t = t.to(device)
         with torch.no_grad():
             logits = model(t)
@@ -101,9 +108,17 @@ def main() -> None:
                 xy = soft_argmax_from_logits(logits, temperature=args.temperature)[0]
             else:
                 xy = argmax_from_logits(logits)[0]
-        x, y = float(xy[0].item()), float(xy[1].item())
-        print(f"{p}: x={x:.1f}, y={y:.1f}")
-        results.append({"image": p, "points": [[x, y]], "labels": [1]})
+        # coordinates are in resized (width x height) space; scale back to original image size
+        x_resized, y_resized = float(xy[0].item()), float(xy[1].item())
+        scale_x = float(orig_w) / float(args.width)
+        scale_y = float(orig_h) / float(args.height)
+        x_orig = x_resized * scale_x
+        y_orig = y_resized * scale_y
+        _print_progress(f"[{idx}/{total}] {os.path.basename(p)} x={x_orig:.1f}, y={y_orig:.1f} orig={orig_w}x{orig_h}")
+        results.append({"image": p, "points": [[x_orig, y_orig]], "labels": [1]})
+
+    # finalize progress line
+    print()
 
     if args.save_json:
         with open(args.save_json, "w", encoding="utf-8") as f:

@@ -30,10 +30,10 @@
 
 示例:
     python seg-rl/sam2_automatic_evaluation.py \
-      --image_dir /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/imagesTr \
-      --json_file /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/pred_masks-0.json \
+      --image_dir /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/canonical/images \
+      --json_file /root/autodl-tmp/works/Seg-R0/outputs/seg_r1_md/Task01_BrainTumour/pred_masks-0.jsonl \
       --sam_checkpoint /root/autodl-tmp/works/Seg-R0/third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
-      --output_dir /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/sam_everything \
+      --output_dir /root/autodl-tmp/works/Seg-R0/outputs/seg_r1_md/Task01_BrainTumour/sam_everything \
       --device cuda \
       --metric dice
 """
@@ -530,13 +530,14 @@ def main():
     
     try:
         # SAM2配置文件路径
-        config_path = Path(__file__).parent.parent / "third_party" / "sam2" / args.config_path
-        if not config_path.exists():
-            config_path = Path(args.config_path)
-            if not config_path.exists():
-                raise FileNotFoundError(f"SAM2 config file not found: {args.config_path}")
-        
-        sam_model = build_sam2(str(config_path), args.sam_checkpoint)
+        model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
+        sam_model = build_sam2(model_cfg, args.sam_checkpoint)
+        # config_path = Path(__file__).parent.parent / "third_party" / "sam2" / args.config_path
+        # if not config_path.exists():
+        #     config_path = Path(args.config_path)
+        #     if not config_path.exists():
+        #         raise FileNotFoundError(f"SAM2 config file not found: {args.config_path}") 
+        # sam_model = build_sam2(str(config_path), args.sam_checkpoint)
         sam_model = sam_model.to(device)
         
         # 创建自动mask生成器
