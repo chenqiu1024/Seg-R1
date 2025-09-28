@@ -3,22 +3,26 @@
 """
 使用SAM2从点提示进行图像分割
 
-读取包含图像路径和正/负类点坐标的JSONL文件，使用SAM2进行分割，
-并将预测的mask保存为灰度图像。
+读取由点提示组成的输入（支持JSON数组或JSONL逐行），使用SAM2进行分割，
+将预测mask保存为灰度图像，并按要求生成/追加每幅图像对应的bbox日志。
 
 功能:
 - 从点提示生成图像分割mask
 - 自动计算每个mask的最小包围盒
 - 可选择输出包含mask路径和包围盒坐标的JSON文件
 
-输入JSONL格式:
+输入JSON格式（数组）或JSONL（逐行）:
     新格式: {"image": "/path/img.jpg", "points": [[x1,y1], [x2,y2]], "labels": [1, 0]}
     旧格式: {"image": "/path/img.jpg", "x": x1, "y": y1}
 
 输出:
-    与输入图像对应的灰度mask图像，保存到指定目录
-    - 0 (黑色): 背景
-    - 255 (白色): 前景
+    - 预测mask按图像stem创建子目录保存为灰度图：output_dir/<stem>/<k>.png
+      其中k为提示点序列长度-1；像素值：0=背景，255=前景
+    - 在output_dir生成<stem>.jsonl（JSON对象，非数组）。该文件内容保持为：
+      {"count": N, "bboxes": [[x1,y1,x2,y2], ...]}。每次新增一个mask，仅向
+      bboxes追加一个新的bbox并将count递增，无需重写历史bbox。
+    - 将输入JSON数组拷贝到 --json_output，并为每条加入/覆写
+      "sam_masks_dir": output_dir
 
 依赖项:
     - SAM2 (Segment Anything Model 2)
@@ -228,7 +232,7 @@ def validate_and_extract_points(obj: Dict[str, Any], line_num: int) -> Tuple[boo
 
 
 def get_output_path(image_path: str, output_dir: str) -> str:
-    """生成输出mask文件路径
+    """生成输出mask文件路径（旧：单文件路径；新：保留但未使用）
     
     Args:
         image_path: 输入图像路径
@@ -239,6 +243,54 @@ def get_output_path(image_path: str, output_dir: str) -> str:
     """
     image_name = Path(image_path).stem
     return os.path.join(output_dir, f"{image_name}.png")
+
+
+def get_mask_dir_for_image(image_path: str, output_dir: str) -> str:
+    """返回该图像对应的mask子目录路径 output_dir/<stem>"""
+    image_name = Path(image_path).stem
+    return os.path.join(output_dir, image_name)
+
+
+def get_mask_index_from_points(points: List[Tuple[float, float]]) -> int:
+    """根据点序列长度返回mask索引：len(points)-1"""
+    return max(0, int(len(points) - 1))
+
+
+def get_mask_path_for_points(image_path: str, output_dir: str, points: List[Tuple[float, float]]) -> str:
+    """输出mask路径：output_dir/<stem>/<k>.png，k=len(points)-1"""
+    mask_dir = get_mask_dir_for_image(image_path, output_dir)
+    os.makedirs(mask_dir, exist_ok=True)
+    k = get_mask_index_from_points(points)
+    return os.path.join(mask_dir, f"{k}.png")
+
+
+def append_state_log(output_dir: str, image_path: str, bbox: Tuple[int, int, int, int]) -> None:
+    """在 <output_dir>/<stem>.jsonl 中维护单个JSON对象：
+    {"count": N, "bboxes": [[x1,y1,x2,y2], ...]}
+    仅追加当前bbox并将count递增。不会重新读取或计算历史bbox。
+    """
+    stem = Path(image_path).stem
+    log_path = os.path.join(output_dir, f"{stem}.jsonl")
+
+    record: Dict[str, Any] = {"count": 0, "bboxes": []}
+    if os.path.isfile(log_path):
+        try:
+            with open(log_path, 'r', encoding='utf-8') as f:
+                content = f.read().strip()
+                if content:
+                    parsed = json.loads(content)
+                    if isinstance(parsed, dict) and "count" in parsed and "bboxes" in parsed:
+                        record = parsed
+        except Exception:
+            pass
+
+    # 追加当前bbox并递增count
+    record.setdefault("bboxes", [])
+    record["bboxes"].append([int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])])
+    record["count"] = int(record.get("count", 0)) + 1
+
+    with open(log_path, 'w', encoding='utf-8') as f:
+        json.dump(record, f, ensure_ascii=False)
 
 
 def calculate_bounding_box(mask: np.ndarray) -> Tuple[int, int, int, int]:
@@ -288,7 +340,7 @@ def save_mask_as_grayscale(mask: np.ndarray, output_path: str) -> None:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Use SAM2 to segment images from point prompts")
     p.add_argument("--input_jsonl", type=str, required=True,
-                   help="Input JSONL file containing image paths and point coordinates")
+                   help="Input JSON array (preferred) or JSONL file containing image paths and point coordinates")
     p.add_argument("--output_dir", type=str, required=True,
                    help="Output directory to save mask images")
     p.add_argument("--sam_checkpoint", type=str, required=True,
@@ -302,7 +354,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--resize", type=int, nargs=2, default=None, metavar=("WIDTH", "HEIGHT"),
                    help="Resize input images to specified size [width height]")
     p.add_argument("--json_output", type=str, default=None,
-                   help="Path to output JSON file containing mask paths and bounding boxes")
+                   help="Path to write the copied input JSON array with added 'sam_masks_dir'")
     return p.parse_args()
 
 
@@ -333,111 +385,134 @@ def main():
         print(f"Error initializing SAM2: {e}")
         return 1
     
-    # 处理JSONL文件
-    print(f"Processing JSONL file: {args.input_jsonl}")
+    # 读取输入（优先按JSON数组解析；失败则按JSONL逐行解析）
+    print(f"Processing input: {args.input_jsonl}")
     
     num_processed = 0
     num_skipped = 0
     num_errors = 0
     
-    # 用于存储JSON输出的列表
-    json_results = []
-    
-    with open(args.input_jsonl, "r", encoding="utf-8") as f:
-        for line_num, line in enumerate(f, 1):
-            line = line.strip()
-            if not line:
-                continue
-                
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError as e:
-                print(f"[ERROR] Line {line_num}: Invalid JSON - {e}")
-                num_errors += 1
-                continue
-            
-            # 验证并提取点信息
-            is_valid, points, labels = validate_and_extract_points(obj, line_num)
-            if not is_valid:
-                num_errors += 1
-                continue
-            
-            image_path = obj["image"]
-            
-            # 检查图像文件是否存在
-            if not os.path.isfile(image_path):
-                print(f"[ERROR] Line {line_num}: Image file not found: {image_path}")
-                num_errors += 1
-                continue
-            
-            # 生成输出路径
-            output_path = get_output_path(image_path, args.output_dir)
-            
-            # 检查是否跳过已存在的文件
-            if args.skip_existing and os.path.isfile(output_path):
-                _print_progress(num_processed, num_skipped + 1, num_errors,
-                                f"skip line {line_num}: {Path(output_path).name} exists")
-                num_skipped += 1
-                continue
-            
-            try:
-                # 加载图像
-                image = PILImage.open(image_path).convert("RGB")
-                orig_w, orig_h = image.size
-
-                # 若指定resize，则按比例缩放点坐标并对图像进行resize
-                if args.resize:
-                    resize_w, resize_h = int(args.resize[0]), int(args.resize[1])
-                    scale_x = float(resize_w) / float(orig_w)
-                    scale_y = float(resize_h) / float(orig_h)
-                    points_resized = [(px * scale_x, py * scale_y) for (px, py) in points]
-                    image_for_pred = image.resize((resize_w, resize_h), PILImage.BILINEAR)
+    # 解析输入记录列表 records: List[Dict]
+    records: List[Dict[str, Any]] = []
+    try:
+        with open(args.input_jsonl, 'r', encoding='utf-8') as f:
+            content = f.read().strip()
+            if content.startswith('['):
+                parsed = json.loads(content)
+                if isinstance(parsed, list):
+                    records = parsed
                 else:
-                    points_resized = points
-                    image_for_pred = image
-                    scale_x = 1.0
-                    scale_y = 1.0
+                    print("[ERROR] Input JSON root must be an array")
+                    return 1
+            else:
+                # JSONL逐行
+                for line_num, line in enumerate(content.splitlines(), 1):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        records.append(json.loads(line))
+                    except json.JSONDecodeError as e:
+                        print(f"[ERROR] Line {line_num}: Invalid JSON - {e}")
+                        num_errors += 1
+                        continue
+    except Exception as e:
+        print(f"Error reading input: {e}")
+        return 1
 
-                # 运行SAM2预测（在处理后的分辨率上）
-                mask, confidence = sam_wrapper.predict(image_for_pred, points_resized, labels)
+    for idx, obj in enumerate(records, 1):
+        line_num = idx
 
-                # 如果做了resize，则将mask缩放回原图尺寸，并在原图尺寸上计算bbox
-                if args.resize:
-                    mask_binary = (mask > 0).astype(np.uint8)
-                    mask_orig_size = cv2.resize(mask_binary, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
-                    x_min, y_min, x_max, y_max = calculate_bounding_box(mask_orig_size)
-                    # 保存缩放回原尺寸的mask
-                    save_mask_as_grayscale(mask_orig_size, output_path)
-                else:
-                    # 未resize，直接使用原mask与bbox
-                    x_min, y_min, x_max, y_max = calculate_bounding_box(mask)
-                    save_mask_as_grayscale(mask, output_path)
+        # 验证并提取点信息
+        is_valid, points, labels = validate_and_extract_points(obj, line_num)
+        if not is_valid:
+            num_errors += 1
+            continue
 
-                # 如果需要JSON输出，添加到结果列表（bbox恒以原图坐标系表示）
-                if args.json_output:
-                    json_results.append({
-                        "mask_path": output_path,
-                        "bbox": [x_min, y_min, x_max, y_max]
-                    })
+        image_path = obj["image"]
 
-                _print_progress(num_processed + 1, num_skipped, num_errors,
-                                f"ok line {line_num}: {Path(output_path).name} conf={confidence:.3f}")
-                num_processed += 1
-                
-            except Exception as e:
-                _print_progress(num_processed, num_skipped, num_errors + 1,
-                                f"error line {line_num}: {Path(image_path).name}")
-                num_errors += 1
-                continue
-    
-    # 保存JSON输出
-    if args.json_output and json_results:
+        # 检查图像文件是否存在
+        if not os.path.isfile(image_path):
+            print(f"[ERROR] Line {line_num}: Image file not found: {image_path}")
+            num_errors += 1
+            continue
+
+        # 生成输出路径（子目录/<k>.png）
+        output_path = get_mask_path_for_points(image_path, args.output_dir, points)
+
+        # 检查是否跳过已存在的文件
+        mask_existed = os.path.isfile(output_path)
+        if args.skip_existing and mask_existed:
+            _print_progress(num_processed, num_skipped + 1, num_errors,
+                            f"skip line {line_num}: {Path(output_path).name} exists")
+            # 此分支无现成bbox，且不应为不存在的日志补写空记录
+            num_skipped += 1
+            continue
+
         try:
-            with open(args.json_output, "w", encoding="utf-8") as json_file:
-                json.dump(json_results, json_file, indent=2, ensure_ascii=False)
-            print(f"JSON output saved to: {args.json_output}")
+            # 加载图像
+            image = PILImage.open(image_path).convert("RGB")
+            orig_w, orig_h = image.size
+
+            # 若指定resize，则按比例缩放点坐标并对图像进行resize
+            if args.resize:
+                resize_w, resize_h = int(args.resize[0]), int(args.resize[1])
+                scale_x = float(resize_w) / float(orig_w)
+                scale_y = float(resize_h) / float(orig_h)
+                points_resized = [(px * scale_x, py * scale_y) for (px, py) in points]
+                image_for_pred = image.resize((resize_w, resize_h), PILImage.BILINEAR)
+            else:
+                points_resized = points
+                image_for_pred = image
+                scale_x = 1.0
+                scale_y = 1.0
+
+            # 运行SAM2预测（在处理后的分辨率上）
+            mask, confidence = sam_wrapper.predict(image_for_pred, points_resized, labels)
+
+            # 如果做了resize，则将mask缩放回原图尺寸，并在原图尺寸上计算bbox
+            if args.resize:
+                mask_binary = (mask > 0).astype(np.uint8)
+                mask_orig_size = cv2.resize(mask_binary, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
+                x_min, y_min, x_max, y_max = calculate_bounding_box(mask_orig_size)
+                # 保存缩放回原尺寸的mask
+                save_mask_as_grayscale(mask_orig_size, output_path)
+            else:
+                # 未resize，直接使用原mask与bbox
+                x_min, y_min, x_max, y_max = calculate_bounding_box(mask)
+                save_mask_as_grayscale(mask, output_path)
+
+            # 追加/更新该图像的日志（单一JSON对象，追加bbox并递增count）
+            try:
+                append_state_log(args.output_dir, image_path, (x_min, y_min, x_max, y_max))
+            except Exception as e:
+                print(f"[WARN] Failed to append state log for {image_path}: {e}")
+
+            _print_progress(num_processed + 1, num_skipped, num_errors,
+                            f"ok line {line_num}: {Path(output_path).name} conf={confidence:.3f}")
+            num_processed += 1
+
         except Exception as e:
-            print(f"[ERROR] Failed to save JSON output: {e}")
+            _print_progress(num_processed, num_skipped, num_errors + 1,
+                            f"error line {line_num}: {Path(image_path).name}")
+            num_errors += 1
+            continue
+    
+    # 将输入数组复制到json_output并添加/覆盖 sam_masks_dir
+    if args.json_output:
+        try:
+            # 若前面用JSONL解析得到records，则以records为准写出数组
+            out_records = []
+            for obj in records:
+                if isinstance(obj, dict):
+                    obj2 = dict(obj)
+                    obj2["sam_masks_dir"] = args.output_dir
+                    out_records.append(obj2)
+            with open(args.json_output, 'w', encoding='utf-8') as jf:
+                json.dump(out_records, jf, indent=2, ensure_ascii=False)
+            print(f"Copied input to json_output with 'sam_masks_dir': {args.json_output}")
+        except Exception as e:
+            print(f"[ERROR] Failed to save json_output: {e}")
             return 1
     
     # 打印总结（先补换行清空进度行）

@@ -5,19 +5,21 @@ Generate JSONL supervision (image,x,y) by computing a "deep interior" point of
 binary masks using the Euclidean Distance Transform (EDT) maximum.
 
 Each output line is a JSON object like:
-  {"image": "/abs/path/to/image.jpg", "points": [[123.4,456.7], [124.5,457.8]], "labels": [1, 0]}
+  {"image": "/abs/path/to/image.jpg", "gt_mask": "/abs/path/to/mask.png", "points": [[123.4,456.7]], "labels": [1]}
 
 Coordinates are in pixel space of the original image/mask pair.
 Designed for Seg-R1 heatmap-classification pretraining pipelines.
 
 Example usage:
+  # 1) 首次生成（计算首个最佳提示点）
   python seg-rl/annotator/gen_point_jsonl_from_masks.py \
     --images_dir /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/canonical/images \
     --masks_dir  /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/canonical/masks \
-    --output_jsonl /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/mask_salient_points-0.jsonl \
-    --viz_dir /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/mask_salient_points-0 \
-    --viz_alpha 0.7 \
-    --viz_radius 6
+    --output_jsonl /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour.jsonl
+
+  # 2) 追加模式（为每条记录计算后续的第2个及以后提示点）
+  python seg-rl/annotator/gen_point_jsonl_from_masks.py \
+    --appendto_jsonl /root/datasets/segrl_pretrain_braintumour.jsonl
 
 Notes:
 - Foreground is defined as any non-zero pixel in the mask.
@@ -33,13 +35,18 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 from PIL import Image, ImageDraw
-
+from scipy.ndimage import label, distance_transform_edt
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Create JSONL of image->deepest-point(x,y) from masks using EDT")
-    p.add_argument("--images_dir", type=str, required=True, help="Directory containing images (e.g., JPG)")
-    p.add_argument("--masks_dir", type=str, required=True, help="Directory containing PNG masks aligned to images")
-    p.add_argument("--output_jsonl", type=str, required=True, help="Path to write JSONL output")
+    p = argparse.ArgumentParser(description="Create/Append deepest-point prompts from masks using EDT")
+    # 互斥：首写输出 vs 追加到已存在的JSON数组
+    group = p.add_mutually_exclusive_group(required=True)
+    group.add_argument("--output_jsonl", type=str, help="Path to write JSONL lines for first prompts")
+    group.add_argument("--appendto_jsonl", type=str, help="Path to existing JSON array to append next prompts")
+
+    # 首次生成模式需要的参数（在追加模式下将被忽略）
+    p.add_argument("--images_dir", type=str, default=None, help="Directory containing images (e.g., JPG)")
+    p.add_argument("--masks_dir", type=str, default=None, help="Directory containing PNG masks aligned to images")
     p.add_argument("--abs_paths", type=lambda s: s.lower() in {"1","true","yes","y"}, default=True,
                    help="Write absolute image paths (default: True)")
     p.add_argument("--skip_empty", type=lambda s: s.lower() in {"1","true","yes","y"}, default=True,
@@ -70,6 +77,76 @@ def stem(path: str) -> str:
     base, ext = os.path.splitext(name)
     return base
 
+
+def _find_latest_mask_path(sam_masks_dir: str, image_path: str, current_points_len: int) -> Optional[str]:
+    """返回该图像在sam_masks_dir下的最新预测mask路径。
+    优先尝试 sam_masks_dir/<stem>/<current_points_len-1>.png；若不存在，
+    则在该目录下寻找最大数字文件名的png。
+    """
+    image_stem = stem(image_path)
+    candidate_dir = os.path.join(sam_masks_dir, image_stem)
+    if not os.path.isdir(candidate_dir):
+        return None
+    k = max(0, int(current_points_len - 1))
+    preferred = os.path.join(candidate_dir, f"{k}.png")
+    if os.path.isfile(preferred):
+        return preferred
+    # fallback: find max numeric png
+    best_idx = -1
+    best_path = None
+    for name in os.listdir(candidate_dir):
+        if not name.lower().endswith(".png"):
+            continue
+        s = os.path.splitext(name)[0]
+        try:
+            idx = int(s)
+        except Exception:
+            continue
+        if idx > best_idx:
+            best_idx = idx
+            best_path = os.path.join(candidate_dir, name)
+    return best_path
+
+def largest_diff_component_representative(A, B, connectivity=2, min_area=0):
+    # A, B: 2D uint8 arrays, values {0,1} 或 {0,255}
+    A = (A > 0).astype(np.uint8)
+    B = (B > 0).astype(np.uint8)
+    C = A.astype(np.int8) - B.astype(np.int8)  # {-1, 0, +1}
+
+    regions = []
+    # 8 邻域结构元（connectivity=2 表示 8 邻域；=1 表示 4 邻域）
+    st = np.ones((3,3), dtype=np.uint8) if connectivity == 2 else np.array([[0,1,0],[1,1,1],[0,1,0]], dtype=np.uint8)
+
+    for sign, mask in ((1, C > 0), (-1, C < 0)):
+        if not mask.any():
+            continue
+        lab, n = label(mask, structure=st)
+        if n == 0:
+            continue
+        areas = np.bincount(lab.ravel())[1:]  # 忽略背景0
+        if min_area > 0:
+            keep_ids = np.where(areas >= min_area)[0] + 1
+            if keep_ids.size == 0:
+                continue
+            mask2 = np.isin(lab, keep_ids)
+            lab, n = label(mask2, structure=st)
+            if n == 0:
+                continue
+            areas = np.bincount(lab.ravel())[1:]
+
+        k = np.argmax(areas) + 1
+        comp = (lab == k)
+        regions.append((sign, int(areas[k-1]), comp))
+
+    if not regions:
+        return None  # 无非零差异
+
+    # 选面积最大的分量；若需以“最深”优先，可在 key 中加入 max EDT 作为次序
+    sign, area, comp = max(regions, key=lambda t: t[1])
+
+    D = distance_transform_edt(comp)
+    y, x = np.unravel_index(np.argmax(D), D.shape)
+    return dict(sign=sign, area=area, y=int(y), x=int(x), max_radius=float(D[y, x]))
 
 def compute_centroid(mask_u8: np.ndarray) -> Optional[Tuple[float, float]]:
     """
@@ -179,14 +256,98 @@ def find_corresponding_image(
 
 def main() -> None:
     args = parse_args()
+
+    # 追加模式：读取已有JSON数组，计算下一提示点并写回
+    if args.appendto_jsonl:
+        json_path = args.appendto_jsonl
+        if not os.path.isfile(json_path):
+            raise FileNotFoundError(f"Append target not found: {json_path}")
+        with open(json_path, 'r', encoding='utf-8') as f:
+            content = f.read().strip()
+        try:
+            arr = json.loads(content)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"Append target must be a JSON array: {e}")
+        if not isinstance(arr, list):
+            raise RuntimeError("Append target root must be a JSON array")
+
+        updated = 0
+        for idx, rec in enumerate(arr):
+            if not isinstance(rec, dict):
+                continue
+            image_path = rec.get("image")
+            gt_mask_path = rec.get("gt_mask")
+            sam_masks_dir = rec.get("sam_masks_dir")
+            points_list = rec.get("points", [])
+            labels_list = rec.get("labels", [])
+
+            if not (image_path and gt_mask_path and sam_masks_dir):
+                print(f"[WARN] Skip idx {idx}: missing fields")
+                continue
+
+            # 找最新预测mask
+            last_mask_path = _find_latest_mask_path(sam_masks_dir, image_path, len(points_list))
+            if not last_mask_path or not os.path.isfile(last_mask_path):
+                print(f"[WARN] Skip idx {idx}: last mask not found under {sam_masks_dir}")
+                continue
+
+            # 读取gt与pred
+            try:
+                gt_u8 = np.array(Image.open(gt_mask_path), dtype=np.uint8)
+                pred_u8 = np.array(Image.open(last_mask_path), dtype=np.uint8)
+            except Exception as e:
+                print(f"[WARN] Skip idx {idx}: failed to read masks ({e})")
+                continue
+
+            # 若形状不同，将pred按最近邻缩放到gt尺寸
+            h_g, w_g = gt_u8.shape[:2]
+            h_p, w_p = pred_u8.shape[:2]
+            if (h_g, w_g) != (h_p, w_p):
+                try:
+                    from PIL import Image as _PIL
+                    pred_u8 = np.array(_PIL.fromarray(pred_u8).resize((w_g, h_g), resample=Image.NEAREST), dtype=np.uint8)
+                except Exception:
+                    pass
+
+            # 计算差异的最大连通分量代表点
+            rep = largest_diff_component_representative(gt_u8, pred_u8, connectivity=2, min_area=0)
+            if rep is None:
+                print(f"[INFO] idx {idx}: no diff component; skip append")
+                continue
+            x_next = int(rep["x"])  # 列
+            y_next = int(rep["y"])  # 行
+            label_next = 1 if int(rep["sign"]) > 0 else 0
+
+            # 追加points与labels
+            if not isinstance(points_list, list):
+                points_list = []
+            if not isinstance(labels_list, list):
+                labels_list = []
+            points_list.append([x_next, y_next])
+            labels_list.append(int(label_next))
+            rec["points"] = points_list
+            rec["labels"] = labels_list
+            updated += 1
+
+        # 回写同一文件
+        with open(json_path, 'w', encoding='utf-8') as f:
+            json.dump(arr, f, indent=2, ensure_ascii=False)
+        print(f"Appended next prompts to {json_path} (updated {updated} items)")
+        return
+
+    # 否则：首写模式，生成首个提示点（与之前逻辑一致）
+    if not args.images_dir or not args.masks_dir or not args.output_jsonl:
+        raise RuntimeError("images_dir, masks_dir and output_jsonl are required for initial generation mode")
+
     images_dir = args.images_dir
     masks_dir = args.masks_dir
     output_jsonl = args.output_jsonl
     allowed_image_exts = tuple(e.strip().lower() for e in args.image_exts.split(",") if e.strip())
 
     os.makedirs(os.path.dirname(output_jsonl) or ".", exist_ok=True)
-    if args.viz_dir:
-        os.makedirs(args.viz_dir, exist_ok=True)
+    # Visualization output disabled
+    # if args.viz_dir:
+    #     os.makedirs(args.viz_dir, exist_ok=True)
 
     # Gather masks as the source of truth
     mask_files = list_files_with_exts(masks_dir, allowed_exts=(".png",))
@@ -202,7 +363,7 @@ def main() -> None:
         for mask_name in mask_files:
             sample_stem = stem(mask_name)
             mask_path = os.path.join(masks_dir, mask_name)
-
+            
             # Load mask
             try:
                 mask_img = Image.open(mask_path)
@@ -210,7 +371,7 @@ def main() -> None:
             except Exception as e:
                 print(f"[WARN] Skipping unreadable mask: {mask_path} ({e})")
                 continue
-
+            
             # Compute centroid
             centroid = compute_centroid(mask_u8)
             if centroid is None:
@@ -221,14 +382,14 @@ def main() -> None:
                     # For empty masks and skip_empty=False, place centroid at image center
                     h, w = mask_u8.shape[:2]
                     centroid = (float(w - 1) / 2.0, float(h - 1) / 2.0)
-
+            
             # Find corresponding image
             img_path = find_corresponding_image(images_dir, sample_stem, allowed_image_exts)
             if img_path is None:
                 num_missing_images += 1
                 print(f"[WARN] Missing image for mask stem '{sample_stem}' in {images_dir}")
                 continue
-
+            
             # Optional: verify size match and warn if not
             try:
                 with Image.open(img_path) as im:
@@ -242,20 +403,21 @@ def main() -> None:
                     centroid = (centroid[0] * scale_x, centroid[1] * scale_y)
             except Exception:
                 pass
-
+            
             image_field = os.path.abspath(img_path) if args.abs_paths else img_path
-            record = {"image": image_field, "points": [[float(centroid[0]), float(centroid[1])]], "labels": [1]}
+            mask_field = os.path.abspath(mask_path) if args.abs_paths else mask_path
+            record = {"image": image_field, "gt_mask": mask_field, "points": [[float(centroid[0]), float(centroid[1])]], "labels": [1]}
             out_f.write(json.dumps(record, ensure_ascii=False) + "\n")
             num_written += 1
 
             # Visualization
-            if args.viz_dir:
+            if False and args.viz_dir:
                 try:
                     # Load image RGB
                     with Image.open(img_path) as im_rgb:
                         im_rgb = im_rgb.convert("RGB")
                         w_im, h_im = im_rgb.size
-
+                        
                         # Ensure mask size matches visualization image
                         m = mask_u8
                         if (m.shape[1], m.shape[0]) != (w_im, h_im):
@@ -263,7 +425,7 @@ def main() -> None:
                             m_img = Image.fromarray(m)
                             m_img = m_img.resize((w_im, h_im), resample=Image.NEAREST)
                             m = np.array(m_img, dtype=np.uint8)
-
+                        
                         # Create colored mask overlay
                         overlay = Image.new("RGBA", (w_im, h_im), (0, 0, 0, 0))
                         mask_alpha = int(max(0.0, min(1.0, args.viz_alpha)) * 255)
@@ -273,17 +435,17 @@ def main() -> None:
                         alpha_img = Image.fromarray(fg, mode="L")
                         color_img = Image.new("RGBA", (w_im, h_im), color)
                         overlay.paste(color_img, (0, 0), mask=alpha_img)
-
+                        
                         # Compose overlay on image
                         comp = im_rgb.convert("RGBA")
                         comp = Image.alpha_composite(comp, overlay)
-
+                        
                         # Draw the deepest point
                         draw = ImageDraw.Draw(comp)
                         px, py = float(centroid[0]), float(centroid[1])
                         r = max(1, int(args.viz_radius))
                         draw.ellipse((px - r, py - r, px + r, py + r), outline=(0, 255, 0, 255), width=2)
-
+                        
                         # Save
                         out_name = f"{sample_stem}.png"
                         comp.convert("RGB").save(os.path.join(args.viz_dir, out_name))
