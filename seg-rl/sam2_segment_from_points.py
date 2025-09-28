@@ -39,29 +39,24 @@
 
 基础用法:
     python seg-rl/sam2_segment_from_points.py \
-      --input_jsonl /root/autodl-tmp/works/Seg-R0/outputs/seg_r1_md/Task01_BrainTumour/heatmap_train-0/pred_salient_points.jsonl \
-      --output_dir /root/autodl-tmp/works/Seg-R0/outputs/seg_r1_md/Task01_BrainTumour/pred_masks-0 \
+      --input_jsonl /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour.jsonl \
+      --output_dir /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/pretrain_gt_masks \
       --sam_checkpoint /root/autodl-tmp/works/Seg-R0/third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
-      --device cuda
+      --device cuda \
 
 带JSON输出:
     python seg-rl/sam2_segment_from_points.py \
-      --input_jsonl /root/autodl-tmp/works/Seg-R0/outputs/seg_r1_md/Task01_BrainTumour/heatmap_train-0/pred_salient_points.jsonl \
-      --output_dir /root/autodl-tmp/works/Seg-R0/outputs/seg_r1_md/Task01_BrainTumour/pred_masks-0 \
+      --input_jsonl /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour.jsonl \
+      --json_output /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour.jsonl \
+      --output_dir /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/pretrain_gt_masks \
       --sam_checkpoint /root/autodl-tmp/works/Seg-R0/third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
       --device cuda \
       --resize 512 512 \
-      --skip_existing \
-      --json_output /root/autodl-tmp/works/Seg-R0/outputs/seg_r1_md/Task01_BrainTumour/pred_masks-0.jsonl
+      --skip_existing
 
-JSON输出格式:
-    [
-      {
-        "mask_path": "/path/to/mask1.png",
-        "bbox": [10, 20, 100, 150]
-      },
-      ...
-    ]
+详细参数及输出格式说明请参考：docs/cursor_pretrain_flow_all_2025092801.md）：
+    
+
 """
 
 import argparse

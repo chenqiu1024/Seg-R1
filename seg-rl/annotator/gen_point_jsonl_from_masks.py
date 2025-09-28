@@ -19,7 +19,7 @@ Example usage:
 
   # 2) 追加模式（为每条记录计算后续的第2个及以后提示点）
   python seg-rl/annotator/gen_point_jsonl_from_masks.py \
-    --appendto_jsonl /root/datasets/segrl_pretrain_braintumour.jsonl
+    --appendto_jsonl /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour.jsonl
 
 Notes:
 - Foreground is defined as any non-zero pixel in the mask.
