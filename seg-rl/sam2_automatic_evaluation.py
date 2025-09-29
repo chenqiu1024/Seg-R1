@@ -1,41 +1,36 @@
 #!/usr/bin/env python3
 
 """
-使用SAM2 Automatic模式批量分割并评估与真值mask的吻合度
+使用SAM2 Automatic(EVERYTHING)模式批量分割，并基于规范化JSON描述生成标准化输出以便评估与可视化
 
 功能:
-- 使用SAM2 Automatic模式对指定目录下的图片进行批量分割
-- 与JSON描述的真值masks进行吻合度评估
-- 支持IoU和DICE指标评估
-- 生成分割效果可视化图片
-- 统计整个数据集的最好/最差/平均分割效果
+- 根据 --refer_json 指定的JSON数组描述，按EVERYTHING模式对每个样本进行分割
+- 使用每个候选区域的包围框与该样本真值mask的包围框计算IoU，选择IoU最大的区域作为预测mask
+- 将预测mask与包围框以规范形式写入 --output_dir：
+  - <output_dir>/<stem>/0.png
+  - <output_dir>/<stem>.jsonl  内容：{"count":1, "bboxes":[[x1,y1,x2,y2]]}
 
-评估方法:
-1. 对每张原图使用SAM2 Automatic模式分割得到多个区域
-2. 通过包围盒重叠筛选候选预测mask
-3. 计算候选mask与真值mask的IoU/DICE，取最大值作为该图的评估结果
-4. 统计整个数据集的分割效果
+判定规则:
+1. 对每张原图使用SAM2 Automatic产生多个区域
+2. 将每个区域的 [x,y,w,h] 转为 [x1,y1,x2,y2]
+3. 与真值mask的包围框计算IoU，取IoU最大的区域作为预测mask（若无区域，跳过该样本）
 
 输出可视化:
-- 图1: Automatic模式分割的多区域多色展示
-- 图2: 最佳预测mask与真值mask叠加显示（半透明）+ 评估指标
+- 本脚本不再负责可视化；请使用 visualization/viz_sam_segmentation.py 对标准化结果进行可视化
 
 用法:
     python seg-rl/sam2_automatic_evaluation.py \
-      --image_dir /path/to/images \
-      --json_file /path/to/masks.json \
+      --refer_json /root/datasets/segrl_pretrain_braintumour.jsonl \
+      --output_dir /root/outputs/sam_automatic \
       --sam_checkpoint /path/to/sam2.1_hiera_large.pt \
-      --output_dir /path/to/results \
       --device cuda
 
 示例:
     python seg-rl/sam2_automatic_evaluation.py \
-      --image_dir /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/canonical/images \
-      --json_file /root/autodl-tmp/works/Seg-R0/outputs/seg_r1_md/Task01_BrainTumour/pred_masks-0.jsonl \
+      --refer_json /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour.jsonl \
       --sam_checkpoint /root/autodl-tmp/works/Seg-R0/third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
-      --output_dir /root/autodl-tmp/works/Seg-R0/outputs/seg_r1_md/Task01_BrainTumour/sam_everything \
-      --device cuda \
-      --metric dice
+      --output_dir /root/autodl-tmp/outputs/seg_r1_md/Task01_BrainTumour/sam_automatic \
+      --device cuda
 """
 
 import argparse
@@ -144,55 +139,22 @@ def bbox_overlap(bbox1: List[int], bbox2: List[int]) -> bool:
     return True
 
 
-def load_ground_truth_masks(json_file: str) -> Dict[str, Dict[str, Any]]:
-    """加载真值mask信息
-    
-    Args:
-        json_file: JSON文件路径
-        
-    Returns:
-        字典，键为图片文件名（无扩展名），值为mask信息
-    """
-    with open(json_file, 'r', encoding='utf-8') as f:
-        data = json.load(f)
-    
-    gt_masks = {}
-    for item in data:
-        mask_path = item['mask_path']
-        bbox = item['bbox']
-        
-        # 从mask路径提取文件名（无扩展名）
-        mask_filename = Path(mask_path).stem
-        
-        gt_masks[mask_filename] = {
-            'mask_path': mask_path,
-            'bbox': bbox
-        }
-    
-    return gt_masks
+def _read_refer_json(json_path: str) -> List[Dict[str, Any]]:
+    with open(json_path, 'r', encoding='utf-8') as f:
+        arr = json.load(f)
+    if not isinstance(arr, list):
+        raise RuntimeError("refer_json must be a JSON array")
+    return arr
 
 
-def get_image_files(image_dir: str) -> List[str]:
-    """获取图片目录下所有支持的图片文件
-    
-    Args:
-        image_dir: 图片目录
-        
-    Returns:
-        图片文件路径列表，按文件名排序
-    """
-    image_files = []
-    
-    if not os.path.isdir(image_dir):
-        print(f"Error: Directory not found: {image_dir}")
-        return image_files
-    
-    for file_path in Path(image_dir).iterdir():
-        if file_path.is_file() and file_path.suffix.lower() in SUPPORTED_EXTENSIONS:
-            image_files.append(str(file_path))
-    
-    image_files.sort()
-    return image_files
+def _compute_bbox_from_mask(mask: np.ndarray) -> List[int]:
+    mask_bin = (mask > 0).astype(np.uint8)
+    ys, xs = np.where(mask_bin)
+    if ys.size == 0 or xs.size == 0:
+        return [0, 0, 0, 0]
+    x1 = int(xs.min()); x2 = int(xs.max())
+    y1 = int(ys.min()); y2 = int(ys.max())
+    return [x1, y1, x2, y2]
 
 
 def load_mask_image(mask_path: str) -> Optional[np.ndarray]:
@@ -224,18 +186,8 @@ def load_mask_image(mask_path: str) -> Optional[np.ndarray]:
         return None
 
 
-def evaluate_image(image_path: str, gt_info: Dict[str, Any], mask_generator, metric: str = 'iou') -> Tuple[float, Dict[str, Any]]:
-    """评估单张图片的分割效果
-    
-    Args:
-        image_path: 图片路径
-        gt_info: 真值信息
-        mask_generator: SAM2 mask生成器
-        metric: 评估指标 ('iou' 或 'dice')
-        
-    Returns:
-        (最佳分数, 详细信息字典)
-    """
+def evaluate_image(image_path: str, gt_mask_path: str, mask_generator) -> Tuple[float, Dict[str, Any]]:
+    """对单张图片运行EVERYTHING分割，按与GT bbox的IoU选择最佳区域"""
     try:
         # 加载图片
         image = cv2.imread(image_path)
@@ -245,11 +197,11 @@ def evaluate_image(image_path: str, gt_info: Dict[str, Any], mask_generator, met
         image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         
         # 加载真值mask
-        gt_mask = load_mask_image(gt_info['mask_path'])
+        gt_mask = load_mask_image(gt_mask_path)
         if gt_mask is None:
-            return 0.0, {'error': f'Failed to load ground truth mask: {gt_info["mask_path"]}'}
-        
-        gt_bbox = gt_info['bbox']
+            return 0.0, {'error': f'Failed to load ground truth mask: {gt_mask_path}'}
+        # 由GT mask计算bbox
+        gt_bbox = _compute_bbox_from_mask(gt_mask)
         
         # 使用SAM2 Automatic模式生成mask
         masks = mask_generator.generate(image_rgb)
@@ -257,52 +209,47 @@ def evaluate_image(image_path: str, gt_info: Dict[str, Any], mask_generator, met
         if not masks:
             return 0.0, {'error': 'No masks generated by SAM2', 'num_generated': 0}
         
-        # 筛选与真值包围盒重叠的预测mask
-        candidate_masks = []
+        # 遍历所有mask，按bbox IoU选择最佳
+        best_iou = 0.0
+        best_mask_info = None
+        candidate_count = 0
         for mask_info in masks:
-            pred_bbox = mask_info['bbox']  # SAM2返回的格式应该是[x, y, w, h]
-            # 转换为[x_min, y_min, x_max, y_max]格式
+            pred_bbox = mask_info['bbox']  # [x, y, w, h]
             pred_bbox_xyxy = [
-                int(pred_bbox[0]), 
-                int(pred_bbox[1]), 
-                int(pred_bbox[0] + pred_bbox[2]), 
+                int(pred_bbox[0]),
+                int(pred_bbox[1]),
+                int(pred_bbox[0] + pred_bbox[2]),
                 int(pred_bbox[1] + pred_bbox[3])
             ]
-            
-            if bbox_overlap(gt_bbox, pred_bbox_xyxy):
-                candidate_masks.append({
+            # bbox IoU
+            # compute IoU between gt_bbox and pred_bbox_xyxy
+            x1 = max(gt_bbox[0], pred_bbox_xyxy[0])
+            y1 = max(gt_bbox[1], pred_bbox_xyxy[1])
+            x2 = min(gt_bbox[2], pred_bbox_xyxy[2])
+            y2 = min(gt_bbox[3], pred_bbox_xyxy[3])
+            inter = max(0, x2 - x1 + 1) * max(0, y2 - y1 + 1)
+            area_gt = max(0, gt_bbox[2] - gt_bbox[0] + 1) * max(0, gt_bbox[3] - gt_bbox[1] + 1)
+            area_pd = max(0, pred_bbox_xyxy[2] - pred_bbox_xyxy[0] + 1) * max(0, pred_bbox_xyxy[3] - pred_bbox_xyxy[1] + 1)
+            union = area_gt + area_pd - inter
+            iou = float(inter) / float(union) if union > 0 else 0.0
+            candidate_count += 1
+            if iou > best_iou:
+                best_iou = iou
+                best_mask_info = {
                     'mask': mask_info['segmentation'],
                     'bbox': pred_bbox_xyxy,
-                    'area': mask_info['area'],
+                    'area': mask_info.get('area', 0),
                     'stability_score': mask_info.get('stability_score', 0.0)
-                })
-        
-        if not candidate_masks:
+                }
+        if best_mask_info is None:
             return 0.0, {
-                'error': 'No overlapping masks found',
+                'error': 'No masks found',
                 'num_generated': len(masks),
-                'num_candidates': 0
+                'num_candidates': candidate_count
             }
-        
-        # 计算每个候选mask与真值的重合度
-        best_score = 0.0
-        best_mask_info = None
-        
-        for mask_info in candidate_masks:
-            pred_mask = mask_info['mask']
-            
-            if metric == 'dice':
-                score = calculate_dice(gt_mask, pred_mask)
-            else:  # iou
-                score = calculate_iou(gt_mask, pred_mask)
-            
-            if score > best_score:
-                best_score = score
-                best_mask_info = mask_info
-        
-        return best_score, {
+        return best_iou, {
             'num_generated': len(masks),
-            'num_candidates': len(candidate_masks),
+            'num_candidates': candidate_count,
             'best_mask': best_mask_info,
             'all_generated_masks': masks,
             'gt_bbox': gt_bbox,
@@ -412,19 +359,13 @@ def create_visualization(image_path: str, eval_info: Dict[str, Any], best_score:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Evaluate SAM2 Automatic segmentation against ground truth masks"
+        description="Run SAM2 EVERYTHING mode and save standardized outputs for evaluation/visualization"
     )
     parser.add_argument(
-        "--image_dir", 
-        type=str, 
+        "--refer_json",
+        type=str,
         required=True,
-        help="Directory containing input images"
-    )
-    parser.add_argument(
-        "--json_file", 
-        type=str, 
-        required=True,
-        help="JSON file containing ground truth mask information"
+        help="Path to JSON array describing samples: image, gt_mask, sam_masks_dir (ignored here)"
     )
     parser.add_argument(
         "--sam_checkpoint", 
@@ -436,26 +377,13 @@ def parse_args() -> argparse.Namespace:
         "--output_dir", 
         type=str, 
         required=True,
-        help="Output directory for results and visualizations"
+        help="Output directory for standardized masks and bbox logs"
     )
     parser.add_argument(
         "--device", 
         type=str, 
         default=None,
         help="Device to run on (cuda/cpu). Auto-detect if not specified"
-    )
-    parser.add_argument(
-        "--metric", 
-        type=str, 
-        choices=['iou', 'dice'], 
-        default='iou',
-        help="Evaluation metric (default: iou)"
-    )
-    parser.add_argument(
-        "--config_path", 
-        type=str, 
-        default="configs/sam2.1/sam2.1_hiera_l.yaml",
-        help="Path to SAM2 config file"
     )
     parser.add_argument(
         "--points_per_side", 
@@ -492,12 +420,8 @@ def main():
     args = parse_args()
     
     # 检查输入
-    if not os.path.isdir(args.image_dir):
-        print(f"Error: Image directory not found: {args.image_dir}")
-        return 1
-    
-    if not os.path.isfile(args.json_file):
-        print(f"Error: JSON file not found: {args.json_file}")
+    if not os.path.isfile(args.refer_json):
+        print(f"Error: refer_json not found: {args.refer_json}")
         return 1
     
     if not os.path.isfile(args.sam_checkpoint):
@@ -507,15 +431,12 @@ def main():
     # 创建输出目录
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # 加载真值数据
-    print(f"Loading ground truth data from: {args.json_file}")
-    gt_masks = load_ground_truth_masks(args.json_file)
-    print(f"Loaded {len(gt_masks)} ground truth masks")
-    
-    # 获取图片文件
-    print(f"Scanning image directory: {args.image_dir}")
-    image_files = get_image_files(args.image_dir)
-    print(f"Found {len(image_files)} images")
+    # 读取refer_json数组
+    try:
+        records = _read_refer_json(args.refer_json)
+    except Exception as e:
+        print(f"Error reading refer_json: {e}")
+        return 1
     
     # 初始化SAM2
     print(f"Initializing SAM2 with checkpoint: {args.sam_checkpoint}")
@@ -555,106 +476,55 @@ def main():
         return 1
     
     # 评估所有图片
-    print(f"\nStarting evaluation with {args.metric.upper()} metric...")
+    print("\nStarting SAM2 EVERYTHING inference and export...")
     
-    all_scores = []
     num_processed = 0
     num_errors = 0
-    results_log = []
-    
     start_time = time.time()
     
-    for i, image_path in enumerate(image_files, 1):
-        image_name = Path(image_path).stem
-        
-        if args.verbose:
-            print(f"[{i}/{len(image_files)}] Processing: {image_name}")
-        
-        # 检查是否有对应的真值
-        if image_name not in gt_masks:
-            if args.verbose:
-                print(f"  -> No ground truth found, skipping")
+    for i, rec in enumerate(records, 1):
+        if not isinstance(rec, dict):
+            continue
+        image_path = rec.get('image')
+        gt_mask_path = rec.get('gt_mask')
+        if not (image_path and gt_mask_path):
             num_errors += 1
             continue
-        
-        gt_info = gt_masks[image_name]
-        
-        # 评估图片
-        score, eval_info = evaluate_image(image_path, gt_info, mask_generator, args.metric)
-        
+        stem = Path(image_path).stem
+        out_mask_dir = os.path.join(args.output_dir, stem)
+        os.makedirs(out_mask_dir, exist_ok=True)
+        mask_png_path = os.path.join(out_mask_dir, '0.png')
+        bbox_json_path = os.path.join(args.output_dir, f"{stem}.jsonl")
+
+        score, eval_info = evaluate_image(image_path, gt_mask_path, mask_generator)
         if 'error' in eval_info:
             if args.verbose:
-                print(f"  -> Error: {eval_info['error']}")
+                print(f"[{i}/{len(records)}] {stem}: {eval_info['error']}")
             num_errors += 1
             continue
-        
-        all_scores.append(score)
+
+        best = eval_info.get('best_mask')
+        if best is None or best.get('mask') is None:
+            num_errors += 1
+            continue
+
+        # 保存预测mask为灰度png（0/255）
+        mask_bin = (best['mask'] > 0).astype(np.uint8) * 255
+        cv2.imwrite(mask_png_path, mask_bin)
+
+        # 写bbox日志（单对象字典）
+        bbox = best.get('bbox', [0, 0, 0, 0])
+        rec_obj = {"count": 1, "bboxes": [[int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])]]}
+        with open(bbox_json_path, 'w', encoding='utf-8') as f:
+            json.dump(rec_obj, f, ensure_ascii=False)
+
         num_processed += 1
-        
-        # 记录结果
-        result_entry = {
-            'image_name': image_name,
-            'score': score,
-            'num_generated': eval_info['num_generated'],
-            'num_candidates': eval_info['num_candidates']
-        }
-        results_log.append(result_entry)
-        
         if args.verbose:
-            print(f"  -> {args.metric.upper()}: {score:.3f} "
-                  f"({eval_info['num_candidates']}/{eval_info['num_generated']} candidates)")
-        
-        # 创建可视化（如果启用）
-        if not args.no_visualization:
-            vis_output_path = os.path.join(args.output_dir, image_name)
-            create_visualization(image_path, eval_info, score, args.metric, vis_output_path)
-    
-    # 计算统计信息
-    if all_scores:
-        best_score = max(all_scores)
-        worst_score = min(all_scores)
-        avg_score = sum(all_scores) / len(all_scores)
-        
-        # 保存详细结果
-        results_summary = {
-            'metric': args.metric,
-            'total_images': len(image_files),
-            'processed': num_processed,
-            'errors': num_errors,
-            'statistics': {
-                'best': best_score,
-                'worst': worst_score,
-                'average': avg_score
-            },
-            'detailed_results': results_log,
-            'parameters': {
-                'points_per_side': args.points_per_side,
-                'pred_iou_thresh': args.pred_iou_thresh,
-                'stability_score_thresh': args.stability_score_thresh
-            }
-        }
-        
-        results_file = os.path.join(args.output_dir, 'evaluation_results.json')
-        with open(results_file, 'w', encoding='utf-8') as f:
-            json.dump(results_summary, f, indent=2, ensure_ascii=False)
-        
-        # 打印总结
-        elapsed_time = time.time() - start_time
-        print(f"\nEvaluation completed in {elapsed_time:.1f} seconds:")
-        print(f"  Total images: {len(image_files)}")
-        print(f"  Processed: {num_processed}")
-        print(f"  Errors: {num_errors}")
-        print(f"  Metric: {args.metric.upper()}")
-        print(f"  Best score: {best_score:.3f}")
-        print(f"  Worst score: {worst_score:.3f}")
-        print(f"  Average score: {avg_score:.3f}")
-        print(f"  Results saved to: {results_file}")
-        print(f"  Visualizations saved to: {args.output_dir}")
-        
-        return 0
-    else:
-        print("No images were successfully processed.")
-        return 1
+            print(f"[{i}/{len(records)}] {stem}: saved 0.png and bbox json")
+
+    elapsed = time.time() - start_time
+    print(f"\nDone. processed={num_processed} errors={num_errors} in {elapsed:.1f}s")
+    return 0 if num_errors == 0 else 1
 
 
 if __name__ == "__main__":
