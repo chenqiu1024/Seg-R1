@@ -22,6 +22,9 @@ Outputs (per-sample):
       "1": {"DICE": 0.18, "IOU": 0.09},
       "2": {"DICE": 0.93, "IOU": 0.86}
     }
+
+ Example:
+ python seg-rl/evaluation/eval_sam_masks.py --input_json datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour-1.jsonl --num_prompts 1
 """
 
 import argparse
