@@ -20,6 +20,14 @@ python seg-rl/visualization/viz_heuristic_sam_points.py \
     --alpha_pred 0.4 \
     --marker_size 8 \
     --font_scale 0.6
+
+/opt/anaconda3/envs/seg-r1/bin/python seg-rl/visualization/viz_heuristic_sam_points.py \
+    --input_json datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour-1.jsonl \
+    --out_dir output/braintumour/heuristic_points \
+    --alpha_gt 0.7 \
+    --alpha_pred 0.7 \
+    --marker_size 4 \
+    --font_scale 0.6
 """
 
 import argparse

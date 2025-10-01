@@ -12,6 +12,14 @@ Usage:
     --marker_size 8 \
     --font_scale 0.5
 
+  /opt/anaconda3/envs/seg-r1/bin/python seg-rl/visualization/viz_sam_segmentation.py \
+    --input_json datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour-1.jsonl \
+    --output_dir output/braintumour/sam_everything \
+    --alpha_gt 0.65 \
+    --alpha_pred 0.65 \
+    --marker_size 4 \
+    --font_scale 0.25
+
 Input JSON format (array):
   [
     {"image": "/path/img.jpg", "gt_mask": "/path/gt.png", "sam_masks_dir": "/out/masks",
