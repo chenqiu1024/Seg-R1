@@ -11,6 +11,15 @@ is the number of prompts available for that sample. Column k (1-based) shows:
   - The last prompt point at step k drawn: white '^' for foreground, white 'X' for background
 
 Output per-sample image to --out_dir/<stem>.jpg
+
+Example usage:
+python seg-rl/visualization/viz_heuristic_sam_points.py \
+    --input_json datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour.jsonl \
+    --out_dir outputs/heuristic_points \
+    --alpha_gt 0.4 \
+    --alpha_pred 0.4 \
+    --marker_size 8 \
+    --font_scale 0.6
 """
 
 import argparse

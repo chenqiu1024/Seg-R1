@@ -5,8 +5,12 @@ Batch visualization of SAM segmentation results per number of prompts.
 
 Usage:
   python seg-rl/visualization/viz_sam_segmentation.py \
-    --input_json /root/datasets/segrl_pretrain_braintumour.jsonl \
-    --output_dir /root/output/braintumour
+    --input_json datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour.jsonl \
+    --output_dir outputs/sam_everything \
+    --alpha_gt 0.35 \
+    --alpha_pred 0.35 \
+    --marker_size 8 \
+    --font_scale 0.5
 
 Input JSON format (array):
   [
