@@ -21,6 +21,11 @@ Example usage:
   python seg-rl/annotator/gen_point_jsonl_from_masks.py \
     --appendto_jsonl /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour.jsonl
 
+  # 3) 调试模式（生成调试图像）
+  /opt/anaconda3/envs/seg-r1/bin/python seg-rl/annotator/gen_point_jsonl_from_masks.py \
+    --debug_json datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour-1.jsonl \
+    --debug_output_dir output/braintumour/dbg_gen_point
+
 Notes:
 - Foreground is defined as any non-zero pixel in the mask.
 - Target point is the pixel farthest from the background (EDT argmax), which
@@ -36,6 +41,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import numpy as np
 from PIL import Image, ImageDraw
 from scipy.ndimage import label, distance_transform_edt
+import cv2  # type: ignore
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Create/Append deepest-point prompts from masks using EDT")
@@ -43,6 +49,7 @@ def parse_args() -> argparse.Namespace:
     group = p.add_mutually_exclusive_group(required=True)
     group.add_argument("--output_jsonl", type=str, help="Path to write JSONL lines for first prompts")
     group.add_argument("--appendto_jsonl", type=str, help="Path to existing JSON array to append next prompts")
+    group.add_argument("--debug_json", type=str, help="Path to JSON array to read for debug visualization only")
 
     # 首次生成模式需要的参数（在追加模式下将被忽略）
     p.add_argument("--images_dir", type=str, default=None, help="Directory containing images (e.g., JPG)")
@@ -56,6 +63,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--viz_dir", type=str, default=None, help="Optional directory to save overlay visualizations")
     p.add_argument("--viz_alpha", type=float, default=0.35, help="Alpha for mask overlay (0-1)")
     p.add_argument("--viz_radius", type=int, default=4, help="Radius (pixels) for deepest-point circle")
+    p.add_argument("--debug_output_dir", type=str, default=None,
+                   help="If set, write per-sample debug images for diff component selection")
     return p.parse_args()
 
 
@@ -78,12 +87,11 @@ def stem(path: str) -> str:
     return base
 
 
-def _find_latest_mask_path(sam_masks_dir: str, image_path: str, current_points_len: int) -> Optional[str]:
+def _find_latest_mask_path(sam_masks_dir: str, image_stem: str, current_points_len: int) -> Optional[str]:
     """返回该图像在sam_masks_dir下的最新预测mask路径。
     优先尝试 sam_masks_dir/<stem>/<current_points_len-1>.png；若不存在，
     则在该目录下寻找最大数字文件名的png。
     """
-    image_stem = stem(image_path)
     candidate_dir = os.path.join(sam_masks_dir, image_stem)
     if not os.path.isdir(candidate_dir):
         return None
@@ -106,47 +114,6 @@ def _find_latest_mask_path(sam_masks_dir: str, image_path: str, current_points_l
             best_idx = idx
             best_path = os.path.join(candidate_dir, name)
     return best_path
-
-def largest_diff_component_representative(A, B, connectivity=2, min_area=0):
-    # A, B: 2D uint8 arrays, values {0,1} 或 {0,255}
-    A = (A > 0).astype(np.uint8)
-    B = (B > 0).astype(np.uint8)
-    C = A.astype(np.int8) - B.astype(np.int8)  # {-1, 0, +1}
-
-    regions = []
-    # 8 邻域结构元（connectivity=2 表示 8 邻域；=1 表示 4 邻域）
-    st = np.ones((3,3), dtype=np.uint8) if connectivity == 2 else np.array([[0,1,0],[1,1,1],[0,1,0]], dtype=np.uint8)
-
-    for sign, mask in ((1, C > 0), (-1, C < 0)):
-        if not mask.any():
-            continue
-        lab, n = label(mask, structure=st)
-        if n == 0:
-            continue
-        areas = np.bincount(lab.ravel())[1:]  # 忽略背景0
-        if min_area > 0:
-            keep_ids = np.where(areas >= min_area)[0] + 1
-            if keep_ids.size == 0:
-                continue
-            mask2 = np.isin(lab, keep_ids)
-            lab, n = label(mask2, structure=st)
-            if n == 0:
-                continue
-            areas = np.bincount(lab.ravel())[1:]
-
-        k = np.argmax(areas) + 1
-        comp = (lab == k)
-        regions.append((sign, int(areas[k-1]), comp))
-
-    if not regions:
-        return None  # 无非零差异
-
-    # 选面积最大的分量；若需以“最深”优先，可在 key 中加入 max EDT 作为次序
-    sign, area, comp = max(regions, key=lambda t: t[1])
-
-    D = distance_transform_edt(comp)
-    y, x = np.unravel_index(np.argmax(D), D.shape)
-    return dict(sign=sign, area=area, y=int(y), x=int(x), max_radius=float(D[y, x]))
 
 def compute_centroid(mask_u8: np.ndarray) -> Optional[Tuple[float, float]]:
     """
@@ -237,6 +204,131 @@ def compute_centroid(mask_u8: np.ndarray) -> Optional[Tuple[float, float]]:
     y, x = np.unravel_index(np.argmax(dist), dist.shape)
     return (float(x), float(y))
 
+def largest_diff_component_representative(A, B, connectivity=2, min_area=0, dbg_out_path: Optional[str] = None):
+    # A, B: 2D uint8 arrays, values {0,1} 或 {0,255}
+    A = (A > 0).astype(np.uint8)
+    B = (B > 0).astype(np.uint8)
+    C = A.astype(np.int8) - B.astype(np.int8)  # {-1, 0, +1}
+
+    regions = []
+    # 8 邻域结构元（connectivity=2 表示 8 邻域；=1 表示 4 邻域）
+    st = np.ones((3,3), dtype=np.uint8) if connectivity == 2 else np.array([[0,1,0],[1,1,1],[0,1,0]], dtype=np.uint8)
+
+    for sign, mask in ((1, C > 0), (-1, C < 0)):
+        if not mask.any():
+            continue
+        lab, n = label(mask, structure=st)
+        if n == 0:
+            continue
+        areas = np.bincount(lab.ravel())[1:]  # 忽略背景0
+        if min_area > 0:
+            keep_ids = np.where(areas >= min_area)[0] + 1
+            if keep_ids.size == 0:
+                continue
+            mask2 = np.isin(lab, keep_ids)
+            lab, n = label(mask2, structure=st)
+            if n == 0:
+                continue
+            areas = np.bincount(lab.ravel())[1:]
+
+        k = np.argmax(areas) + 1
+        comp = (lab == k)
+        regions.append((sign, int(areas[k-1]), comp))
+
+    if not regions:
+        return None  # 无非零差异
+
+    # 选面积最大的分量；若需以“最深”优先，可在 key 中加入 max EDT 作为次序
+    sign, area, comp = max(regions, key=lambda t: t[1])
+
+    centroid = compute_centroid(comp)
+    if centroid is None:
+        return None
+
+    # 调试可视化
+    if dbg_out_path:
+        try:
+            h, w = A.shape[:2]
+            # Panel 1: A/B overlay (A=green, B=red)
+            overlay1 = np.zeros((h, w, 3), dtype=np.uint8)
+            overlay1[..., 1] = (A > 0).astype(np.uint8) * 255  # G
+            overlay1[..., 2] = (B > 0).astype(np.uint8) * 255  # R
+            bg = np.zeros_like(overlay1)
+            panel1 = cv2.addWeighted(bg, 1.0, overlay1, 0.6, 0.0)
+
+            # Panel 2: signed diff C (positive green, negative red)
+            C = A.astype(np.int8) - B.astype(np.int8)
+            panel2 = np.zeros((h, w, 3), dtype=np.uint8)
+            pos = (C > 0)
+            neg = (C < 0)
+            panel2[pos, 1] = 255
+            panel2[neg, 2] = 255
+
+            # Panel 3: connected components colored + final X marker
+            panel3 = np.zeros((h, w, 3), dtype=np.uint8)
+            # Color positive comps
+            for sgn, mask in ((1, C > 0), (-1, C < 0)):
+                if not mask.any():
+                    continue
+                lab, n = label(mask, structure=np.ones((3,3), dtype=np.uint8) if connectivity == 2 else np.array([[0,1,0],[1,1,1],[0,1,0]], dtype=np.uint8))
+                if n == 0:
+                    continue
+                # generate distinct vivid colors
+                rng = np.random.default_rng(12345 if sgn > 0 else 54321)
+                colors = (rng.integers(0, 256, size=(n, 3))).astype(np.uint8)
+                colors = np.clip(colors + 100, 0, 255)  # brighten
+                for i in range(1, n + 1):
+                    panel3[lab == i] = colors[i - 1]
+
+            # draw marker at centroid: foreground -> caret '^', background -> 'X'
+            cx, cy = int(round(centroid[0])), int(round(centroid[1]))
+            # outline black then white (match viz script style)
+            def _draw_cross(img, x, y, size=6, color=(255,255,255), thickness=2):
+                cv2.line(img, (x - size, y - size), (x + size, y + size), (0,0,0), thickness + 2, lineType=cv2.LINE_AA)
+                cv2.line(img, (x - size, y + size), (x + size, y - size), (0,0,0), thickness + 2, lineType=cv2.LINE_AA)
+                cv2.line(img, (x - size, y - size), (x + size, y + size), color, thickness, lineType=cv2.LINE_AA)
+                cv2.line(img, (x - size, y + size), (x + size, y - size), color, thickness, lineType=cv2.LINE_AA)
+            def _draw_caret(img, x, y, size=6, color=(255,255,255), thickness=2):
+                p_top = (int(x), int(y - size))
+                p_left = (int(x - size), int(y + size))
+                p_right = (int(x + size), int(y + size))
+                # outline
+                cv2.line(img, p_left, p_top, (0,0,0), thickness + 2, lineType=cv2.LINE_AA)
+                cv2.line(img, p_right, p_top, (0,0,0), thickness + 2, lineType=cv2.LINE_AA)
+                # stroke
+                cv2.line(img, p_left, p_top, color, thickness, lineType=cv2.LINE_AA)
+                cv2.line(img, p_right, p_top, color, thickness, lineType=cv2.LINE_AA)
+
+            if int(sign) > 0:
+                _draw_caret(panel3, cx, cy, size=6, color=(255,255,255), thickness=2)
+            else:
+                _draw_cross(panel3, cx, cy, size=6, color=(255,255,255), thickness=2)
+
+            # Add panel titles for clarity
+            def _add_title(img: np.ndarray, text: str) -> None:
+                band_h = max(20, min(48, img.shape[0] // 20))
+                roi = img[0:band_h, :, :]
+                overlay = roi.copy()
+                cv2.rectangle(overlay, (0, 0), (img.shape[1] - 1, band_h - 1), (0, 0, 0), thickness=-1)
+                cv2.addWeighted(overlay, 0.5, roi, 0.5, 0, dst=roi)
+                # outlined text
+                org = (8, band_h - 6)
+                cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, lineType=cv2.LINE_AA)
+                cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, lineType=cv2.LINE_AA)
+
+            _add_title(panel1, "Overlay A (green) vs B (red)")
+            _add_title(panel2, "Signed diff C: + (green), - (red)")
+            _add_title(panel3, "Components + selected X")
+
+            # concat panels
+            canvas = np.concatenate([panel1, panel2, panel3], axis=1)
+            os.makedirs(os.path.dirname(dbg_out_path) or ".", exist_ok=True)
+            from PIL import Image as _PIL
+            _PIL.fromarray(canvas[..., ::-1]).save(dbg_out_path)  # BGR->RGB flip
+        except Exception as _:
+            pass
+
+    return dict(sign=sign, area=area, y=int(centroid[1]), x=int(centroid[0]))
 
 def find_corresponding_image(
     images_dir: str,
@@ -253,9 +345,110 @@ def find_corresponding_image(
             return os.path.join(images_dir, name)
     return None
 
+def calculate_next_point(gt_mask_path, sam_masks_dir, current_points_len, dbg_out_dir: Optional[str] = None):
+    # 读取gt与pred
+    try:
+        gt_u8 = np.array(Image.open(gt_mask_path), dtype=np.uint8)
+        if current_points_len > 0:
+            last_mask_path = _find_latest_mask_path(sam_masks_dir, stem(gt_mask_path), current_points_len)
+            if not last_mask_path or not os.path.isfile(last_mask_path):
+                print(f"[WARN] Skip: last mask not found under {sam_masks_dir}")
+                return None, None, None
+            pred_u8 = np.array(Image.open(last_mask_path), dtype=np.uint8)
+        else:
+            pred_u8 = np.zeros_like(gt_u8)
+    except Exception as e:
+        print(f"[WARN] Skip: failed to read masks ({e})")
+        return None, None, None
+
+    # 若形状不同，将pred按最近邻缩放到gt尺寸
+    h_g, w_g = gt_u8.shape[:2]
+    h_p, w_p = pred_u8.shape[:2]
+    if (h_g, w_g) != (h_p, w_p):
+        try:
+            from PIL import Image as _PIL
+            pred_u8 = np.array(_PIL.fromarray(pred_u8).resize((w_g, h_g), resample=Image.NEAREST), dtype=np.uint8)
+        except Exception:
+            pass
+
+    # 计算差异的最大连通分量代表点
+    dbg_path = None
+    if dbg_out_dir:
+        try:
+            subdir = os.path.join(dbg_out_dir, stem(gt_mask_path))
+            os.makedirs(subdir, exist_ok=True)
+            dbg_path = os.path.join(subdir, f"dbg_{max(0, int(current_points_len))}.png")
+        except Exception:
+            dbg_path = None
+    rep = largest_diff_component_representative(gt_u8, pred_u8, connectivity=2, min_area=0, dbg_out_path=dbg_path)
+    if rep is None:
+        print(f"[INFO] no diff component; skip append")
+        return None, None, None
+    x_next = int(rep["x"])  # 列
+    y_next = int(rep["y"])  # 行
+    label_next = 1 if int(rep["sign"]) > 0 else 0
+    return x_next, y_next, label_next
 
 def main() -> None:
     args = parse_args()
+
+    # Debug-only mode: read JSON, generate debug images but do not write JSON
+    if args.debug_json:
+        if not args.debug_output_dir:
+            raise RuntimeError("--debug_output_dir is required when --debug_json is set")
+        json_path = args.debug_json
+        if not os.path.isfile(json_path):
+            raise FileNotFoundError(f"Debug JSON not found: {json_path}")
+        with open(json_path, 'r', encoding='utf-8') as f:
+            content = f.read().strip()
+        try:
+            arr = json.loads(content)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"Debug JSON must be a JSON array: {e}")
+        if not isinstance(arr, list):
+            raise RuntimeError("Debug JSON root must be a JSON array")
+
+        num_generated = 0
+        for rec in arr:
+            if not isinstance(rec, dict):
+                continue
+            image_path = rec.get("image")
+            gt_mask_path = rec.get("gt_mask")
+            sam_masks_dir = rec.get("sam_masks_dir")
+            if not (image_path and gt_mask_path and sam_masks_dir):
+                continue
+            # For each numeric mask under sam_masks_dir/<stem>/, iterate k over existing masks except the max
+            sample_stem = stem(gt_mask_path)
+            candidate_dir = os.path.join(sam_masks_dir, sample_stem)
+            if not os.path.isdir(candidate_dir):
+                continue
+            # Collect numeric mask indices
+            numeric_indices = []
+            for name in os.listdir(candidate_dir):
+                if not name.lower().endswith('.png'):
+                    continue
+                s = os.path.splitext(name)[0]
+                try:
+                    k = int(s)
+                except Exception:
+                    continue
+                numeric_indices.append(k)
+            if not numeric_indices:
+                continue
+            numeric_indices = sorted(set(numeric_indices))
+            if len(numeric_indices) <= 1:
+                continue
+            # For each k except max, call calculate_next_point with current_points_len = k + 1
+            for k in numeric_indices[:-1]:
+                _ = calculate_next_point(
+                    gt_mask_path,
+                    sam_masks_dir,
+                    k + 1,
+                    dbg_out_dir=args.debug_output_dir,
+                )
+                num_generated += 1
+        print(f"Generated debug images for {num_generated} steps into {args.debug_output_dir}")
+        return
 
     # 追加模式：读取已有JSON数组，计算下一提示点并写回
     if args.appendto_jsonl:
@@ -285,39 +478,30 @@ def main() -> None:
                 print(f"[WARN] Skip idx {idx}: missing fields")
                 continue
 
-            # 找最新预测mask
-            last_mask_path = _find_latest_mask_path(sam_masks_dir, image_path, len(points_list))
-            if not last_mask_path or not os.path.isfile(last_mask_path):
-                print(f"[WARN] Skip idx {idx}: last mask not found under {sam_masks_dir}")
+            x_next, y_next, label_next = calculate_next_point(
+                gt_mask_path,
+                sam_masks_dir,
+                len(points_list),
+                dbg_out_dir=args.debug_output_dir,
+            )
+            if x_next is None or y_next is None or label_next is None:
                 continue
 
-            # 读取gt与pred
+            # 对齐首写模式：若原图与掩模尺寸不同，则将点坐标从掩模坐标系映射到原图坐标系
             try:
-                gt_u8 = np.array(Image.open(gt_mask_path), dtype=np.uint8)
-                pred_u8 = np.array(Image.open(last_mask_path), dtype=np.uint8)
-            except Exception as e:
-                print(f"[WARN] Skip idx {idx}: failed to read masks ({e})")
-                continue
-
-            # 若形状不同，将pred按最近邻缩放到gt尺寸
-            h_g, w_g = gt_u8.shape[:2]
-            h_p, w_p = pred_u8.shape[:2]
-            if (h_g, w_g) != (h_p, w_p):
-                try:
-                    from PIL import Image as _PIL
-                    pred_u8 = np.array(_PIL.fromarray(pred_u8).resize((w_g, h_g), resample=Image.NEAREST), dtype=np.uint8)
-                except Exception:
-                    pass
-
-            # 计算差异的最大连通分量代表点
-            rep = largest_diff_component_representative(gt_u8, pred_u8, connectivity=2, min_area=0)
-            if rep is None:
-                print(f"[INFO] idx {idx}: no diff component; skip append")
-                continue
-            x_next = int(rep["x"])  # 列
-            y_next = int(rep["y"])  # 行
-            label_next = 1 if int(rep["sign"]) > 0 else 0
-
+                from PIL import Image  # type: ignore
+                with Image.open(image_path) as im:
+                    w_im, h_im = im.size
+                with Image.open(gt_mask_path) as m_im:
+                    w_m, h_m = m_im.size
+                if (w_im, h_im) != (w_m, h_m):
+                    scale_x = w_im / float(max(w_m, 1))
+                    scale_y = h_im / float(max(h_m, 1))
+                    x_next = float(x_next) * scale_x
+                    y_next = float(y_next) * scale_y
+            except Exception:
+                pass
+    
             # 追加points与labels
             if not isinstance(points_list, list):
                 points_list = []
@@ -372,9 +556,13 @@ def main() -> None:
                 print(f"[WARN] Skipping unreadable mask: {mask_path} ({e})")
                 continue
             
-            # Compute centroid
-            centroid = compute_centroid(mask_u8)
-            if centroid is None:
+            x_next, y_next, label_next = calculate_next_point(
+                mask_path,
+                None,
+                0,
+                dbg_out_dir=args.debug_output_dir,
+            )
+            if x_next is None or y_next is None or label_next is None:
                 if args.skip_empty:
                     num_skipped_empty += 1
                     continue
@@ -382,7 +570,8 @@ def main() -> None:
                     # For empty masks and skip_empty=False, place centroid at image center
                     h, w = mask_u8.shape[:2]
                     centroid = (float(w - 1) / 2.0, float(h - 1) / 2.0)
-            
+            centroid = (x_next, y_next)
+
             # Find corresponding image
             img_path = find_corresponding_image(images_dir, sample_stem, allowed_image_exts)
             if img_path is None:
