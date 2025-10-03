@@ -55,11 +55,11 @@
       --skip_existing
     
     /opt/anaconda3/envs/seg-r1/bin/python seg-rl/sam2_segment_from_points.py \
-      --input_jsonl datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour-251002.jsonl \
-      --json_output datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour-251002.jsonl \
-      --output_dir datasets/seg_r1_md/Task01_BrainTumour/pretrain_gt_masks-251002 \
+      --input_jsonl datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour-251003.jsonl \
+      --json_output datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour-251003.jsonl \
+      --output_dir datasets/seg_r1_md/Task01_BrainTumour/pretrain_gt_masks-251003 \
       --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
-      --device cuda \
+      --device mps \
       --resize 512 512 \
       --skip_existing
 

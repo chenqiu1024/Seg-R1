@@ -25,6 +25,8 @@ Outputs (per-sample):
 
  Example:
  python seg-rl/evaluation/eval_sam_masks.py --input_json datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour-1.jsonl --num_prompts 1
+ 
+ /opt/anaconda3/envs/seg-r1/bin/python seg-rl/evaluation/eval_sam_masks.py --input_json datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour-251003.jsonl --num_prompts 1
 """
 
 import argparse
