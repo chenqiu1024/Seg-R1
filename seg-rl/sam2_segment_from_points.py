@@ -100,18 +100,6 @@ class SAMWrapper:
             device: 运行设备 (e.g. "cuda", "cuda:0", "cpu")
                    如果为None，将自动检测可用设备
         """
-        # SAM2配置文件路径
-        model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
-        sam_model = build_sam2(model_cfg, model_path) 
-        # # 检查配置文件是否存在
-        # config_path = Path(__file__).parent.parent / "third_party" / "sam2" / "sam2" / model_cfg
-        # if not config_path.exists():
-        #     # 尝试相对于当前目录
-        #     config_path = Path(model_cfg)
-        #     if not config_path.exists():
-        #         raise FileNotFoundError(f"SAM2 config file not found: {model_cfg}")
-        # sam_model = build_sam2(str(config_path), model_path)
-        
         # 自动检测设备
         if device is None:
             self.device = torch.device(
@@ -121,7 +109,19 @@ class SAMWrapper:
             self.device = torch.device(device)
         
         # 移动到指定设备
-        sam_model = sam_model.to(self.device)
+        # SAM2配置文件路径
+        model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
+        sam_model = build_sam2(model_cfg, model_path, device=self.device) 
+        # # 检查配置文件是否存在
+        # config_path = Path(__file__).parent.parent / "third_party" / "sam2" / "sam2" / model_cfg
+        # if not config_path.exists():
+        #     # 尝试相对于当前目录
+        #     config_path = Path(model_cfg)
+        #     if not config_path.exists():
+        #         raise FileNotFoundError(f"SAM2 config file not found: {model_cfg}")
+        # sam_model = build_sam2(str(config_path), model_path)
+        
+        ### sam_model = sam_model.to(self.device)
         
         # 初始化预测器
         self.predictor = SAM2ImagePredictor(sam_model)
