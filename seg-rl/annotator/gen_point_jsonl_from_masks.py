@@ -128,6 +128,17 @@ def _find_latest_mask_path(sam_masks_dir: str, image_stem: str, current_points_l
             best_path = os.path.join(candidate_dir, name)
     return best_path
 
+from scipy import ndimage as ndi
+
+def farthest_point_from_boundary(mask: np.ndarray) -> Optional[Tuple[float, float]]:
+    # mask: 二值数组，区域为 True/1，背景为 False/0
+    mask = (mask > 0)
+    dist = ndi.distance_transform_edt(mask)  # 区域内每点到背景的欧氏距离
+    y, x = np.unravel_index(np.argmax(dist), dist.shape)
+    # r = float(dist[y, x])  # 到边界的最大最小距离
+    # return (y, x), r
+    return (float(x), float(y))
+
 def compute_centroid(mask_u8: np.ndarray) -> Optional[Tuple[float, float]]:
     """
     Compute a robust interior point (x,y) for the foreground mask as the
@@ -254,7 +265,8 @@ def largest_diff_component_representative(A, B, connectivity=2, min_area=0, dbg_
     # 选面积最大的分量；若需以“最深”优先，可在 key 中加入 max EDT 作为次序
     sign, area, comp = max(regions, key=lambda t: t[1])
 
-    centroid = compute_centroid(comp)
+    centroid = farthest_point_from_boundary(comp)
+    # centroid = compute_centroid(comp)
     if centroid is None:
         return None
 
