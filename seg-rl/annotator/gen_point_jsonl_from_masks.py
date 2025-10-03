@@ -17,6 +17,11 @@ Example usage:
     --masks_dir  /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/canonical/masks \
     --output_jsonl /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour.jsonl
 
+  /opt/anaconda3/envs/seg-r1/bin/python seg-rl/annotator/gen_point_jsonl_from_masks.py \
+    --images_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/images \
+    --masks_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/masks \
+    --output_jsonl datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour-251002.jsonl
+
   # 2) 追加模式（为每条记录计算后续的第2个及以后提示点）
   python seg-rl/annotator/gen_point_jsonl_from_masks.py \
     --appendto_jsonl /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour.jsonl
@@ -39,7 +44,8 @@ import os
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
-from PIL import Image, ImageDraw
+# from PIL import Image, ImageDraw
+from PIL import Image as _PIL
 from scipy.ndimage import label, distance_transform_edt
 import cv2  # type: ignore
 
@@ -69,6 +75,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def list_files_with_exts(directory: str, allowed_exts: Tuple[str, ...]) -> List[str]:
+    directory = to_abs(directory) or directory
     if not os.path.isdir(directory):
         raise FileNotFoundError(f"Directory not found: {directory}")
     out: List[str] = []
@@ -85,6 +92,12 @@ def stem(path: str) -> str:
     # Remove common two-part extensions like .nii.gz by iterative splitext
     base, ext = os.path.splitext(name)
     return base
+
+
+def to_abs(path: Optional[str]) -> Optional[str]:
+    if path is None:
+        return None
+    return os.path.abspath(path) if not os.path.isabs(path) else path
 
 
 def _find_latest_mask_path(sam_masks_dir: str, image_stem: str, current_points_len: int) -> Optional[str]:
@@ -323,7 +336,7 @@ def largest_diff_component_representative(A, B, connectivity=2, min_area=0, dbg_
             # concat panels
             canvas = np.concatenate([panel1, panel2, panel3], axis=1)
             os.makedirs(os.path.dirname(dbg_out_path) or ".", exist_ok=True)
-            from PIL import Image as _PIL
+            # from PIL import Image as _PIL
             _PIL.fromarray(canvas[..., ::-1]).save(dbg_out_path)  # BGR->RGB flip
         except Exception as _:
             pass
@@ -335,26 +348,27 @@ def find_corresponding_image(
     sample_stem: str,
     allowed_exts: Tuple[str, ...],
 ) -> Optional[str]:
+    images_dir_abs = to_abs(images_dir)
     for ext in allowed_exts:
-        candidate = os.path.join(images_dir, sample_stem + ext)
+        candidate = os.path.join(images_dir_abs, sample_stem + ext)
         if os.path.isfile(candidate):
             return candidate
     # Fallback: scan directory and match by stem (handles mixed-case extensions or uncommon extensions)
-    for name in os.listdir(images_dir):
+    for name in os.listdir(images_dir_abs):
         if stem(name).lower() == sample_stem.lower():
-            return os.path.join(images_dir, name)
+            return os.path.join(images_dir_abs, name)
     return None
 
 def calculate_next_point(gt_mask_path, sam_masks_dir, current_points_len, dbg_out_dir: Optional[str] = None):
     # 读取gt与pred
     try:
-        gt_u8 = np.array(Image.open(gt_mask_path), dtype=np.uint8)
+        gt_u8 = np.array(_PIL.open(to_abs(gt_mask_path)), dtype=np.uint8)
         if current_points_len > 0:
             last_mask_path = _find_latest_mask_path(sam_masks_dir, stem(gt_mask_path), current_points_len)
             if not last_mask_path or not os.path.isfile(last_mask_path):
                 print(f"[WARN] Skip: last mask not found under {sam_masks_dir}")
                 return None, None, None
-            pred_u8 = np.array(Image.open(last_mask_path), dtype=np.uint8)
+            pred_u8 = np.array(_PIL.open(to_abs(last_mask_path)), dtype=np.uint8)
         else:
             pred_u8 = np.zeros_like(gt_u8)
     except Exception as e:
@@ -366,7 +380,7 @@ def calculate_next_point(gt_mask_path, sam_masks_dir, current_points_len, dbg_ou
     h_p, w_p = pred_u8.shape[:2]
     if (h_g, w_g) != (h_p, w_p):
         try:
-            from PIL import Image as _PIL
+            # from PIL import Image as _PIL
             pred_u8 = np.array(_PIL.fromarray(pred_u8).resize((w_g, h_g), resample=Image.NEAREST), dtype=np.uint8)
         except Exception:
             pass
@@ -390,6 +404,7 @@ def calculate_next_point(gt_mask_path, sam_masks_dir, current_points_len, dbg_ou
     return x_next, y_next, label_next
 
 def main() -> None:
+    global _PIL
     args = parse_args()
 
     # Debug-only mode: read JSON, generate debug images but do not write JSON
@@ -489,10 +504,10 @@ def main() -> None:
 
             # 对齐首写模式：若原图与掩模尺寸不同，则将点坐标从掩模坐标系映射到原图坐标系
             try:
-                from PIL import Image  # type: ignore
-                with Image.open(image_path) as im:
+                # from PIL import Image  # type: ignore
+                with _PIL.open(to_abs(image_path)) as im:
                     w_im, h_im = im.size
-                with Image.open(gt_mask_path) as m_im:
+                with _PIL.open(to_abs(gt_mask_path)) as m_im:
                     w_m, h_m = m_im.size
                 if (w_im, h_im) != (w_m, h_m):
                     scale_x = w_im / float(max(w_m, 1))
@@ -550,7 +565,7 @@ def main() -> None:
             
             # Load mask
             try:
-                mask_img = Image.open(mask_path)
+                mask_img = _PIL.open(to_abs(mask_path))
                 mask_u8 = np.array(mask_img, dtype=np.uint8)
             except Exception as e:
                 print(f"[WARN] Skipping unreadable mask: {mask_path} ({e})")
@@ -581,7 +596,7 @@ def main() -> None:
             
             # Optional: verify size match and warn if not
             try:
-                with Image.open(img_path) as im:
+                with _PIL.open(to_abs(img_path)) as im:
                     w_im, h_im = im.size
                 h_m, w_m = mask_u8.shape[:2]
                 if (w_im, h_im) != (w_m, h_m):
@@ -603,7 +618,7 @@ def main() -> None:
             if False and args.viz_dir:
                 try:
                     # Load image RGB
-                    with Image.open(img_path) as im_rgb:
+                    with _PIL.open(to_abs(img_path)) as im_rgb:
                         im_rgb = im_rgb.convert("RGB")
                         w_im, h_im = im_rgb.size
                         

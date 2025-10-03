@@ -53,6 +53,15 @@
       --device cuda \
       --resize 512 512 \
       --skip_existing
+    
+    /opt/anaconda3/envs/seg-r1/bin/python seg-rl/sam2_segment_from_points.py \
+      --input_jsonl datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour-251002.jsonl \
+      --json_output datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour-251002.jsonl \
+      --output_dir datasets/seg_r1_md/Task01_BrainTumour/pretrain_gt_masks-251002 \
+      --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
+      --device cuda \
+      --resize 512 512 \
+      --skip_existing
 
 详细参数及输出格式说明请参考：docs/cursor_pretrain_flow_all_2025092801.md）：
     
@@ -87,6 +96,12 @@ def _print_progress(num_processed: int, num_skipped: int, num_errors: int, note:
     """在同一行输出进度信息"""
     msg = f"[Progress] processed={num_processed} skipped={num_skipped} errors={num_errors} | {note}"
     print(f"\r{msg}", end="", flush=True)
+
+
+def to_abs(path: Optional[str]) -> Optional[str]:
+    if path is None:
+        return None
+    return os.path.abspath(path) if not os.path.isabs(path) else path
 
 
 class SAMWrapper:
@@ -357,31 +372,32 @@ def main():
     args = parse_args()
     
     # 检查输入文件
-    if not os.path.isfile(args.input_jsonl):
+    if not os.path.isfile(to_abs(args.input_jsonl)):
         print(f"Error: Input JSONL file not found: {args.input_jsonl}")
         return 1
     
     # 检查SAM2检查点
-    if not os.path.isfile(args.sam_checkpoint):
+    if not os.path.isfile(to_abs(args.sam_checkpoint)):
         print(f"Error: SAM2 checkpoint not found: {args.sam_checkpoint}")
         return 1
     
     # 创建输出目录
+    args.output_dir = to_abs(args.output_dir) or args.output_dir
     os.makedirs(args.output_dir, exist_ok=True)
     
     # 初始化SAM2
-    print(f"Initializing SAM2 with checkpoint: {args.sam_checkpoint}")
+    print(f"Initializing SAM2 with checkpoint: {to_abs(args.sam_checkpoint)}")
     print(f"Using device: {args.device or 'auto-detect'}")
     
     try:
-        sam_wrapper = SAMWrapper(args.sam_checkpoint, args.device)
+        sam_wrapper = SAMWrapper(to_abs(args.sam_checkpoint), args.device)
         print("SAM2 initialized successfully")
     except Exception as e:
         print(f"Error initializing SAM2: {e}")
         return 1
     
     # 读取输入（优先按JSON数组解析；失败则按JSONL逐行解析）
-    print(f"Processing input: {args.input_jsonl}")
+    print(f"Processing input: {to_abs(args.input_jsonl)}")
     
     num_processed = 0
     num_skipped = 0
@@ -390,7 +406,7 @@ def main():
     # 解析输入记录列表 records: List[Dict]
     records: List[Dict[str, Any]] = []
     try:
-        with open(args.input_jsonl, 'r', encoding='utf-8') as f:
+        with open(to_abs(args.input_jsonl), 'r', encoding='utf-8') as f:
             content = f.read().strip()
             if content.startswith('['):
                 parsed = json.loads(content)
@@ -424,7 +440,7 @@ def main():
             num_errors += 1
             continue
 
-        image_path = obj["image"]
+        image_path = to_abs(obj["image"]) or obj["image"]
 
         # 检查图像文件是否存在
         if not os.path.isfile(image_path):
@@ -446,7 +462,7 @@ def main():
 
         try:
             # 加载图像
-            image = PILImage.open(image_path).convert("RGB")
+            image = PILImage.open(to_abs(image_path)).convert("RGB")
             orig_w, orig_h = image.size
 
             # 若指定resize，则按比例缩放点坐标并对图像进行resize
