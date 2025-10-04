@@ -106,8 +106,10 @@ class JsonlPointDataset(Dataset):
         image_size: ImageSize,
         hflip_p: float = 0.5,
         vflip_p: float = 0.0,
-        mean: Tuple[float, float, float] = (0.485, 0.456, 0.406),
-        std: Tuple[float, float, float] = (0.229, 0.224, 0.225),
+        mean_rgb: Tuple[float, float, float] = (0.485, 0.456, 0.406),
+        std_rgb: Tuple[float, float, float] = (0.229, 0.224, 0.225),
+        mean_gray: float = 0.5,
+        std_gray: float = 0.5,
         training: bool = True,
     ) -> None:
         super().__init__()
@@ -132,8 +134,10 @@ class JsonlPointDataset(Dataset):
         self.image_size = image_size
         self.hflip_p = hflip_p
         self.vflip_p = vflip_p
-        self.mean = mean
-        self.std = std
+        self.mean_rgb = mean_rgb
+        self.std_rgb = std_rgb
+        self.mean_gray = float(mean_gray)
+        self.std_gray = float(std_gray)
         self.training = training
         
     def _validate_and_process_entry(self, obj: Dict, line_num: int) -> bool:
@@ -191,33 +195,62 @@ class JsonlPointDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         e = self.entries[idx]
         img_path = e["image"]
+        # Prefer explicit conditional image path if provided; otherwise fallback to gt_mask as grayscale condition
+        cond_path = e.get("cond") if isinstance(e, dict) else None
+        if cond_path is None:
+            cond_path = e.get("gt_mask") if isinstance(e, dict) else None
         # Use normalized internal coordinates
         x = float(e["_x"])  # pixel coordinates in original image
         y = float(e["_y"])
 
         image = Image.open(img_path).convert("RGB")
         image = _ensure_rgb(image)
+        cond_img: Image.Image
+        if cond_path is None:
+            # If second image missing, fall back to grayscale of the RGB image to keep channel count stable
+            cond_img = image.convert("L")
+        else:
+            cond_img = Image.open(cond_path).convert("L")
 
         # Resize and coordinate scaling
         image, (x, y) = _resize_with_coords(image, (x, y), self.image_size)
+        cond_img, _ = _resize_with_coords(cond_img, (x, y), self.image_size)
 
-        # Augmentations (flip)
+        # Augmentations (flip) - apply identical transforms to both images and update coords once
         if self.training:
-            image, (x, y) = _random_hflip(image, (x, y), p=self.hflip_p)
-            image, (x, y) = _random_vflip(image, (x, y), p=self.vflip_p)
+            # decide flips once
+            do_h = (np.random.rand() < self.hflip_p)
+            do_v = (np.random.rand() < self.vflip_p)
+            if do_h:
+                w, _ = image.size
+                image = image.transpose(Image.FLIP_LEFT_RIGHT)
+                cond_img = cond_img.transpose(Image.FLIP_LEFT_RIGHT)
+                x = (w - 1) - x
+            if do_v:
+                _, h = image.size
+                image = image.transpose(Image.FLIP_TOP_BOTTOM)
+                cond_img = cond_img.transpose(Image.FLIP_TOP_BOTTOM)
+                y = (h - 1) - y
 
         # To tensor and normalize
         image_t = TF.to_tensor(image)  # [3,H,W], 0..1
-        image_t = TF.normalize(image_t, mean=self.mean, std=self.std)
+        image_t = TF.normalize(image_t, mean=self.mean_rgb, std=self.std_rgb)
+        cond_t = TF.to_tensor(cond_img)  # [1,H,W]
+        cond_t = (cond_t - self.mean_gray) / max(self.std_gray, 1e-6)
+        # Stack to 4 channels: RGB + Gray
+        image_pair = torch.cat([image_t, cond_t], dim=0)  # [4,H,W]
 
         # Pack target as tensor [2]
         target_xy = torch.tensor([x, y], dtype=torch.float32)
 
         sample = {
-            "image": image_t,
+            "image": image_pair,
+            "image_rgb": image_t,
+            "image_gray": cond_t,
             "target_xy": target_xy,
             "meta": {
                 "path": img_path,
+                "cond_path": cond_path,
                 "height": self.image_size.height,
                 "width": self.image_size.width,
             },

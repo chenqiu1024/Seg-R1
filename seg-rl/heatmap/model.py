@@ -22,6 +22,7 @@ class ModelConfig:
     backbone: Literal["resnet18", "unet_s"] = "unet_s"
     pretrained: bool = False
     upsample_to_input: bool = True
+    in_channels: int = 3  # 支持RGB(3)+Gray(1)成对输入，默认4通道
 
 
 class HeatmapHead(nn.Module):
@@ -115,6 +116,21 @@ class PointHeatmapModel(nn.Module):
         if cfg.backbone == "resnet18":
             weights = ResNet18_Weights.DEFAULT if cfg.pretrained else None
             base = resnet18(weights=weights)
+            # 调整conv1以适配任意输入通道
+            if cfg.in_channels != 3:
+                old_conv1 = base.conv1
+                new_conv1 = nn.Conv2d(cfg.in_channels, old_conv1.out_channels, kernel_size=old_conv1.kernel_size,
+                                       stride=old_conv1.stride, padding=old_conv1.padding, bias=False)
+                with torch.no_grad():
+                    if old_conv1.weight.shape[1] == 3:
+                        # 将预训练权重映射到新通道：前3通道拷贝，其余通道取均值
+                        new_conv1.weight[:, :3] = old_conv1.weight
+                        if cfg.in_channels > 3:
+                            mean_w = old_conv1.weight.mean(dim=1, keepdim=True)
+                            new_conv1.weight[:, 3:cfg.in_channels] = mean_w.repeat(1, cfg.in_channels - 3, 1, 1)
+                    else:
+                        nn.init.kaiming_normal_(new_conv1.weight, mode="fan_out", nonlinearity="relu")
+                base.conv1 = new_conv1
             self.stem = nn.Sequential(base.conv1, base.bn1, base.relu, base.maxpool)
             self.layer1 = base.layer1
             self.layer2 = base.layer2  # stride 8 total
@@ -124,7 +140,7 @@ class PointHeatmapModel(nn.Module):
             self.head = HeatmapHead(in_channels)
             self._is_unet = False
         elif cfg.backbone == "unet_s":
-            self.unet = UNetSmall(in_channels=3, base_ch=64)
+            self.unet = UNetSmall(in_channels=cfg.in_channels, base_ch=64)
             self._is_unet = True
         else:
             raise ValueError(f"Unsupported backbone: {cfg.backbone}")
@@ -165,4 +181,108 @@ def soft_argmax_from_logits(logits: torch.Tensor, temperature: float = 1.0) -> t
     y_exp = (p * ys).sum(dim=(2, 3))
     return torch.cat([x_exp, y_exp], dim=1)
 
+
+# ==========================
+# 层级策略采样与log_prob计算
+# 将像素分布分解为：cell分布 + cell内子像素分布
+# ==========================
+
+def _crop_to_stride(logits: torch.Tensor, stride: int) -> tuple[torch.Tensor, int, int]:
+    B, C, H, W = logits.shape
+    Hc = H // stride
+    Wc = W // stride
+    Ht = Hc * stride
+    Wt = Wc * stride
+    return logits[:, :, :Ht, :Wt], Hc, Wc
+
+
+def _cell_logsumexp(logits: torch.Tensor, stride: int) -> tuple[torch.Tensor, torch.Tensor, int, int]:
+    logits, Hc, Wc = _crop_to_stride(logits, stride)
+    B, _, Ht, Wt = logits.shape
+    s = stride
+    patches = F.unfold(logits, kernel_size=(s, s), stride=(s, s))  # [B, s*s, Hc*Wc]
+    lse = torch.logsumexp(patches, dim=1)  # [B, Hc*Wc]
+    lse_map = lse.view(B, 1, Hc, Wc)
+    return lse_map, patches, Hc, Wc
+
+
+@torch.no_grad()
+def sample_cell_and_offset(
+    logits: torch.Tensor,
+    stride: int,
+    temperature: float = 1.0,
+) -> dict:
+    device = logits.device
+    T = max(temperature, 1e-6)
+    lse_map, patches, Hc, Wc = _cell_logsumexp(logits / T, stride)
+    B = logits.size(0)
+    s = stride
+
+    # p(cell)
+    cell_logits_flat = lse_map.view(B, -1)
+    cell_dist = torch.distributions.Categorical(logits=cell_logits_flat)
+    cell_idx = cell_dist.sample()                       # [B]
+    cell_logp = cell_dist.log_prob(cell_idx)            # [B]
+
+    # p(subpixel | cell)
+    within_logits = patches.gather(2, cell_idx.view(B, 1, 1).expand(B, s*s, 1)).squeeze(-1)
+    sub_dist = torch.distributions.Categorical(logits=within_logits)
+    sub_idx = sub_dist.sample()
+    sub_logp = sub_dist.log_prob(sub_idx)
+
+    # index -> (i,j)
+    ci = (cell_idx // Wc)              # [B]
+    cj = (cell_idx % Wc)               # [B]
+    ui = (sub_idx // s)
+    uj = (sub_idx % s)
+
+    # pixel coordinates within cropped region
+    yi = ci * s + ui
+    xj = cj * s + uj
+
+    # offset in [-0.5, 0.5]
+    off_x = (uj.to(torch.float32) + 0.5) / s - 0.5
+    off_y = (ui.to(torch.float32) + 0.5) / s - 0.5
+
+    total_logp = cell_logp + sub_logp
+
+    return {
+        "cell_idx": cell_idx,
+        "cell_ij": torch.stack([cj, ci], dim=1),
+        "sub_idx": sub_idx,
+        "sub_ij": torch.stack([uj, ui], dim=1),
+        "pixel_xy": torch.stack([xj, yi], dim=1),
+        "offset": torch.stack([off_x, off_y], dim=1).to(device),
+        "log_prob": total_logp,
+        "grid_hw": torch.tensor([Hc, Wc], device=device),
+        "stride": torch.tensor(s, device=device),
+    }
+
+
+def action_to_continuous_xy(sample_out: dict) -> torch.Tensor:
+    s = int(sample_out["stride"].item())
+    x = sample_out["pixel_xy"][:, 0].to(torch.float32) + 0.5
+    y = sample_out["pixel_xy"][:, 1].to(torch.float32) + 0.5
+    return torch.stack([x, y], dim=1)
+
+
+def log_prob_of_action(
+    logits: torch.Tensor,
+    stride: int,
+    cell_idx: torch.Tensor,
+    sub_idx: torch.Tensor,
+    temperature: float = 1.0,
+) -> torch.Tensor:
+    T = max(temperature, 1e-6)
+    lse_map, patches, Hc, Wc = _cell_logsumexp(logits / T, stride)
+    B = logits.size(0)
+    s = stride
+
+    cell_logits_flat = lse_map.view(B, -1)
+    cell_logp = torch.log_softmax(cell_logits_flat, dim=1).gather(1, cell_idx.view(B, 1)).squeeze(1)
+
+    within_logits = patches.gather(2, cell_idx.view(B, 1, 1).expand(B, s*s, 1)).squeeze(-1)
+    sub_logp = torch.log_softmax(within_logits, dim=1).gather(1, sub_idx.view(B, 1)).squeeze(1)
+
+    return cell_logp + sub_logp
 

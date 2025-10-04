@@ -268,10 +268,12 @@ def largest_diff_component_representative(A, B, connectivity=2, min_area=0, dbg_
     # 选面积最大的分量；若需以“最深”优先，可在 key 中加入 max EDT 作为次序
     sign, area, comp = max(regions, key=lambda t: t[1])
 
-    centroid = farthest_point_from_boundary(comp)
-    # centroid = compute_centroid(comp)
-    if centroid is None:
-        return None
+    # centroid = farthest_point_from_boundary(comp)
+    # # centroid = compute_centroid(comp)
+    # if centroid is None:
+    #     return None
+    D = distance_transform_edt(comp)
+    (centroidY, centroidX) = np.unravel_index(np.argmax(D), D.shape)
 
     # 调试可视化
     if dbg_out_path:
@@ -309,7 +311,7 @@ def largest_diff_component_representative(A, B, connectivity=2, min_area=0, dbg_
                     panel3[lab == i] = colors[i - 1]
 
             # draw marker at centroid: foreground -> caret '^', background -> 'X'
-            cx, cy = int(round(centroid[0])), int(round(centroid[1]))
+            cx, cy = int(round(centroidX)), int(round(centroidY))
             # outline black then white (match viz script style)
             def _draw_cross(img, x, y, size=6, color=(255,255,255), thickness=2):
                 cv2.line(img, (x - size, y - size), (x + size, y + size), (0,0,0), thickness + 2, lineType=cv2.LINE_AA)
@@ -356,7 +358,7 @@ def largest_diff_component_representative(A, B, connectivity=2, min_area=0, dbg_
         except Exception as _:
             pass
 
-    return dict(sign=sign, area=area, y=int(centroid[1]), x=int(centroid[0]))
+    return dict(sign=sign, area=area, y=int(centroidY), x=int(centroidX), max_radius=float(D[centroidY, centroidX]))
 
 def find_corresponding_image(
     images_dir: str,
@@ -396,7 +398,7 @@ def calculate_next_point(gt_mask_path, sam_masks_dir, current_points_len, dbg_ou
     if (h_g, w_g) != (h_p, w_p):
         try:
             # from PIL import Image as _PIL
-            pred_u8 = np.array(_PIL.fromarray(pred_u8).resize((w_g, h_g), resample=Image.NEAREST), dtype=np.uint8)
+            pred_u8 = np.array(_PIL.fromarray(pred_u8).resize((w_g, h_g), resample=_PIL.NEAREST), dtype=np.uint8)
         except Exception:
             pass
 
@@ -517,21 +519,6 @@ def main() -> None:
             if x_next is None or y_next is None or label_next is None:
                 continue
 
-            # 对齐首写模式：若原图与掩模尺寸不同，则将点坐标从掩模坐标系映射到原图坐标系
-            try:
-                # from PIL import Image  # type: ignore
-                with _PIL.open(to_abs(image_path)) as im:
-                    w_im, h_im = im.size
-                with _PIL.open(to_abs(gt_mask_path)) as m_im:
-                    w_m, h_m = m_im.size
-                if (w_im, h_im) != (w_m, h_m):
-                    scale_x = w_im / float(max(w_m, 1))
-                    scale_y = h_im / float(max(h_m, 1))
-                    x_next = float(x_next) * scale_x
-                    y_next = float(y_next) * scale_y
-            except Exception:
-                pass
-    
             # 追加points与labels
             if not isinstance(points_list, list):
                 points_list = []
@@ -608,21 +595,7 @@ def main() -> None:
                 num_missing_images += 1
                 print(f"[WARN] Missing image for mask stem '{sample_stem}' in {images_dir}")
                 continue
-            
-            # Optional: verify size match and warn if not
-            try:
-                with _PIL.open(to_abs(img_path)) as im:
-                    w_im, h_im = im.size
-                h_m, w_m = mask_u8.shape[:2]
-                if (w_im, h_im) != (w_m, h_m):
-                    num_size_mismatch += 1
-                    # Map centroid from mask to image coordinate if sizes differ
-                    scale_x = w_im / float(max(w_m, 1))
-                    scale_y = h_im / float(max(h_m, 1))
-                    centroid = (centroid[0] * scale_x, centroid[1] * scale_y)
-            except Exception:
-                pass
-            
+           
             image_field = os.path.abspath(img_path) if args.abs_paths else img_path
             mask_field = os.path.abspath(mask_path) if args.abs_paths else mask_path
             record = {"image": image_field, "gt_mask": mask_field, "points": [[float(centroid[0]), float(centroid[1])]], "labels": [1]}

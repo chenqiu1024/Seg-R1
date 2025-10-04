@@ -70,7 +70,7 @@ python -m seg-rl.heatmap.train \
   --epochs 30 --amp
 """
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Train heatmap classification point locator")
+    p = argparse.ArgumentParser(description="Train heatmap classification point locator (paired inputs: RGB + Gray)")
     p.add_argument("--data_jsonl", type=str, required=True, help="JSONL file with training samples (supports new points+labels format and legacy x+y format); splits done in-script")
     p.add_argument("--height", type=int, default=512)
     p.add_argument("--width", type=int, default=512)
@@ -138,7 +138,7 @@ def main() -> None:
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True, collate_fn=collate_fn) if val_ds is not None else None
     test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True, collate_fn=collate_fn) if test_ds is not None else None
 
-    cfg = ModelConfig(backbone=args.arch, pretrained=args.pretrained)
+    cfg = ModelConfig(backbone=args.arch, pretrained=args.pretrained, in_channels=3)
     model = PointHeatmapModel(cfg).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -215,7 +215,7 @@ def main() -> None:
         max_count = args.vis_count if args.vis_mode == "sample" else float("inf")
         with torch.no_grad():
             for batch in loader:
-                img_t = batch["image"]  # [B,3,H,W]
+                img_t = batch["image_rgb"]  # [B,3,H,W] use RGB for visualization
                 tgt = batch["target_xy"]  # [B,2]
                 logits = model(img_t.to(device))
                 # ensure logits match image resolution for precise overlay
