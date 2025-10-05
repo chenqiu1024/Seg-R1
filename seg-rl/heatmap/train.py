@@ -52,6 +52,16 @@ python -m seg-rl.heatmap.train \
   --out_dir /root/autodl-tmp/works/Seg-R0/outputs/seg_r1_md/Task01_BrainTumour/heatmap_train-0 \
   --vis_mode sample --vis_count 16
 
+/opt/anaconda3/envs/seg-r1/bin/python -m seg-rl.heatmap.train \
+  --jsonl datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour-251001.jsonl \
+  --sam_dir datasets/seg_r1_md/Task01_BrainTumour/pretrain_gt_masks-251001 \
+  --height 512 --width 512 --arch unet_s \
+  --loss kl --sigma 6.0 --tau 1.0 \
+  --batch_size 16 --epochs 40 --amp \
+  --val_ratio 0.1 --test_ratio 0.1 --seed 42 \
+  --save_every 1 --save_steps 500 --progress --auto_resume \
+  --out_dir output/seg_r1_md/Task01_BrainTumour/heatmap_train-251001
+
 高分辨率场景（增大sigma获得更软的分布）:
 python -m seg-rl.heatmap.train \
   --data_jsonl /root/autodl-tmp/works/Seg-R0/datasets/seg_r1_md/Task01_BrainTumour/mask_salient_points-0.jsonl \
@@ -97,13 +107,24 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--vis_mode", type=str, choices=["none", "sample", "all"], default="none", help="Visualization mode")
     p.add_argument("--vis_count", type=int, default=16, help="When vis_mode=sample, number of samples to visualize")
     p.add_argument("--vis_dir", type=str, default=None, help="Directory to save visualization images; default under out_dir/vis")
+    p.add_argument("--save_steps", type=int, default=0, help="Save checkpoint every N steps (0 to disable)")
+    p.add_argument("--progress", action="store_true", help="Show tqdm progress bar during training")
+    p.add_argument("--auto_resume", action="store_true", help="If set and --resume not provided, try <out_dir>/last.pt")
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Prefer CUDA, then Apple Metal (MPS), else CPU
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+    # AMP only on CUDA for stability
     amp_enabled = args.amp and (device.type == "cuda")
+    autocast_device_type = "cuda" if device.type == "cuda" else "cpu"
 
     os.makedirs(args.out_dir, exist_ok=True)
     plots_dir = args.plots_dir or os.path.join(args.out_dir, "plots")
@@ -147,11 +168,22 @@ def main() -> None:
 
     start_epoch = 0
     global_step = 0
+    tried_auto = False
     if args.resume and os.path.isfile(args.resume):
         from .utils import load_checkpoint
         ckpt = load_checkpoint(args.resume, model, optimizer, scaler)
         start_epoch = ckpt.epoch
         global_step = ckpt.step
+        print(f"[Resume] Loaded checkpoint from {args.resume} (epoch={start_epoch}, step={global_step})")
+    elif args.auto_resume:
+        auto_path = os.path.join(args.out_dir, "last.pt")
+        if os.path.isfile(auto_path):
+            tried_auto = True
+            from .utils import load_checkpoint
+            ckpt = load_checkpoint(auto_path, model, optimizer, scaler)
+            start_epoch = ckpt.epoch
+            global_step = ckpt.step
+            print(f"[Auto-Resume] Loaded checkpoint from {auto_path} (epoch={start_epoch}, step={global_step})")
 
     history = {"train_loss": [], "val_pck": [], "test_pck": []}
 
@@ -269,12 +301,21 @@ def main() -> None:
     for epoch in range(start_epoch, args.epochs):
         model.train()
         running_loss = 0.0
-        for batch in train_loader:
+        # Progress bar setup
+        _iter = train_loader
+        _tqdm = None
+        if args.progress:
+            try:
+                from tqdm import tqdm  # type: ignore
+                _tqdm = tqdm(total=len(train_loader), desc=f"Epoch {epoch+1}/{args.epochs}")
+            except Exception:
+                _tqdm = None
+        for bi, batch in enumerate(train_loader, 1):
             img = batch["image"].to(device, non_blocking=True)
             tgt = batch["target_xy"].to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
-            with torch.amp.autocast(device_type=device.type, enabled=amp_enabled):
+            with torch.amp.autocast(device_type=autocast_device_type, enabled=amp_enabled):
                 logits, label_logits = model(img)
                 if args.loss == "ce":
                     loss_hm = ce_over_pixels(logits, tgt)
@@ -290,6 +331,24 @@ def main() -> None:
 
             running_loss += loss.item()
             global_step += 1
+
+            # Periodic checkpoint
+            if args.save_steps > 0 and (global_step % args.save_steps == 0):
+                save_path = os.path.join(args.out_dir, f"step_{global_step}.pt")
+                save_checkpoint(save_path, model, optimizer, scaler, epoch=epoch + 1, step=global_step)
+                # also update last.pt symlink-like copy
+                last_path = os.path.join(args.out_dir, "last.pt")
+                save_checkpoint(last_path, model, optimizer, scaler, epoch=epoch + 1, step=global_step)
+
+            # Progress output
+            if _tqdm is not None:
+                _tqdm.set_postfix({"loss": f"{loss.item():.4f}", "lr": f"{optimizer.param_groups[0]['lr']:.2e}"})
+                _tqdm.update(1)
+            elif (bi % max(1, len(train_loader)//10)) == 0:
+                print(f"Epoch {epoch+1}/{args.epochs} [{bi}/{len(train_loader)}] loss={loss.item():.4f} lr={optimizer.param_groups[0]['lr']:.2e}")
+
+        if _tqdm is not None:
+            _tqdm.close()
 
         avg_loss = running_loss / max(1, len(train_loader))
         history["train_loss"].append(avg_loss)
@@ -308,10 +367,12 @@ def main() -> None:
         if args.vis_mode != "none":
             visualize_dataset(val_loader or train_loader, split_name="val_or_train")
 
-        # Save
+        # Save epoch checkpoint and update last.pt
         if ((epoch + 1) % max(1, args.save_every)) == 0:
             save_path = os.path.join(args.out_dir, f"model_epoch_{epoch+1}.pt")
             save_checkpoint(save_path, model, optimizer, scaler, epoch=epoch+1, step=global_step)
+        last_path = os.path.join(args.out_dir, "last.pt")
+        save_checkpoint(last_path, model, optimizer, scaler, epoch=epoch+1, step=global_step)
 
 
 if __name__ == "__main__":

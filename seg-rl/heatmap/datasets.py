@@ -115,19 +115,38 @@ class JsonlPointDataset(Dataset):
     ) -> None:
         super().__init__()
         self.entries: List[Dict[str, object]] = []
-        with open(jsonl_path, "r", encoding="utf-8") as f:
-            for line_num, line in enumerate(f, 1):
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                    if not self._validate_and_process_entry(obj, line_num):
+        # Read entire file as JSON array if possible; fallback to JSONL per-line
+        recs: List[Dict] = []
+        try:
+            with open(jsonl_path, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+            data = json.loads(content)
+            if isinstance(data, list):
+                recs = [obj for obj in data if isinstance(obj, dict)]
+            else:
+                raise ValueError("Root is not a JSON array")
+        except Exception:
+            # Fallback: JSONL lines
+            with open(jsonl_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
                         continue
-                    self.entries.append(obj)
-                except (json.JSONDecodeError, ValueError, KeyError, IndexError) as e:
-                    print(f"[WARN] Skipping invalid JSON at line {line_num}: {e}")
+                    try:
+                        obj = json.loads(line)
+                        if isinstance(obj, dict):
+                            recs.append(obj)
+                    except Exception:
+                        continue
+        # Validate/process
+        for i, obj in enumerate(recs, 1):
+            try:
+                if not self._validate_and_process_entry(obj, i):
                     continue
+                self.entries.append(obj)
+            except (ValueError, KeyError, IndexError) as e:
+                print(f"[WARN] Skipping invalid JSON at idx {i}: {e}")
+                continue
         
         if len(self.entries) == 0:
             raise ValueError(f"No valid entries found in {jsonl_path}")
@@ -300,25 +319,37 @@ class SamSequencePointDataset(Dataset):
     ) -> None:
         super().__init__()
         self.entries: List[Dict[str, object]] = []
-        with open(jsonl_path, "r", encoding="utf-8") as f:
-            for line_num, line in enumerate(f, 1):
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                    if not isinstance(obj, dict):
+        # Prefer JSON array; fallback to JSONL
+        recs: List[Dict] = []
+        try:
+            with open(jsonl_path, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+            data = json.loads(content)
+            if isinstance(data, list):
+                recs = [obj for obj in data if isinstance(obj, dict)]
+            else:
+                raise ValueError("Root is not a JSON array")
+        except Exception:
+            with open(jsonl_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
                         continue
-                    # minimal validation
-                    if "image" not in obj or "points" not in obj or "labels" not in obj:
+                    try:
+                        obj = json.loads(line)
+                        if isinstance(obj, dict):
+                            recs.append(obj)
+                    except Exception:
                         continue
-                    points = obj.get("points", [])
-                    labels = obj.get("labels", [])
-                    if not isinstance(points, list) or not isinstance(labels, list) or len(points) != len(labels) or len(points) == 0:
-                        continue
-                    self.entries.append(obj)
-                except Exception:
-                    continue
+        for obj in recs:
+            # minimal validation
+            if "image" not in obj or "points" not in obj or "labels" not in obj:
+                continue
+            points = obj.get("points", [])
+            labels = obj.get("labels", [])
+            if not isinstance(points, list) or not isinstance(labels, list) or len(points) != len(labels) or len(points) == 0:
+                continue
+            self.entries.append(obj)
 
         if len(self.entries) == 0:
             raise ValueError(f"No valid entries found in {jsonl_path}")
