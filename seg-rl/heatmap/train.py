@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader, Subset
 from PIL import Image
 
 try:
-    from .datasets import JsonlPointDataset, ImageSize, collate_fn
+    from .datasets import JsonlPointDataset, SamSequencePointDataset, ImageSize, collate_fn
     from .model import ModelConfig, PointHeatmapModel, argmax_from_logits, soft_argmax_from_logits
     from .losses import ce_over_pixels, kl_to_gaussian_targets, mse_to_gaussian_targets
     from .utils import save_checkpoint
@@ -21,7 +21,7 @@ except ImportError:  # allow running as a script without package context
     _pkg_root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
     if _pkg_root not in _sys.path:
         _sys.path.insert(0, _pkg_root)
-    from heatmap.datasets import JsonlPointDataset, ImageSize, collate_fn
+    from heatmap.datasets import JsonlPointDataset, SamSequencePointDataset, ImageSize, collate_fn
     from heatmap.model import ModelConfig, PointHeatmapModel, argmax_from_logits, soft_argmax_from_logits
     from heatmap.losses import ce_over_pixels, kl_to_gaussian_targets, mse_to_gaussian_targets
     from heatmap.utils import save_checkpoint
@@ -70,8 +70,9 @@ python -m seg-rl.heatmap.train \
   --epochs 30 --amp
 """
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Train heatmap classification point locator (paired inputs: RGB + Gray)")
-    p.add_argument("--data_jsonl", type=str, required=True, help="JSONL file with training samples (supports new points+labels format and legacy x+y format); splits done in-script")
+    p = argparse.ArgumentParser(description="Train heatmap model with self-supervised sequence dataset (RGB + Gray)")
+    p.add_argument("--jsonl", type=str, required=True, help="Path to JSONL (points+labels per image)")
+    p.add_argument("--sam_dir", type=str, required=True, help="Directory of SAM masks per step: {sam_dir}/{stem}/{k}.png")
     p.add_argument("--height", type=int, default=512)
     p.add_argument("--width", type=int, default=512)
     p.add_argument("--batch_size", type=int, default=16)
@@ -112,7 +113,7 @@ def main() -> None:
 
     image_size = ImageSize(height=args.height, width=args.width)
     # Load once to get length for splitting
-    full_ds_for_len = JsonlPointDataset(args.data_jsonl, image_size=image_size, training=True)
+    full_ds_for_len = SamSequencePointDataset(args.jsonl, sam_dir=args.sam_dir, image_size=image_size, training=True)
     n = len(full_ds_for_len)
     assert 0.0 <= args.val_ratio < 1.0 and 0.0 <= args.test_ratio < 1.0 and args.val_ratio + args.test_ratio < 1.0, "Invalid split ratios"
     n_test = int(round(n * args.test_ratio))
@@ -126,9 +127,9 @@ def main() -> None:
     idx_test = perm[n_train + n_val:]
 
     # Build datasets per split to control augmentation flag
-    train_base = JsonlPointDataset(args.data_jsonl, image_size=image_size, training=True)
-    val_base = JsonlPointDataset(args.data_jsonl, image_size=image_size, training=False) if n_val > 0 else None
-    test_base = JsonlPointDataset(args.data_jsonl, image_size=image_size, training=False) if n_test > 0 else None
+    train_base = SamSequencePointDataset(args.jsonl, sam_dir=args.sam_dir, image_size=image_size, training=True)
+    val_base = SamSequencePointDataset(args.jsonl, sam_dir=args.sam_dir, image_size=image_size, training=False) if n_val > 0 else None
+    test_base = SamSequencePointDataset(args.jsonl, sam_dir=args.sam_dir, image_size=image_size, training=False) if n_test > 0 else None
 
     train_ds = Subset(train_base, idx_train)
     val_ds = Subset(val_base, idx_val) if val_base is not None else None
@@ -138,7 +139,7 @@ def main() -> None:
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True, collate_fn=collate_fn) if val_ds is not None else None
     test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True, collate_fn=collate_fn) if test_ds is not None else None
 
-    cfg = ModelConfig(backbone=args.arch, pretrained=args.pretrained, in_channels=3)
+    cfg = ModelConfig(backbone=args.arch, pretrained=args.pretrained, in_channels=4)
     model = PointHeatmapModel(cfg).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -164,7 +165,7 @@ def main() -> None:
             for batch in loader:
                 img = batch["image"].to(device, non_blocking=True)
                 tgt = batch["target_xy"].to(device, non_blocking=True)
-                logits = model(img)
+                logits, label_logits = model(img)
                 pred_xy = soft_argmax_from_logits(logits)
                 d = torch.linalg.norm(pred_xy - tgt, dim=1)
                 correct += (d <= args.eval_thresh).sum().item()
@@ -217,7 +218,9 @@ def main() -> None:
             for batch in loader:
                 img_t = batch["image_rgb"]  # [B,3,H,W] use RGB for visualization
                 tgt = batch["target_xy"]  # [B,2]
-                logits = model(img_t.to(device))
+                # Build 4ch input for the model: RGB + Gray
+                img4 = torch.cat([img_t.to(device), batch["image_gray"].to(device)], dim=1)
+                logits, label_logits = model(img4)
                 # ensure logits match image resolution for precise overlay
                 _, _, H_img, W_img = img_t.shape
                 if logits.shape[-2] != H_img or logits.shape[-1] != W_img:
@@ -272,13 +275,15 @@ def main() -> None:
 
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type=device.type, enabled=amp_enabled):
-                logits = model(img)
+                logits, label_logits = model(img)
                 if args.loss == "ce":
-                    loss = ce_over_pixels(logits, tgt)
+                    loss_hm = ce_over_pixels(logits, tgt)
                 elif args.loss == "kl":
-                    loss = kl_to_gaussian_targets(logits, tgt, sigma=args.sigma, tau=args.tau)
+                    loss_hm = kl_to_gaussian_targets(logits, tgt, sigma=args.sigma, tau=args.tau)
                 else:
-                    loss = mse_to_gaussian_targets(logits, tgt, sigma=args.sigma)
+                    loss_hm = mse_to_gaussian_targets(logits, tgt, sigma=args.sigma)
+                loss_label = nn.CrossEntropyLoss()(label_logits, batch["target_label"].to(device))
+                loss = loss_hm + 0.2 * loss_label
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()

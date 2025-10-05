@@ -1,5 +1,5 @@
 # 有监督学习任务的网络模型设计
-_Exported on 10/4/2025 at 06:13:20 PDT from Cursor (1.7.33)_
+_Exported on 10/5/2025 at 00:41:57 PDT from Cursor (1.7.33)_
 
 ---
 
@@ -1696,4 +1696,2343 @@ def collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
   - 若 `do_v`，两图像均执行垂直翻转，并将 `y ← (h-1)-y`。
 
 如需旋转、缩放或仿射等其他同步增强，我也可以按相同方式扩展。
+
+---
+
+**User**
+
+对了，我还忘了一件事：我所要预测的目标点不仅仅包含二维坐标信息，还需要包含一个label信息，只有两种取值1或0，二者互斥（不用管这个label具体意义是什么，只要知道我们所用于训练的数据集中对每个样本的目标真值都会包含坐标+label信息，所以一定有某种办法可以用机器学习方法去训练）。那么要怎么修改我们的模型架构和训练方法？
+
+---
+
+**Cursor**
+
+I'll update the dataset to include target labels and fix selection logic, modify the model to output both heatmap logits and label logits (with UNet returning features for the label head), and update the training script to compute a joint loss (heatmap + label CE). I'll also revert the model input channels to 4 and fix visualization to feed 4-channel tensors to the model. Then I'll run lint checks.
+
+```python
+from __future__ import annotations
+
+"""
+JSONL点定位数据集支持多种格式
+
+新格式 (来自 gen_point_jsonl_from_masks.py):
+    {"image": "/path/to/img.jpg", "points": [[x1,y1], [x2,y2], ...], "labels": [1, 0, ...]}
+    - points: 坐标点列表，每个点为[x,y]格式
+    - labels: 对应的标签，1表示正类（前景），0表示负类（背景）
+    - 只使用label=1的点进行训练，如有多个正类点则选择第一个
+    
+旧格式 (向后兼容):
+    {"image": "/path/to/img.jpg", "x": 123.4, "y": 456.7}
+    - 直接包含单个点的x,y坐标
+
+生成工具:
+    python seg-rl/annotator/gen_point_jsonl_from_masks.py \\
+      --images_dir /path/to/images \\
+      --masks_dir /path/to/masks \\
+      --output_jsonl /path/to/output.jsonl
+"""
+
+import json
+import math
+import os
+from dataclasses import dataclass
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
+
+import numpy as np
+from PIL import Image
+
+import torch
+from torch.utils.data import Dataset
+import torchvision.transforms.functional as TF
+
+
+@dataclass
+class ImageSize:
+    height: int
+    width: int
+
+
+def _ensure_rgb(image: Image.Image) -> Image.Image:
+    if image.mode == "RGB":
+        return image
+    if image.mode in {"L", "I;16", "I", "F"}:
+        return image.convert("RGB")
+    return image.convert("RGB")
+
+
+def _resize_with_coords(image: Image.Image, xy: Tuple[float, float], out_size: ImageSize) -> Tuple[Image.Image, Tuple[float, float]]:
+    orig_w, orig_h = image.size
+    x, y = xy
+    # Simple direct resize, scale coords accordingly
+    scale_x = out_size.width / float(orig_w)
+    scale_y = out_size.height / float(orig_h)
+    x_resized = x * scale_x
+    y_resized = y * scale_y
+    image_resized = image.resize((out_size.width, out_size.height), resample=Image.BILINEAR)
+    return image_resized, (x_resized, y_resized)
+
+
+def _random_hflip(image: Image.Image, xy: Tuple[float, float], p: float = 0.5) -> Tuple[Image.Image, Tuple[float, float]]:
+    if np.random.rand() >= p:
+        return image, xy
+    w, _ = image.size
+    x, y = xy
+    image = image.transpose(Image.FLIP_LEFT_RIGHT)
+    x_flipped = (w - 1) - x
+    return image, (x_flipped, y)
+
+
+def _random_vflip(image: Image.Image, xy: Tuple[float, float], p: float = 0.0) -> Tuple[Image.Image, Tuple[float, float]]:
+    if np.random.rand() >= p:
+        return image, xy
+    w, h = image.size
+    x, y = xy
+    image = image.transpose(Image.FLIP_TOP_BOTTOM)
+    y_flipped = (h - 1) - y
+    return image, (x, y_flipped)
+
+
+class JsonlPointDataset(Dataset):
+    """Dataset for JSONL lines supporting multiple formats:
+    
+    New format (from gen_point_jsonl_from_masks.py):
+        {"image": "/path/to/img.jpg", "points": [[x1,y1], [x2,y2], ...], "labels": [1, 0, ...]}
+    
+    Legacy format (backward compatibility):
+        {"image": "/path/to/img.jpg", "x": x1, "y": y1}
+    
+    For new format:
+        - Uses only points with label=1 (positive/foreground)
+        - If multiple positive points exist, picks the first one
+        - Skips samples with no positive points
+    
+    Options:
+        - resize: resize to fixed HxW and scale coordinates
+        - random flips: horizontal/vertical (vflip off by default)
+        - normalization: mean/std to Tensor
+    """
+
+    def __init__(
+        self,
+        jsonl_path: str,
+        image_size: ImageSize,
+        hflip_p: float = 0.5,
+        vflip_p: float = 0.0,
+        mean_rgb: Tuple[float, float, float] = (0.485, 0.456, 0.406),
+        std_rgb: Tuple[float, float, float] = (0.229, 0.224, 0.225),
+        mean_gray: float = 0.5,
+        std_gray: float = 0.5,
+        training: bool = True,
+    ) -> None:
+        super().__init__()
+        self.entries: List[Dict[str, object]] = []
+        with open(jsonl_path, "r", encoding="utf-8") as f:
+            for line_num, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                    if not self._validate_and_process_entry(obj, line_num):
+                        continue
+                    self.entries.append(obj)
+                except (json.JSONDecodeError, ValueError, KeyError, IndexError) as e:
+                    print(f"[WARN] Skipping invalid JSON at line {line_num}: {e}")
+                    continue
+        
+        if len(self.entries) == 0:
+            raise ValueError(f"No valid entries found in {jsonl_path}")
+        
+        self.image_size = image_size
+        self.hflip_p = hflip_p
+        self.vflip_p = vflip_p
+        self.mean_rgb = mean_rgb
+        self.std_rgb = std_rgb
+        self.mean_gray = float(mean_gray)
+        self.std_gray = float(std_gray)
+        self.training = training
+        
+    def _validate_and_process_entry(self, obj: Dict, line_num: int) -> bool:
+        """Validate and normalize entry to internal format. Returns True if valid."""
+        if "image" not in obj:
+            print(f"[WARN] Line {line_num}: Missing 'image' field")
+            return False
+            
+        # Check format: new format has "points" and "labels", legacy has "x" and "y"
+        if "points" in obj and "labels" in obj:
+            # New format
+            points = obj["points"]
+            labels = obj["labels"]
+            
+            if not isinstance(points, list) or not isinstance(labels, list):
+                print(f"[WARN] Line {line_num}: 'points' and 'labels' must be lists")
+                return False
+                
+            if len(points) != len(labels):
+                print(f"[WARN] Line {line_num}: 'points' and 'labels' must have same length")
+                return False
+            
+            # Choose the first (point,label) pair deterministically
+            first_point = points[0]
+            first_label = labels[0]
+            if not isinstance(first_point, (list, tuple)) or len(first_point) != 2:
+                print(f"[WARN] Line {line_num}: Invalid point format {first_point}")
+                return False
+            if first_label not in (0, 1):
+                print(f"[WARN] Line {line_num}: Invalid label value {first_label}, expected 0 or 1")
+                return False
+            # Store in internal format
+            obj["_x"] = float(first_point[0])
+            obj["_y"] = float(first_point[1])
+            obj["_label"] = int(first_label)
+            
+        elif "x" in obj and "y" in obj:
+            # Legacy format
+            obj["_x"] = float(obj["x"])
+            obj["_y"] = float(obj["y"])
+            # If legacy has label field, use it; else default to 1
+            obj["_label"] = int(obj.get("label", 1))
+            
+        else:
+            print(f"[WARN] Line {line_num}: Missing coordinate data (need 'points'+'labels' or 'x'+'y')")
+            return False
+            
+        return True
+
+    def __len__(self) -> int:
+        return len(self.entries)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        e = self.entries[idx]
+        img_path = e["image"]
+        # Prefer explicit conditional image path if provided; otherwise fallback to gt_mask as grayscale condition
+        cond_path = e.get("cond") if isinstance(e, dict) else None
+        if cond_path is None:
+            cond_path = e.get("gt_mask") if isinstance(e, dict) else None
+        # Use normalized internal coordinates
+        x = float(e["_x"])  # pixel coordinates in original image
+        y = float(e["_y"])
+
+        image = Image.open(img_path).convert("RGB")
+        image = _ensure_rgb(image)
+        cond_img: Image.Image
+        if cond_path is None:
+            # If second image missing, fall back to grayscale of the RGB image to keep channel count stable
+            cond_img = image.convert("L")
+        else:
+            cond_img = Image.open(cond_path).convert("L")
+
+        # Resize and coordinate scaling
+        image, (x, y) = _resize_with_coords(image, (x, y), self.image_size)
+        cond_img, _ = _resize_with_coords(cond_img, (x, y), self.image_size)
+
+        # Augmentations (flip) - apply identical transforms to both images and update coords once
+        if self.training:
+            # decide flips once
+            do_h = (np.random.rand() < self.hflip_p)
+            do_v = (np.random.rand() < self.vflip_p)
+            if do_h:
+                w, _ = image.size
+                image = image.transpose(Image.FLIP_LEFT_RIGHT)
+                cond_img = cond_img.transpose(Image.FLIP_LEFT_RIGHT)
+                x = (w - 1) - x
+            if do_v:
+                _, h = image.size
+                image = image.transpose(Image.FLIP_TOP_BOTTOM)
+                cond_img = cond_img.transpose(Image.FLIP_TOP_BOTTOM)
+                y = (h - 1) - y
+
+        # To tensor and normalize
+        image_t = TF.to_tensor(image)  # [3,H,W], 0..1
+        image_t = TF.normalize(image_t, mean=self.mean_rgb, std=self.std_rgb)
+        cond_t = TF.to_tensor(cond_img)  # [1,H,W]
+        cond_t = (cond_t - self.mean_gray) / max(self.std_gray, 1e-6)
+        # Stack to 4 channels: RGB + Gray
+        image_pair = torch.cat([image_t, cond_t], dim=0)  # [4,H,W]
+
+        # Pack target as tensor [2]
+        target_xy = torch.tensor([x, y], dtype=torch.float32)
+        target_label = torch.tensor(int(e.get("_label", 1)), dtype=torch.long)
+
+        sample = {
+            "image": image_pair,
+            "image_rgb": image_t,
+            "image_gray": cond_t,
+            "target_xy": target_xy,
+            "target_label": target_label,
+            "meta": {
+                "path": img_path,
+                "cond_path": cond_path,
+                "height": self.image_size.height,
+                "width": self.image_size.width,
+            },
+        }
+        return sample
+
+
+def collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+    images = torch.stack([b["image"] for b in batch], dim=0)
+    targets_xy = torch.stack([b["target_xy"] for b in batch], dim=0)
+    targets_label = torch.stack([b["target_label"] for b in batch], dim=0)
+    metas = [b["meta"] for b in batch]
+    return {"image": images, "target_xy": targets_xy, "target_label": targets_label, "meta": metas}
+
+
+
+```
+
+```python
+<<'PATCH'
+*** Begin Patch
+*** Update File: /Users/donchiu/Works/Seg-R1/seg-rl/heatmap/model.py
+@@
+-class HeatmapHead(nn.Module):
++class HeatmapHead(nn.Module):
+@@
+         return self.head(x)
++
++
++class LabelHead(nn.Module):
++    def __init__(self, in_channels: int, mid_channels: int = 256, num_classes: int = 2) -> None:
++        super().__init__()
++        self.pool = nn.AdaptiveAvgPool2d(1)
++        self.fc = nn.Sequential(
++            nn.Conv2d(in_channels, mid_channels, kernel_size=1, bias=False),
++            nn.BatchNorm2d(mid_channels),
++            nn.ReLU(inplace=True),
++            nn.Conv2d(mid_channels, num_classes, kernel_size=1, bias=True),
++        )
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        x = self.pool(x)
++        return self.fc(x).flatten(1)
+@@
+-            self.head = HeatmapHead(in_channels)
++            self.head = HeatmapHead(in_channels)
++            self.label_head = LabelHead(in_channels)
+             self._is_unet = False
+         elif cfg.backbone == "unet_s":
+-            self.unet = UNetSmall(in_channels=cfg.in_channels, base_ch=64)
++            self.unet = UNetSmall(in_channels=cfg.in_channels, base_ch=64)
++            # For UNet, use penultimate decoder feature for label head; here reuse final conv input via small feature tap
++            # We expose a small wrapper to return both heatmap logits and a global pooled feature.
+             self._is_unet = True
+         else:
+             raise ValueError(f"Unsupported backbone: {cfg.backbone}")
+@@
+-    def forward(self, x: torch.Tensor) -> torch.Tensor:
++    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+         b, c, h, w = x.shape
+         if getattr(self, "_is_unet", False):
+-            logits = self.unet(x)
+-            return logits
++            # Modify UNet forward minimally: get heatmap, and build a pooled feature from the last decoder output
++            # Here, approximate feature by applying a light conv on input then pooling together with heatmap context.
++            logits = self.unet(x)
++            # Build a feature for label by concatenating x with heatmap and reducing
++            with torch.no_grad():
++                pass
++            feat = torch.cat([x.mean(dim=1, keepdim=True), logits], dim=1)  # [B,2,H,W]
++            feat = F.avg_pool2d(feat, kernel_size=(max(1, feat.size(2)//8), max(1, feat.size(3)//8)))
++            feat = F.adaptive_avg_pool2d(feat, output_size=1)  # [B,2,1,1]
++            label_logits = nn.Conv2d(2, 2, kernel_size=1, bias=True).to(feat.device)(feat).flatten(1)
++            return logits, label_logits
+         x = self.stem(x)
+         x = self.layer1(x)
+         x = self.layer2(x)  # stride 8 total
+         x = self.layer3(x)  # stride 16
+         x = self.layer4(x)  # stride 32
+-        in_channels = 512
+-        logits_low = self.head(x)  # [B,1,h',w']
++        in_channels = 512
++        logits_low = self.head(x)  # [B,1,h',w']
++        label_logits = self.label_head(x)  # [B,2]
+         if self.cfg.upsample_to_input:
+             logits = F.interpolate(logits_low, size=(h, w), mode="bilinear", align_corners=False)
+-            return logits
+-        return logits_low
++            return logits, label_logits
++        return logits_low, label_logits
+*** End Patch
+PATCH
+```
+
+I'll add a label prediction head to the model, make UNet expose the last decoder feature for classification, update the model forward to return both heatmap and label logits, switch training to use 4-channel inputs with a joint loss (heatmap + label CE), and fix evaluation/visualization to unpack outputs. Then I'll run lint checks.
+
+```python
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Literal, Optional, Tuple
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision.models import resnet18, ResNet18_Weights
+
+
+@dataclass
+class ModelConfig:
+    """模型配置
+    
+    backbone: 选择骨干架构
+        - "unet_s": 轻量UNet，默认推荐，输出高分辨率平滑热力图，适合软分布学习
+        - "resnet18": ResNet18 + 插值上采样，速度快但空间精度略低
+    pretrained: 是否使用预训练权重（仅对resnet18有效）
+    upsample_to_input: resnet18时是否上采样到输入分辨率
+    """
+    backbone: Literal["resnet18", "unet_s"] = "unet_s"
+    pretrained: bool = False
+    upsample_to_input: bool = True
+    in_channels: int = 3  # 支持RGB(3)+Gray(1)成对输入，默认4通道
+
+
+class HeatmapHead(nn.Module):
+    def __init__(self, in_channels: int, mid_channels: int = 256) -> None:
+        super().__init__()
+        self.head = nn.Sequential(
+            nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(mid_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid_channels, 1, kernel_size=1, bias=True),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.head(x)
+
+
+class LabelHead(nn.Module):
+    def __init__(self, in_channels: int, mid_channels: int = 256, num_classes: int = 2) -> None:
+        super().__init__()
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Conv2d(in_channels, mid_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(mid_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid_channels, num_classes, kernel_size=1, bias=True),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.pool(x)
+        return self.fc(x).flatten(1)
+
+class DoubleConv(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int) -> None:
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.block(x)
+
+
+class UNetSmall(nn.Module):
+    """轻量级U-Net，输出输入分辨率的单通道logits热力图
+    
+    设计用于生成平滑、空间精确的热力图，通过跳连保持细节信息。
+    相比ResNet+上采样，能更好地学习软分布，避免插值带来的空间失真。
+    特别适合配合高斯软目标(KL/MSE)训练距离衰减的热力图。
+    
+    参数:
+        in_channels: 输入通道数，默认3(RGB)
+        base_ch: 基础通道数，控制模型容量，默认64
+    """
+
+    def __init__(self, in_channels: int = 3, base_ch: int = 64) -> None:
+        super().__init__()
+        c1, c2, c3, c4 = base_ch, base_ch * 2, base_ch * 4, base_ch * 8
+        self.out_ch = c1
+        self.enc1 = DoubleConv(in_channels, c1)
+        self.enc2 = DoubleConv(c1, c2)
+        self.enc3 = DoubleConv(c2, c3)
+        self.enc4 = DoubleConv(c3, c4)
+
+        self.pool = nn.MaxPool2d(2)
+
+        self.up3 = nn.ConvTranspose2d(c4, c3, kernel_size=2, stride=2)
+        self.dec3 = DoubleConv(c4, c3)
+        self.up2 = nn.ConvTranspose2d(c3, c2, kernel_size=2, stride=2)
+        self.dec2 = DoubleConv(c3, c2)
+        self.up1 = nn.ConvTranspose2d(c2, c1, kernel_size=2, stride=2)
+        self.dec1 = DoubleConv(c2, c1)
+
+        self.final = nn.Conv2d(c1, 1, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool(e1))
+        e3 = self.enc3(self.pool(e2))
+        e4 = self.enc4(self.pool(e3))
+
+        d3 = self.up3(e4)
+        d3 = torch.cat([d3, e3], dim=1)
+        d3 = self.dec3(d3)
+        d2 = self.up2(d3)
+        d2 = torch.cat([d2, e2], dim=1)
+        d2 = self.dec2(d2)
+        d1 = self.up1(d2)
+        d1 = torch.cat([d1, e1], dim=1)
+        d1 = self.dec1(d1)
+        # expose last decoder feature for classification head
+        self.last_dec = d1
+        return self.final(d1)
+
+
+class PointHeatmapModel(nn.Module):
+    """Backbone + 1-channel heatmap logits head.
+
+    Output: logits of shape [B,1,H',W'] optionally upsampled to input HxW.
+    """
+
+    def __init__(self, cfg: ModelConfig) -> None:
+        super().__init__()
+        self.cfg = cfg
+        if cfg.backbone == "resnet18":
+            weights = ResNet18_Weights.DEFAULT if cfg.pretrained else None
+            base = resnet18(weights=weights)
+            # 调整conv1以适配任意输入通道
+            if cfg.in_channels != 3:
+                old_conv1 = base.conv1
+                new_conv1 = nn.Conv2d(cfg.in_channels, old_conv1.out_channels, kernel_size=old_conv1.kernel_size,
+                                       stride=old_conv1.stride, padding=old_conv1.padding, bias=False)
+                with torch.no_grad():
+                    if old_conv1.weight.shape[1] == 3:
+                        # 将预训练权重映射到新通道：前3通道拷贝，其余通道取均值
+                        new_conv1.weight[:, :3] = old_conv1.weight
+                        if cfg.in_channels > 3:
+                            mean_w = old_conv1.weight.mean(dim=1, keepdim=True)
+                            new_conv1.weight[:, 3:cfg.in_channels] = mean_w.repeat(1, cfg.in_channels - 3, 1, 1)
+                    else:
+                        nn.init.kaiming_normal_(new_conv1.weight, mode="fan_out", nonlinearity="relu")
+                base.conv1 = new_conv1
+            self.stem = nn.Sequential(base.conv1, base.bn1, base.relu, base.maxpool)
+            self.layer1 = base.layer1
+            self.layer2 = base.layer2  # stride 8 total
+            self.layer3 = base.layer3  # stride 16
+            self.layer4 = base.layer4  # stride 32
+            in_channels = 512
+            self.head = HeatmapHead(in_channels)
+            self.label_head = LabelHead(in_channels)
+            self._is_unet = False
+        elif cfg.backbone == "unet_s":
+            self.unet = UNetSmall(in_channels=cfg.in_channels, base_ch=64)
+            self.label_head_unet = LabelHead(self.unet.out_ch)
+            self._is_unet = True
+        else:
+            raise ValueError(f"Unsupported backbone: {cfg.backbone}")
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        b, c, h, w = x.shape
+        if getattr(self, "_is_unet", False):
+            logits = self.unet(x)
+            # use last decoder feature for label
+            feat = getattr(self.unet, "last_dec", None)
+            if feat is None:
+                # fallback to using input averaged with logits if feature missing
+                feat = x
+            label_logits = self.label_head_unet(feat)
+            return logits, label_logits
+        x = self.stem(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+        logits_low = self.head(x)  # [B,1,h',w']
+        label_logits = self.label_head(x)  # [B,2]
+        if self.cfg.upsample_to_input:
+            logits = F.interpolate(logits_low, size=(h, w), mode="bilinear", align_corners=False)
+            return logits, label_logits
+        return logits_low, label_logits
+
+
+def argmax_from_logits(logits: torch.Tensor) -> torch.Tensor:
+    """Get integer pixel coordinates from logits [B,1,H,W] -> [B,2] (x,y)."""
+    b, _, h, w = logits.shape
+    idx = logits.view(b, -1).argmax(dim=1)
+    y = (idx // w).float()
+    x = (idx % w).float()
+    return torch.stack([x, y], dim=1)
+
+
+def soft_argmax_from_logits(logits: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
+    """Soft-argmax to get sub-pixel expected coordinates [B,1,H,W] -> [B,2] (x,y)."""
+    b, _, h, w = logits.shape
+    p = F.softmax(logits.view(b, -1) / max(temperature, 1e-6), dim=1).view(b, 1, h, w)
+    xs = torch.linspace(0, w - 1, w, device=logits.device).view(1, 1, 1, w)
+    ys = torch.linspace(0, h - 1, h, device=logits.device).view(1, 1, h, 1)
+    x_exp = (p * xs).sum(dim=(2, 3))
+    y_exp = (p * ys).sum(dim=(2, 3))
+    return torch.cat([x_exp, y_exp], dim=1)
+
+
+# ==========================
+# 层级策略采样与log_prob计算
+# 将像素分布分解为：cell分布 + cell内子像素分布
+# ==========================
+
+def _crop_to_stride(logits: torch.Tensor, stride: int) -> tuple[torch.Tensor, int, int]:
+    B, C, H, W = logits.shape
+    Hc = H // stride
+    Wc = W // stride
+    Ht = Hc * stride
+    Wt = Wc * stride
+    return logits[:, :, :Ht, :Wt], Hc, Wc
+
+
+def _cell_logsumexp(logits: torch.Tensor, stride: int) -> tuple[torch.Tensor, torch.Tensor, int, int]:
+    logits, Hc, Wc = _crop_to_stride(logits, stride)
+    B, _, Ht, Wt = logits.shape
+    s = stride
+    patches = F.unfold(logits, kernel_size=(s, s), stride=(s, s))  # [B, s*s, Hc*Wc]
+    lse = torch.logsumexp(patches, dim=1)  # [B, Hc*Wc]
+    lse_map = lse.view(B, 1, Hc, Wc)
+    return lse_map, patches, Hc, Wc
+
+
+@torch.no_grad()
+def sample_cell_and_offset(
+    logits: torch.Tensor,
+    stride: int,
+    temperature: float = 1.0,
+) -> dict:
+    device = logits.device
+    T = max(temperature, 1e-6)
+    lse_map, patches, Hc, Wc = _cell_logsumexp(logits / T, stride)
+    B = logits.size(0)
+    s = stride
+
+    # p(cell)
+    cell_logits_flat = lse_map.view(B, -1)
+    cell_dist = torch.distributions.Categorical(logits=cell_logits_flat)
+    cell_idx = cell_dist.sample()                       # [B]
+    cell_logp = cell_dist.log_prob(cell_idx)            # [B]
+
+    # p(subpixel | cell)
+    within_logits = patches.gather(2, cell_idx.view(B, 1, 1).expand(B, s*s, 1)).squeeze(-1)
+    sub_dist = torch.distributions.Categorical(logits=within_logits)
+    sub_idx = sub_dist.sample()
+    sub_logp = sub_dist.log_prob(sub_idx)
+
+    # index -> (i,j)
+    ci = (cell_idx // Wc)              # [B]
+    cj = (cell_idx % Wc)               # [B]
+    ui = (sub_idx // s)
+    uj = (sub_idx % s)
+
+    # pixel coordinates within cropped region
+    yi = ci * s + ui
+    xj = cj * s + uj
+
+    # offset in [-0.5, 0.5]
+    off_x = (uj.to(torch.float32) + 0.5) / s - 0.5
+    off_y = (ui.to(torch.float32) + 0.5) / s - 0.5
+
+    total_logp = cell_logp + sub_logp
+
+    return {
+        "cell_idx": cell_idx,
+        "cell_ij": torch.stack([cj, ci], dim=1),
+        "sub_idx": sub_idx,
+        "sub_ij": torch.stack([uj, ui], dim=1),
+        "pixel_xy": torch.stack([xj, yi], dim=1),
+        "offset": torch.stack([off_x, off_y], dim=1).to(device),
+        "log_prob": total_logp,
+        "grid_hw": torch.tensor([Hc, Wc], device=device),
+        "stride": torch.tensor(s, device=device),
+    }
+
+
+def action_to_continuous_xy(sample_out: dict) -> torch.Tensor:
+    s = int(sample_out["stride"].item())
+    x = sample_out["pixel_xy"][:, 0].to(torch.float32) + 0.5
+    y = sample_out["pixel_xy"][:, 1].to(torch.float32) + 0.5
+    return torch.stack([x, y], dim=1)
+
+
+def log_prob_of_action(
+    logits: torch.Tensor,
+    stride: int,
+    cell_idx: torch.Tensor,
+    sub_idx: torch.Tensor,
+    temperature: float = 1.0,
+) -> torch.Tensor:
+    T = max(temperature, 1e-6)
+    lse_map, patches, Hc, Wc = _cell_logsumexp(logits / T, stride)
+    B = logits.size(0)
+    s = stride
+
+    cell_logits_flat = lse_map.view(B, -1)
+    cell_logp = torch.log_softmax(cell_logits_flat, dim=1).gather(1, cell_idx.view(B, 1)).squeeze(1)
+
+    within_logits = patches.gather(2, cell_idx.view(B, 1, 1).expand(B, s*s, 1)).squeeze(-1)
+    sub_logp = torch.log_softmax(within_logits, dim=1).gather(1, sub_idx.view(B, 1)).squeeze(1)
+
+    return cell_logp + sub_logp
+
+
+```
+
+```python
+<<'PATCH'
+*** Begin Patch
+*** Update File: /Users/donchiu/Works/Seg-R1/seg-rl/heatmap/train.py
+@@
+-    cfg = ModelConfig(backbone=args.arch, pretrained=args.pretrained, in_channels=3)
++    cfg = ModelConfig(backbone=args.arch, pretrained=args.pretrained, in_channels=4)
+     model = PointHeatmapModel(cfg).to(device)
+@@
+-                logits = model(img)
+-                if args.loss == "ce":
+-                    loss = ce_over_pixels(logits, tgt)
+-                elif args.loss == "kl":
+-                    loss = kl_to_gaussian_targets(logits, tgt, sigma=args.sigma, tau=args.tau)
+-                else:
+-                    loss = mse_to_gaussian_targets(logits, tgt, sigma=args.sigma)
++                logits, label_logits = model(img)
++                if args.loss == "ce":
++                    loss_hm = ce_over_pixels(logits, tgt)
++                elif args.loss == "kl":
++                    loss_hm = kl_to_gaussian_targets(logits, tgt, sigma=args.sigma, tau=args.tau)
++                else:
++                    loss_hm = mse_to_gaussian_targets(logits, tgt, sigma=args.sigma)
++                loss_label = nn.CrossEntropyLoss()(label_logits, batch["target_label"].to(device))
++                loss = loss_hm + 0.2 * loss_label
+@@
+-                logits = model(img_t.to(device))
++                logits, label_logits = model(torch.cat([img_t.to(device), batch["image_gray"].to(device)], dim=1))
+                 # ensure logits match image resolution for precise overlay
+*** End Patch
+PATCH
+```
+
+I'll update the training script to:
+- use 4-channel inputs,
+- handle the model's two-head outputs (heatmap logits and label logits),
+- compute joint loss (heatmap + 0.2 * label CE),
+- update evaluation and visualization to construct 4-channel inputs and use only heatmap logits for coordinate metrics.
+
+Then I'll run a lint check.
+
+```python
+from __future__ import annotations
+
+import argparse
+import os
+from typing import Tuple, List
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, Subset
+from PIL import Image
+
+try:
+    from .datasets import JsonlPointDataset, ImageSize, collate_fn
+    from .model import ModelConfig, PointHeatmapModel, argmax_from_logits, soft_argmax_from_logits
+    from .losses import ce_over_pixels, kl_to_gaussian_targets, mse_to_gaussian_targets
+    from .utils import save_checkpoint
+    from .utils import draw_cross, draw_triangle, draw_diagonal_cross, overlay_heatmap, make_grid
+except ImportError:  # allow running as a script without package context
+    import sys as _sys
+    import os as _os
+    _pkg_root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    if _pkg_root not in _sys.path:
+        _sys.path.insert(0, _pkg_root)
+    from heatmap.datasets import JsonlPointDataset, ImageSize, collate_fn
+    from heatmap.model import ModelConfig, PointHeatmapModel, argmax_from_logits, soft_argmax_from_logits
+    from heatmap.losses import ce_over_pixels, kl_to_gaussian_targets, mse_to_gaussian_targets
+    from heatmap.utils import save_checkpoint
+    from heatmap.utils import draw_cross, draw_triangle, draw_diagonal_cross, overlay_heatmap, make_grid
+
+"""
+训练热力图分类点定位模型，支持软高斯目标分布
+
+数据准备 - 从mask生成训练数据:
+python seg-rl/annotator/gen_point_jsonl_from_masks.py \\
+  --images_dir /path/to/images \\
+  --masks_dir /path/to/masks \\
+  --output_jsonl /path/to/training_data.jsonl
+
+支持的JSONL格式:
+  新格式: {"image": "/path/img.jpg", "points": [[x,y]], "labels": [1]}
+  旧格式: {"image": "/path/img.jpg", "x": x, "y": y}
+
+推荐用法（UNet + KL软目标，更适合生成平滑的距离衰减热力图）:
+python -m seg-rl.heatmap.train \
+  --data_jsonl /root/autodl-tmp/works/Seg-R0/datasets/seg_r1_md/Task01_BrainTumour/mask_salient_points-0.jsonl \
+  --height 512 --width 512 \
+  --arch unet_s \
+  --loss kl --sigma 6.0 --tau 1.0 \
+  --batch_size 16 --epochs 40 --amp \
+  --val_ratio 0.1 --test_ratio 0.1 --seed 42 \
+  --eval_thresh 5.0 --save_every 5 \
+  --out_dir /root/autodl-tmp/works/Seg-R0/outputs/seg_r1_md/Task01_BrainTumour/heatmap_train-0 \
+  --vis_mode sample --vis_count 16
+
+高分辨率场景（增大sigma获得更软的分布）:
+python -m seg-rl.heatmap.train \
+  --data_jsonl /root/autodl-tmp/works/Seg-R0/datasets/seg_r1_md/Task01_BrainTumour/mask_salient_points-0.jsonl \
+  --height 1024 --width 1024 \
+  --arch unet_s \
+  --loss kl --sigma 10.0 --tau 1.2 \
+  --batch_size 8 --epochs 50 --amp \
+  --lr 1e-4 --weight_decay 1e-4 \
+  --out_dir /root/autodl-tmp/works/Seg-R0/outputs/seg_r1_md/Task01_BrainTumour/heatmap_train-0 \
+  --vis_mode sample --vis_count 16
+
+MSE损失选项（更稳定的形状匹配）:
+python -m seg-rl.heatmap.train \
+  --data_jsonl /path/to/your/data.jsonl \
+  --arch unet_s --loss mse --sigma 8.0 \
+  --epochs 30 --amp
+"""
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Train heatmap classification point locator (paired inputs: RGB + Gray)")
+    p.add_argument("--data_jsonl", type=str, required=True, help="JSONL file with training samples (supports new points+labels format and legacy x+y format); splits done in-script")
+    p.add_argument("--height", type=int, default=512)
+    p.add_argument("--width", type=int, default=512)
+    p.add_argument("--batch_size", type=int, default=16)
+    p.add_argument("--epochs", type=int, default=20)
+    p.add_argument("--save_every", type=int, default=1, help="Save checkpoint every N epochs")
+    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--weight_decay", type=float, default=1e-4)
+    p.add_argument("--arch", type=str, choices=["unet_s", "resnet18"], default="unet_s")
+    p.add_argument("--loss", type=str, choices=["ce", "kl", "mse"], default="kl")
+    p.add_argument("--sigma", type=float, default=3.0, help="Gaussian sigma for KL/MSE targets")
+    p.add_argument("--tau", type=float, default=1.0, help="Temperature for KL/model softmax")
+    p.add_argument("--amp", action="store_true")
+    p.add_argument("--workers", type=int, default=8)
+    p.add_argument("--out_dir", type=str, default="./outputs/seg_rl")
+    p.add_argument("--plots_dir", type=str, default=None, help="Directory to save loss/PCK plots; default under out_dir/plots")
+    p.add_argument("--pretrained", action="store_true")
+    p.add_argument("--resume", type=str, default=None)
+    p.add_argument("--eval_thresh", type=float, default=5.0, help="PCK threshold in pixels")
+    p.add_argument("--val_ratio", type=float, default=0.1, help="Validation split ratio from the full dataset")
+    p.add_argument("--test_ratio", type=float, default=0.0, help="Test split ratio from the full dataset")
+    p.add_argument("--seed", type=int, default=42, help="Random seed for splitting")
+    p.add_argument("--vis_mode", type=str, choices=["none", "sample", "all"], default="none", help="Visualization mode")
+    p.add_argument("--vis_count", type=int, default=16, help="When vis_mode=sample, number of samples to visualize")
+    p.add_argument("--vis_dir", type=str, default=None, help="Directory to save visualization images; default under out_dir/vis")
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    amp_enabled = args.amp and (device.type == "cuda")
+
+    os.makedirs(args.out_dir, exist_ok=True)
+    plots_dir = args.plots_dir or os.path.join(args.out_dir, "plots")
+    os.makedirs(plots_dir, exist_ok=True)
+    vis_dir = args.vis_dir or os.path.join(args.out_dir, "vis")
+    os.makedirs(vis_dir, exist_ok=True)
+
+    image_size = ImageSize(height=args.height, width=args.width)
+    # Load once to get length for splitting
+    full_ds_for_len = JsonlPointDataset(args.data_jsonl, image_size=image_size, training=True)
+    n = len(full_ds_for_len)
+    assert 0.0 <= args.val_ratio < 1.0 and 0.0 <= args.test_ratio < 1.0 and args.val_ratio + args.test_ratio < 1.0, "Invalid split ratios"
+    n_test = int(round(n * args.test_ratio))
+    n_val = int(round(n * args.val_ratio))
+    n_train = n - n_val - n_test
+    g = torch.Generator()
+    g.manual_seed(args.seed)
+    perm = torch.randperm(n, generator=g).tolist()
+    idx_train = perm[:n_train]
+    idx_val = perm[n_train:n_train + n_val]
+    idx_test = perm[n_train + n_val:]
+
+    # Build datasets per split to control augmentation flag
+    train_base = JsonlPointDataset(args.data_jsonl, image_size=image_size, training=True)
+    val_base = JsonlPointDataset(args.data_jsonl, image_size=image_size, training=False) if n_val > 0 else None
+    test_base = JsonlPointDataset(args.data_jsonl, image_size=image_size, training=False) if n_test > 0 else None
+
+    train_ds = Subset(train_base, idx_train)
+    val_ds = Subset(val_base, idx_val) if val_base is not None else None
+    test_ds = Subset(test_base, idx_test) if test_base is not None else None
+
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.workers, pin_memory=True, collate_fn=collate_fn)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True, collate_fn=collate_fn) if val_ds is not None else None
+    test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True, collate_fn=collate_fn) if test_ds is not None else None
+
+    cfg = ModelConfig(backbone=args.arch, pretrained=args.pretrained, in_channels=4)
+    model = PointHeatmapModel(cfg).to(device)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scaler = torch.amp.GradScaler(enabled=amp_enabled)
+
+    start_epoch = 0
+    global_step = 0
+    if args.resume and os.path.isfile(args.resume):
+        from .utils import load_checkpoint
+        ckpt = load_checkpoint(args.resume, model, optimizer, scaler)
+        start_epoch = ckpt.epoch
+        global_step = ckpt.step
+
+    history = {"train_loss": [], "val_pck": [], "test_pck": []}
+
+    def evaluate(loader: DataLoader | None, split_name: str) -> float:
+        if loader is None:
+            return float("nan")
+        model.eval()
+        total = 0
+        correct = 0
+        with torch.no_grad():
+            for batch in loader:
+                img = batch["image"].to(device, non_blocking=True)
+                tgt = batch["target_xy"].to(device, non_blocking=True)
+                logits, label_logits = model(img)
+                pred_xy = soft_argmax_from_logits(logits)
+                d = torch.linalg.norm(pred_xy - tgt, dim=1)
+                correct += (d <= args.eval_thresh).sum().item()
+                total += d.numel()
+        pck = correct / max(1, total)
+        print(f"{split_name} PCK@{args.eval_thresh}: {pck:.4f}")
+        return pck
+
+    def plot_curves():
+        try:
+            import matplotlib.pyplot as plt
+            import numpy as np
+            epochs_axis = np.arange(1, len(history["train_loss"]) + 1)
+            # Loss
+            plt.figure()
+            plt.plot(epochs_axis, history["train_loss"], label="train_loss")
+            plt.xlabel("Epoch")
+            plt.ylabel("Loss")
+            plt.legend()
+            plt.grid(True, ls=":", alpha=0.4)
+            plt.tight_layout()
+            plt.savefig(os.path.join(plots_dir, "loss.png"))
+            plt.close()
+            # PCK
+            plt.figure()
+            if any(not np.isnan(v) for v in history["val_pck"]):
+                plt.plot(epochs_axis, history["val_pck"], label="val_pck")
+            if any(not np.isnan(v) for v in history["test_pck"]):
+                plt.plot(epochs_axis, history["test_pck"], label="test_pck")
+            plt.xlabel("Epoch")
+            plt.ylabel(f"PCK@{args.eval_thresh}")
+            plt.legend()
+            plt.grid(True, ls=":", alpha=0.4)
+            plt.tight_layout()
+            plt.savefig(os.path.join(plots_dir, "pck.png"))
+            plt.close()
+        except Exception as e:
+            print(f"Plotting failed: {e}")
+
+    def visualize_dataset(loader: DataLoader | None, split_name: str):
+        if loader is None or args.vis_mode == "none":
+            return
+        model.eval()
+        import torchvision.transforms.functional as TF
+        import numpy as np
+        saved_images: List[Image.Image] = []
+        count = 0
+        max_count = args.vis_count if args.vis_mode == "sample" else float("inf")
+        with torch.no_grad():
+            for batch in loader:
+                img_t = batch["image_rgb"]  # [B,3,H,W] use RGB for visualization
+                tgt = batch["target_xy"]  # [B,2]
+                # Build 4ch input for the model: RGB + Gray
+                img4 = torch.cat([img_t.to(device), batch["image_gray"].to(device)], dim=1)
+                logits, label_logits = model(img4)
+                # ensure logits match image resolution for precise overlay
+                _, _, H_img, W_img = img_t.shape
+                if logits.shape[-2] != H_img or logits.shape[-1] != W_img:
+                    logits = torch.nn.functional.interpolate(logits, size=(H_img, W_img), mode="bilinear", align_corners=False)
+                # probability heatmap for stable visualization
+                bsz, _, H, W = logits.shape
+                probs = torch.softmax(logits.view(bsz, -1), dim=1).view(bsz, 1, H, W)
+                # compute soft-argmax pred on CPU for simplicity
+                pred_xy = soft_argmax_from_logits(logits).cpu()
+                for i in range(img_t.size(0)):
+                    if count >= max_count:
+                        break
+                    # unnormalize to [0,1] for visualization (ImageNet stats)
+                    mean = np.array([0.485, 0.456, 0.406]).reshape(3, 1, 1)
+                    std = np.array([0.229, 0.224, 0.225]).reshape(3, 1, 1)
+                    arr = img_t[i].cpu().float().numpy()
+                    arr = (arr * std + mean).clip(0.0, 1.0)
+                    pil_img = TF.to_pil_image(torch.from_numpy(arr))
+                    # overlay probability heatmap instead of raw logits
+                    hm = probs[i, 0].detach().cpu().float().numpy()
+                    # show base image in grayscale while keeping heatmap colored
+                    over = overlay_heatmap(pil_img.convert("L"), hm, alpha=0.5)
+                    # clamp coords to image bounds to ensure visibility
+                    h, w = img_t.size(-2), img_t.size(-1)
+                    gx = float(max(0.0, min(w - 1.0, float(tgt[i, 0]))))
+                    gy = float(max(0.0, min(h - 1.0, float(tgt[i, 1]))))
+                    px = float(max(0.0, min(w - 1.0, float(pred_xy[i, 0]))))
+                    py = float(max(0.0, min(h - 1.0, float(pred_xy[i, 1]))))
+                    # draw GT and Pred (GT + Pred both crosses; Pred is 45-degree red cross)
+                    over = draw_cross(over, (gx, gy), color=(0, 255, 0))
+                    over = draw_diagonal_cross(over, (px, py), color=(255, 0, 0), size=10)
+                    saved_images.append(over)
+                    count += 1
+                if count >= max_count:
+                    break
+        # save grid or per-sample
+        if args.vis_mode == "sample":
+            grid = make_grid(saved_images, cols=4)
+            grid.save(os.path.join(vis_dir, f"{split_name}_vis.png"))
+        else:  # all
+            split_dir = os.path.join(vis_dir, split_name)
+            os.makedirs(split_dir, exist_ok=True)
+            for i, img in enumerate(saved_images):
+                img.save(os.path.join(split_dir, f"{i:05d}.png"))
+
+    for epoch in range(start_epoch, args.epochs):
+        model.train()
+        running_loss = 0.0
+        for batch in train_loader:
+            img = batch["image"].to(device, non_blocking=True)
+            tgt = batch["target_xy"].to(device, non_blocking=True)
+
+            optimizer.zero_grad(set_to_none=True)
+            with torch.amp.autocast(device_type=device.type, enabled=amp_enabled):
+                logits, label_logits = model(img)
+                if args.loss == "ce":
+                    loss_hm = ce_over_pixels(logits, tgt)
+                elif args.loss == "kl":
+                    loss_hm = kl_to_gaussian_targets(logits, tgt, sigma=args.sigma, tau=args.tau)
+                else:
+                    loss_hm = mse_to_gaussian_targets(logits, tgt, sigma=args.sigma)
+                loss_label = nn.CrossEntropyLoss()(label_logits, batch["target_label"].to(device))
+                loss = loss_hm + 0.2 * loss_label
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            running_loss += loss.item()
+            global_step += 1
+
+        avg_loss = running_loss / max(1, len(train_loader))
+        history["train_loss"].append(avg_loss)
+        print(f"Epoch {epoch+1}/{args.epochs} - train loss: {avg_loss:.4f}")
+
+        # Validation
+        val_pck = evaluate(val_loader, "val") if val_loader is not None else float("nan")
+        history["val_pck"].append(val_pck)
+        test_pck = evaluate(test_loader, "test") if test_loader is not None else float("nan")
+        history["test_pck"].append(test_pck)
+
+        # plots
+        plot_curves()
+
+        # visualizations
+        if args.vis_mode != "none":
+            visualize_dataset(val_loader or train_loader, split_name="val_or_train")
+
+        # Save
+        if ((epoch + 1) % max(1, args.save_every)) == 0:
+            save_path = os.path.join(args.out_dir, f"model_epoch_{epoch+1}.pt")
+            save_checkpoint(save_path, model, optimizer, scaler, epoch=epoch+1, step=global_step)
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+```
+
+I updated the code to add label prediction and keep RL compatibility.
+
+- What I changed
+  - Dataset: now outputs `target_label ∈ {0,1}` per sample; for new-format JSONL, it pairs the first point with its label; for legacy, `label` is used if present, else defaults to 1. Collate returns `image` (4ch), `target_xy`, `target_label`.
+  - Model:
+    - Added a label head that predicts 2-class logits.
+    - ResNet18 path: `heatmap logits [B,1,H',W']` + `label_logits [B,2]`.
+    - UNet path: returns heatmap logits and uses last decoder feature for `label_logits`.
+    - Kept hierarchical cell+in-cell sampling utilities unchanged (still based on heatmap logits).
+  - Train/eval/vis:
+    - Input set to 4 channels (RGB + Gray).
+    - Forward returns `(logits, label_logits)`.
+    - Joint loss: heatmap loss (CE/KL/MSE as before) + 0.2 × CE(label). Evaluation PCK still uses heatmap.
+
+- How to use the label in GRPO (two options)
+  - Multi-task (simplest; default now): label is supervised only (CE); RL policy remains over location via heatmap (cell + in-cell). This is stable and keeps your previous GRPO design intact.
+  - Joint action policy (if you want label to be part of the action): define action a = (label, cell, subpixel), with
+    - log_prob(a) = log p(label) + log p(cell) + log p(subpixel | cell)
+    - Compute log p(label) from `F.log_softmax(label_logits, dim=1)`.
+    - Keep existing cell/subpixel sampler and add label sampling; sum the three log-probs for GRPO.
+    - Optional: if you want location conditioned on label, you can maintain two heatmap heads (per-label) and select one by sampled label. I can add this variant on request.
+
+- Notes
+  - Your default `ModelConfig.in_channels` is 3; I set `train.py` to instantiate the model with `in_channels=4` because the dataset now provides 4-channel inputs.
+  - Augmentations for the paired images and coordinates are synchronized (fixed earlier).
+
+If you want the joint action version, I’ll add label sampling and return `log_prob_total = logp(label) + logp(cell) + logp(subpixel|cell)` in a helper alongside the existing hierarchical sampler.
+
+---
+
+**User**
+
+请用中文解释你上述行动
+
+---
+
+**Cursor**
+
+- 数据集改动
+  - 将输入改为成对图像：读取一张RGB与一张同尺寸灰度图（优先用`cond`，否则回退到`gt_mask`），统一resize与同步几何增强（水平/垂直翻转对两图与坐标使用同一次随机决策）。
+  - 输出4通道张量（RGB+Gray），并保留`image_rgb`和`image_gray`用于可视化。
+  - 从JSONL读取坐标外，还读取二分类`label`（新格式取第一个point的label；旧格式无label时默认1），批处理时返回`target_xy`与`target_label`。
+
+- 模型改动
+  - 让主干支持可配置输入通道，训练脚本用4通道输入。
+  - 在热图头之外新增二分类`label`头：
+    - ResNet18路径：用最后一层特征做全局池化+MLP输出`label_logits[ B,2 ]`。
+    - UNet路径：暴露最后解码特征作为分类特征，输出`label_logits[ B,2 ]`。
+  - 前向返回二元：`(heatmap_logits[ B,1,H,W ], label_logits[ B,2 ])`。
+  - 保留并可用层级策略采样工具（cell + cell内子像素），`log_prob = log p(cell)+log p(sub|cell)`。
+
+- 训练/评估/可视化
+  - 训练：输入4通道，前向拿到两个输出；损失为“热图损失（CE/KL/MSE三选一）+ 0.2×标签CE”，联合优化定位与标签。
+  - 评估：PCK仍基于热图的`soft-argmax`坐标；可视化时用RGB图叠加由热图概率得到的热力图，模型输入由RGB与Gray拼成4通道。
+  - 这样保持了监督阶段的稳定性与可解释性。
+
+- 与GRPO的兼容
+  - 现有层级策略（离散网格+cell内偏移）保持不变，可直接用于GRPO（动作概率由热图logits计算）。
+  - 若希望“标签也参与RL动作”，可扩展为联合动作：`a = (label, cell, subpixel)`，总`log_prob = log p(label) + log p(cell) + log p(sub|cell)`；当前默认将标签作为监督多任务，不改变策略定义，便于平滑过渡到RL。
+
+- 问题修复
+  - 修正了增强：两张图与坐标使用同一次随机翻转，严格同步。
+
+---
+
+**User**
+
+我希望“标签也参与RL动作”，请确认你的代码已经实现。
+
+---
+
+**Cursor**
+
+I'll add joint action sampling and log-prob helpers so that the label is sampled as part of the RL action and its log-prob is added to the total. Then I'll run a quick lint check.
+
+```python
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Literal, Optional, Tuple
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision.models import resnet18, ResNet18_Weights
+
+
+@dataclass
+class ModelConfig:
+    """模型配置
+    
+    backbone: 选择骨干架构
+        - "unet_s": 轻量UNet，默认推荐，输出高分辨率平滑热力图，适合软分布学习
+        - "resnet18": ResNet18 + 插值上采样，速度快但空间精度略低
+    pretrained: 是否使用预训练权重（仅对resnet18有效）
+    upsample_to_input: resnet18时是否上采样到输入分辨率
+    """
+    backbone: Literal["resnet18", "unet_s"] = "unet_s"
+    pretrained: bool = False
+    upsample_to_input: bool = True
+    in_channels: int = 3  # 支持RGB(3)+Gray(1)成对输入，默认4通道
+
+
+class HeatmapHead(nn.Module):
+    def __init__(self, in_channels: int, mid_channels: int = 256) -> None:
+        super().__init__()
+        self.head = nn.Sequential(
+            nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(mid_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid_channels, 1, kernel_size=1, bias=True),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.head(x)
+
+
+class LabelHead(nn.Module):
+    def __init__(self, in_channels: int, mid_channels: int = 256, num_classes: int = 2) -> None:
+        super().__init__()
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Conv2d(in_channels, mid_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(mid_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid_channels, num_classes, kernel_size=1, bias=True),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.pool(x)
+        return self.fc(x).flatten(1)
+
+class DoubleConv(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int) -> None:
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.block(x)
+
+
+class UNetSmall(nn.Module):
+    """轻量级U-Net，输出输入分辨率的单通道logits热力图
+    
+    设计用于生成平滑、空间精确的热力图，通过跳连保持细节信息。
+    相比ResNet+上采样，能更好地学习软分布，避免插值带来的空间失真。
+    特别适合配合高斯软目标(KL/MSE)训练距离衰减的热力图。
+    
+    参数:
+        in_channels: 输入通道数，默认3(RGB)
+        base_ch: 基础通道数，控制模型容量，默认64
+    """
+
+    def __init__(self, in_channels: int = 3, base_ch: int = 64) -> None:
+        super().__init__()
+        c1, c2, c3, c4 = base_ch, base_ch * 2, base_ch * 4, base_ch * 8
+        self.out_ch = c1
+        self.enc1 = DoubleConv(in_channels, c1)
+        self.enc2 = DoubleConv(c1, c2)
+        self.enc3 = DoubleConv(c2, c3)
+        self.enc4 = DoubleConv(c3, c4)
+
+        self.pool = nn.MaxPool2d(2)
+
+        self.up3 = nn.ConvTranspose2d(c4, c3, kernel_size=2, stride=2)
+        self.dec3 = DoubleConv(c4, c3)
+        self.up2 = nn.ConvTranspose2d(c3, c2, kernel_size=2, stride=2)
+        self.dec2 = DoubleConv(c3, c2)
+        self.up1 = nn.ConvTranspose2d(c2, c1, kernel_size=2, stride=2)
+        self.dec1 = DoubleConv(c2, c1)
+
+        self.final = nn.Conv2d(c1, 1, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool(e1))
+        e3 = self.enc3(self.pool(e2))
+        e4 = self.enc4(self.pool(e3))
+
+        d3 = self.up3(e4)
+        d3 = torch.cat([d3, e3], dim=1)
+        d3 = self.dec3(d3)
+        d2 = self.up2(d3)
+        d2 = torch.cat([d2, e2], dim=1)
+        d2 = self.dec2(d2)
+        d1 = self.up1(d2)
+        d1 = torch.cat([d1, e1], dim=1)
+        d1 = self.dec1(d1)
+        # expose last decoder feature for classification head
+        self.last_dec = d1
+        return self.final(d1)
+
+
+class PointHeatmapModel(nn.Module):
+    """Backbone + 1-channel heatmap logits head.
+
+    Output: logits of shape [B,1,H',W'] optionally upsampled to input HxW.
+    """
+
+    def __init__(self, cfg: ModelConfig) -> None:
+        super().__init__()
+        self.cfg = cfg
+        if cfg.backbone == "resnet18":
+            weights = ResNet18_Weights.DEFAULT if cfg.pretrained else None
+            base = resnet18(weights=weights)
+            # 调整conv1以适配任意输入通道
+            if cfg.in_channels != 3:
+                old_conv1 = base.conv1
+                new_conv1 = nn.Conv2d(cfg.in_channels, old_conv1.out_channels, kernel_size=old_conv1.kernel_size,
+                                       stride=old_conv1.stride, padding=old_conv1.padding, bias=False)
+                with torch.no_grad():
+                    if old_conv1.weight.shape[1] == 3:
+                        # 将预训练权重映射到新通道：前3通道拷贝，其余通道取均值
+                        new_conv1.weight[:, :3] = old_conv1.weight
+                        if cfg.in_channels > 3:
+                            mean_w = old_conv1.weight.mean(dim=1, keepdim=True)
+                            new_conv1.weight[:, 3:cfg.in_channels] = mean_w.repeat(1, cfg.in_channels - 3, 1, 1)
+                    else:
+                        nn.init.kaiming_normal_(new_conv1.weight, mode="fan_out", nonlinearity="relu")
+                base.conv1 = new_conv1
+            self.stem = nn.Sequential(base.conv1, base.bn1, base.relu, base.maxpool)
+            self.layer1 = base.layer1
+            self.layer2 = base.layer2  # stride 8 total
+            self.layer3 = base.layer3  # stride 16
+            self.layer4 = base.layer4  # stride 32
+            in_channels = 512
+            self.head = HeatmapHead(in_channels)
+            self.label_head = LabelHead(in_channels)
+            self._is_unet = False
+        elif cfg.backbone == "unet_s":
+            self.unet = UNetSmall(in_channels=cfg.in_channels, base_ch=64)
+            self.label_head_unet = LabelHead(self.unet.out_ch)
+            self._is_unet = True
+        else:
+            raise ValueError(f"Unsupported backbone: {cfg.backbone}")
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        b, c, h, w = x.shape
+        if getattr(self, "_is_unet", False):
+            logits = self.unet(x)
+            # use last decoder feature for label
+            feat = getattr(self.unet, "last_dec", None)
+            if feat is None:
+                # fallback to using input averaged with logits if feature missing
+                feat = x
+            label_logits = self.label_head_unet(feat)
+            return logits, label_logits
+        x = self.stem(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+        logits_low = self.head(x)  # [B,1,h',w']
+        label_logits = self.label_head(x)  # [B,2]
+        if self.cfg.upsample_to_input:
+            logits = F.interpolate(logits_low, size=(h, w), mode="bilinear", align_corners=False)
+            return logits, label_logits
+        return logits_low, label_logits
+
+
+def argmax_from_logits(logits: torch.Tensor) -> torch.Tensor:
+    """Get integer pixel coordinates from logits [B,1,H,W] -> [B,2] (x,y)."""
+    b, _, h, w = logits.shape
+    idx = logits.view(b, -1).argmax(dim=1)
+    y = (idx // w).float()
+    x = (idx % w).float()
+    return torch.stack([x, y], dim=1)
+
+
+def soft_argmax_from_logits(logits: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
+    """Soft-argmax to get sub-pixel expected coordinates [B,1,H,W] -> [B,2] (x,y)."""
+    b, _, h, w = logits.shape
+    p = F.softmax(logits.view(b, -1) / max(temperature, 1e-6), dim=1).view(b, 1, h, w)
+    xs = torch.linspace(0, w - 1, w, device=logits.device).view(1, 1, 1, w)
+    ys = torch.linspace(0, h - 1, h, device=logits.device).view(1, 1, h, 1)
+    x_exp = (p * xs).sum(dim=(2, 3))
+    y_exp = (p * ys).sum(dim=(2, 3))
+    return torch.cat([x_exp, y_exp], dim=1)
+
+
+# ==========================
+# 层级策略采样与log_prob计算
+# 将像素分布分解为：cell分布 + cell内子像素分布
+# ==========================
+
+def _crop_to_stride(logits: torch.Tensor, stride: int) -> tuple[torch.Tensor, int, int]:
+    B, C, H, W = logits.shape
+    Hc = H // stride
+    Wc = W // stride
+    Ht = Hc * stride
+    Wt = Wc * stride
+    return logits[:, :, :Ht, :Wt], Hc, Wc
+
+
+def _cell_logsumexp(logits: torch.Tensor, stride: int) -> tuple[torch.Tensor, torch.Tensor, int, int]:
+    logits, Hc, Wc = _crop_to_stride(logits, stride)
+    B, _, Ht, Wt = logits.shape
+    s = stride
+    patches = F.unfold(logits, kernel_size=(s, s), stride=(s, s))  # [B, s*s, Hc*Wc]
+    lse = torch.logsumexp(patches, dim=1)  # [B, Hc*Wc]
+    lse_map = lse.view(B, 1, Hc, Wc)
+    return lse_map, patches, Hc, Wc
+
+
+@torch.no_grad()
+def sample_cell_and_offset(
+    logits: torch.Tensor,
+    stride: int,
+    temperature: float = 1.0,
+) -> dict:
+    device = logits.device
+    T = max(temperature, 1e-6)
+    lse_map, patches, Hc, Wc = _cell_logsumexp(logits / T, stride)
+    B = logits.size(0)
+    s = stride
+
+    # p(cell)
+    cell_logits_flat = lse_map.view(B, -1)
+    cell_dist = torch.distributions.Categorical(logits=cell_logits_flat)
+    cell_idx = cell_dist.sample()                       # [B]
+    cell_logp = cell_dist.log_prob(cell_idx)            # [B]
+
+    # p(subpixel | cell)
+    within_logits = patches.gather(2, cell_idx.view(B, 1, 1).expand(B, s*s, 1)).squeeze(-1)
+    sub_dist = torch.distributions.Categorical(logits=within_logits)
+    sub_idx = sub_dist.sample()
+    sub_logp = sub_dist.log_prob(sub_idx)
+
+    # index -> (i,j)
+    ci = (cell_idx // Wc)              # [B]
+    cj = (cell_idx % Wc)               # [B]
+    ui = (sub_idx // s)
+    uj = (sub_idx % s)
+
+    # pixel coordinates within cropped region
+    yi = ci * s + ui
+    xj = cj * s + uj
+
+    # offset in [-0.5, 0.5]
+    off_x = (uj.to(torch.float32) + 0.5) / s - 0.5
+    off_y = (ui.to(torch.float32) + 0.5) / s - 0.5
+
+    total_logp = cell_logp + sub_logp
+
+    return {
+        "cell_idx": cell_idx,
+        "cell_ij": torch.stack([cj, ci], dim=1),
+        "sub_idx": sub_idx,
+        "sub_ij": torch.stack([uj, ui], dim=1),
+        "pixel_xy": torch.stack([xj, yi], dim=1),
+        "offset": torch.stack([off_x, off_y], dim=1).to(device),
+        "log_prob": total_logp,
+        "grid_hw": torch.tensor([Hc, Wc], device=device),
+        "stride": torch.tensor(s, device=device),
+    }
+
+
+def action_to_continuous_xy(sample_out: dict) -> torch.Tensor:
+    s = int(sample_out["stride"].item())
+    x = sample_out["pixel_xy"][:, 0].to(torch.float32) + 0.5
+    y = sample_out["pixel_xy"][:, 1].to(torch.float32) + 0.5
+    return torch.stack([x, y], dim=1)
+
+
+def log_prob_of_action(
+    logits: torch.Tensor,
+    stride: int,
+    cell_idx: torch.Tensor,
+    sub_idx: torch.Tensor,
+    temperature: float = 1.0,
+) -> torch.Tensor:
+    T = max(temperature, 1e-6)
+    lse_map, patches, Hc, Wc = _cell_logsumexp(logits / T, stride)
+    B = logits.size(0)
+    s = stride
+
+    cell_logits_flat = lse_map.view(B, -1)
+    cell_logp = torch.log_softmax(cell_logits_flat, dim=1).gather(1, cell_idx.view(B, 1)).squeeze(1)
+
+    within_logits = patches.gather(2, cell_idx.view(B, 1, 1).expand(B, s*s, 1)).squeeze(-1)
+    sub_logp = torch.log_softmax(within_logits, dim=1).gather(1, sub_idx.view(B, 1)).squeeze(1)
+
+    return cell_logp + sub_logp
+
+
+# ==========================
+# 联合策略：标签 + cell + cell内子像素
+# 提供采样与log_prob计算，便于GRPO等算法直接使用
+# ==========================
+
+@torch.no_grad()
+def sample_joint_label_cell_offset(
+    logits: torch.Tensor,
+    label_logits: torch.Tensor,
+    stride: int,
+    temperature_pixel: float = 1.0,
+    temperature_label: float = 1.0,
+) -> dict:
+    """Sample a joint action (label, cell, subpixel) and return combined log_prob.
+
+    Args:
+        logits: [B,1,H,W] heatmap logits over pixels
+        label_logits: [B,2] binary label logits
+        stride: cell stride size (pixels)
+        temperature_pixel: temperature for pixel distribution
+        temperature_label: temperature for label distribution
+    Returns:
+        dict with keys:
+          - label_idx: [B]
+          - cell_idx, cell_ij, sub_idx, sub_ij, pixel_xy, offset (same as sample_cell_and_offset)
+          - log_prob_label: [B]
+          - log_prob_pixel: [B]  (cell + sub)
+          - log_prob: [B]        (sum)
+          - grid_hw, stride
+    """
+    T_label = max(temperature_label, 1e-6)
+    label_dist = torch.distributions.Categorical(logits=label_logits / T_label)
+    label_idx = label_dist.sample()
+    logp_label = label_dist.log_prob(label_idx)
+
+    pixel = sample_cell_and_offset(logits, stride=stride, temperature=temperature_pixel)
+    logp_pixel = pixel["log_prob"]
+
+    out = dict(pixel)
+    out["label_idx"] = label_idx
+    out["log_prob_label"] = logp_label
+    out["log_prob_pixel"] = logp_pixel
+    out["log_prob"] = logp_label + logp_pixel
+    return out
+
+
+def log_prob_of_joint_action(
+    logits: torch.Tensor,
+    label_logits: torch.Tensor,
+    stride: int,
+    label_idx: torch.Tensor,
+    cell_idx: torch.Tensor,
+    sub_idx: torch.Tensor,
+    temperature_pixel: float = 1.0,
+    temperature_label: float = 1.0,
+) -> torch.Tensor:
+    """Compute log_prob(label) + log_prob(cell) + log_prob(sub|cell) for a given action."""
+    # label term
+    T_label = max(temperature_label, 1e-6)
+    ll = torch.log_softmax(label_logits / T_label, dim=1)
+    logp_label = ll.gather(1, label_idx.view(-1, 1)).squeeze(1)
+
+    # pixel terms
+    logp_pixel = log_prob_of_action(
+        logits=logits,
+        stride=stride,
+        cell_idx=cell_idx,
+        sub_idx=sub_idx,
+        temperature=temperature_pixel,
+    )
+    return logp_label + logp_pixel
+
+
+```
+
+- 目前代码已实现“联合动作”采样与概率计算：动作 a = (label, cell, subpixel)。
+- 在 `seg-rl/heatmap/model.py` 中新增了两个接口：
+  - `sample_joint_label_cell_offset(logits, label_logits, stride, ...)`：先从 `label_logits` 采样 `label`，再用现有的层级策略从 `logits` 采样 `(cell, subpixel)`；返回 `log_prob = log_prob_label + log_prob_pixel`，以及 `cell_idx/sub_idx/pixel_xy/offset` 等信息。
+  - `log_prob_of_joint_action(logits, label_logits, stride, label_idx, cell_idx, sub_idx, ...)`：对给定动作计算 `log_prob(label) + log_prob(cell) + log_prob(sub|cell)`，用于旧策略重算概率或KL正则。
+
+- 训练脚本维持监督多任务（热图+标签CE）；在RL（GRPO）阶段，你可以直接改用上述“联合动作”接口替换原本仅基于像素（cell+subpixel）的策略逻辑，即：
+  - 采样：`joint = sample_joint_label_cell_offset(...)`，拿 `joint["log_prob"]` 参与优势估计与更新。
+  - 旧策略 `log_prob`：用 `log_prob_of_joint_action(...)` 复算。
+
+---
+
+**User**
+
+基于前述工作，请继续改写和完善脚本，目标是从已经获得的分割图像数据集中提取供训练该heatmap预测模型的必要数据，来对该模型进行自监督训练。具体地，程序接收两个命令行参数: jsonl为指向一个如同datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour-251001.jsonl所示的JSON文件的路径，sam_dir表示指向一个存放各提示点序列长度下sam图像分割结果的目录路径，例如datasets/seg_r1_md/Task01_BrainTumour/pretrain_gt_masks-251001（如果对于该JSON文件内容的意义以及该sam_dir目录的结构与内容的意义不明白，你可以通过阅读docs/cursor_20250928.md了解之前的上下文）。数据集是这样定义的：遍历JSON文件中的每一个图像样本image，假设其文件名主干为${stem}，则对于points和labels数组依序遍历第i个元素（i从0到points/labels数组的长度-1），我们就得到一个用于训练前述heatmap预测模型的数据样本，其第一个输入图像（单或多通道）即为image，第二个输入图像（单通道灰度）为：当i为0时是全零图像，当i>0时为路径{$sam_dir}/{$stem}/{$(i-1)}.png所指向的mask图像，而目标真值就是points[i]和label[i]所表示的提示点（坐标+前/背景标签）。请编写或改写相关的脚本以使用这样的数据集来训练heatmap模型，并注意也需要做train/val/test集的划分，训练过程中要记录必要的数据以便绘制loss和precision曲线。最后还要使用test集来评估实际的泛化效果。
+
+---
+
+**Cursor**
+
+I'll add a new dataset class that constructs samples for each point index using the given JSONL and sam_dir, update the training script to accept --jsonl and --sam_dir, wire the new dataset, keep splits/plots/eval, and ensure model uses 4-channel inputs as before. Then I'll run a lint check.
+
+```python
+from __future__ import annotations
+
+"""
+JSONL点定位数据集支持多种格式
+
+新格式 (来自 gen_point_jsonl_from_masks.py):
+    {"image": "/path/to/img.jpg", "points": [[x1,y1], [x2,y2], ...], "labels": [1, 0, ...]}
+    - points: 坐标点列表，每个点为[x,y]格式
+    - labels: 对应的标签，1表示正类（前景），0表示负类（背景）
+    - 只使用label=1的点进行训练，如有多个正类点则选择第一个
+    
+旧格式 (向后兼容):
+    {"image": "/path/to/img.jpg", "x": 123.4, "y": 456.7}
+    - 直接包含单个点的x,y坐标
+
+生成工具:
+    python seg-rl/annotator/gen_point_jsonl_from_masks.py \\
+      --images_dir /path/to/images \\
+      --masks_dir /path/to/masks \\
+      --output_jsonl /path/to/output.jsonl
+"""
+
+import json
+import math
+import os
+from dataclasses import dataclass
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
+
+import numpy as np
+from PIL import Image
+
+import torch
+from torch.utils.data import Dataset
+import torchvision.transforms.functional as TF
+import os
+
+
+@dataclass
+class ImageSize:
+    height: int
+    width: int
+
+
+def _ensure_rgb(image: Image.Image) -> Image.Image:
+    if image.mode == "RGB":
+        return image
+    if image.mode in {"L", "I;16", "I", "F"}:
+        return image.convert("RGB")
+    return image.convert("RGB")
+
+
+def _resize_with_coords(image: Image.Image, xy: Tuple[float, float], out_size: ImageSize) -> Tuple[Image.Image, Tuple[float, float]]:
+    orig_w, orig_h = image.size
+    x, y = xy
+    # Simple direct resize, scale coords accordingly
+    scale_x = out_size.width / float(orig_w)
+    scale_y = out_size.height / float(orig_h)
+    x_resized = x * scale_x
+    y_resized = y * scale_y
+    image_resized = image.resize((out_size.width, out_size.height), resample=Image.BILINEAR)
+    return image_resized, (x_resized, y_resized)
+
+
+def _random_hflip(image: Image.Image, xy: Tuple[float, float], p: float = 0.5) -> Tuple[Image.Image, Tuple[float, float]]:
+    if np.random.rand() >= p:
+        return image, xy
+    w, _ = image.size
+    x, y = xy
+    image = image.transpose(Image.FLIP_LEFT_RIGHT)
+    x_flipped = (w - 1) - x
+    return image, (x_flipped, y)
+
+
+def _random_vflip(image: Image.Image, xy: Tuple[float, float], p: float = 0.0) -> Tuple[Image.Image, Tuple[float, float]]:
+    if np.random.rand() >= p:
+        return image, xy
+    w, h = image.size
+    x, y = xy
+    image = image.transpose(Image.FLIP_TOP_BOTTOM)
+    y_flipped = (h - 1) - y
+    return image, (x, y_flipped)
+
+
+class JsonlPointDataset(Dataset):
+    """Dataset for JSONL lines supporting multiple formats:
+    
+    New format (from gen_point_jsonl_from_masks.py):
+        {"image": "/path/to/img.jpg", "points": [[x1,y1], [x2,y2], ...], "labels": [1, 0, ...]}
+    
+    Legacy format (backward compatibility):
+        {"image": "/path/to/img.jpg", "x": x1, "y": y1}
+    
+    For new format:
+        - Uses only points with label=1 (positive/foreground)
+        - If multiple positive points exist, picks the first one
+        - Skips samples with no positive points
+    
+    Options:
+        - resize: resize to fixed HxW and scale coordinates
+        - random flips: horizontal/vertical (vflip off by default)
+        - normalization: mean/std to Tensor
+    """
+
+    def __init__(
+        self,
+        jsonl_path: str,
+        image_size: ImageSize,
+        hflip_p: float = 0.5,
+        vflip_p: float = 0.0,
+        mean_rgb: Tuple[float, float, float] = (0.485, 0.456, 0.406),
+        std_rgb: Tuple[float, float, float] = (0.229, 0.224, 0.225),
+        mean_gray: float = 0.5,
+        std_gray: float = 0.5,
+        training: bool = True,
+    ) -> None:
+        super().__init__()
+        self.entries: List[Dict[str, object]] = []
+        with open(jsonl_path, "r", encoding="utf-8") as f:
+            for line_num, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                    if not self._validate_and_process_entry(obj, line_num):
+                        continue
+                    self.entries.append(obj)
+                except (json.JSONDecodeError, ValueError, KeyError, IndexError) as e:
+                    print(f"[WARN] Skipping invalid JSON at line {line_num}: {e}")
+                    continue
+        
+        if len(self.entries) == 0:
+            raise ValueError(f"No valid entries found in {jsonl_path}")
+        
+        self.image_size = image_size
+        self.hflip_p = hflip_p
+        self.vflip_p = vflip_p
+        self.mean_rgb = mean_rgb
+        self.std_rgb = std_rgb
+        self.mean_gray = float(mean_gray)
+        self.std_gray = float(std_gray)
+        self.training = training
+        
+    def _validate_and_process_entry(self, obj: Dict, line_num: int) -> bool:
+        """Validate and normalize entry to internal format. Returns True if valid."""
+        if "image" not in obj:
+            print(f"[WARN] Line {line_num}: Missing 'image' field")
+            return False
+            
+        # Check format: new format has "points" and "labels", legacy has "x" and "y"
+        if "points" in obj and "labels" in obj:
+            # New format
+            points = obj["points"]
+            labels = obj["labels"]
+            
+            if not isinstance(points, list) or not isinstance(labels, list):
+                print(f"[WARN] Line {line_num}: 'points' and 'labels' must be lists")
+                return False
+                
+            if len(points) != len(labels):
+                print(f"[WARN] Line {line_num}: 'points' and 'labels' must have same length")
+                return False
+            
+            # Choose the first (point,label) pair deterministically
+            first_point = points[0]
+            first_label = labels[0]
+            if not isinstance(first_point, (list, tuple)) or len(first_point) != 2:
+                print(f"[WARN] Line {line_num}: Invalid point format {first_point}")
+                return False
+            if first_label not in (0, 1):
+                print(f"[WARN] Line {line_num}: Invalid label value {first_label}, expected 0 or 1")
+                return False
+            # Store in internal format
+            obj["_x"] = float(first_point[0])
+            obj["_y"] = float(first_point[1])
+            obj["_label"] = int(first_label)
+            
+        elif "x" in obj and "y" in obj:
+            # Legacy format
+            obj["_x"] = float(obj["x"])
+            obj["_y"] = float(obj["y"])
+            # If legacy has label field, use it; else default to 1
+            obj["_label"] = int(obj.get("label", 1))
+            
+        else:
+            print(f"[WARN] Line {line_num}: Missing coordinate data (need 'points'+'labels' or 'x'+'y')")
+            return False
+            
+        return True
+
+    def __len__(self) -> int:
+        return len(self.entries)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        e = self.entries[idx]
+        img_path = e["image"]
+        # Prefer explicit conditional image path if provided; otherwise fallback to gt_mask as grayscale condition
+        cond_path = e.get("cond") if isinstance(e, dict) else None
+        if cond_path is None:
+            cond_path = e.get("gt_mask") if isinstance(e, dict) else None
+        # Use normalized internal coordinates
+        x = float(e["_x"])  # pixel coordinates in original image
+        y = float(e["_y"])
+
+        image = Image.open(img_path).convert("RGB")
+        image = _ensure_rgb(image)
+        cond_img: Image.Image
+        if cond_path is None:
+            # If second image missing, fall back to grayscale of the RGB image to keep channel count stable
+            cond_img = image.convert("L")
+        else:
+            cond_img = Image.open(cond_path).convert("L")
+
+        # Resize and coordinate scaling
+        image, (x, y) = _resize_with_coords(image, (x, y), self.image_size)
+        cond_img, _ = _resize_with_coords(cond_img, (x, y), self.image_size)
+
+        # Augmentations (flip) - apply identical transforms to both images and update coords once
+        if self.training:
+            # decide flips once
+            do_h = (np.random.rand() < self.hflip_p)
+            do_v = (np.random.rand() < self.vflip_p)
+            if do_h:
+                w, _ = image.size
+                image = image.transpose(Image.FLIP_LEFT_RIGHT)
+                cond_img = cond_img.transpose(Image.FLIP_LEFT_RIGHT)
+                x = (w - 1) - x
+            if do_v:
+                _, h = image.size
+                image = image.transpose(Image.FLIP_TOP_BOTTOM)
+                cond_img = cond_img.transpose(Image.FLIP_TOP_BOTTOM)
+                y = (h - 1) - y
+
+        # To tensor and normalize
+        image_t = TF.to_tensor(image)  # [3,H,W], 0..1
+        image_t = TF.normalize(image_t, mean=self.mean_rgb, std=self.std_rgb)
+        cond_t = TF.to_tensor(cond_img)  # [1,H,W]
+        cond_t = (cond_t - self.mean_gray) / max(self.std_gray, 1e-6)
+        # Stack to 4 channels: RGB + Gray
+        image_pair = torch.cat([image_t, cond_t], dim=0)  # [4,H,W]
+
+        # Pack target as tensor [2]
+        target_xy = torch.tensor([x, y], dtype=torch.float32)
+        target_label = torch.tensor(int(e.get("_label", 1)), dtype=torch.long)
+
+        sample = {
+            "image": image_pair,
+            "image_rgb": image_t,
+            "image_gray": cond_t,
+            "target_xy": target_xy,
+            "target_label": target_label,
+            "meta": {
+                "path": img_path,
+                "cond_path": cond_path,
+                "height": self.image_size.height,
+                "width": self.image_size.width,
+            },
+        }
+        return sample
+
+
+def collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+    images = torch.stack([b["image"] for b in batch], dim=0)
+    targets_xy = torch.stack([b["target_xy"] for b in batch], dim=0)
+    targets_label = torch.stack([b["target_label"] for b in batch], dim=0)
+    metas = [b["meta"] for b in batch]
+    return {"image": images, "target_xy": targets_xy, "target_label": targets_label, "meta": metas}
+
+
+class SamSequencePointDataset(Dataset):
+    """Dataset for self-supervised heatmap training from segmentation sequences.
+
+    For each entry in JSONL containing fields:
+      {"image": "/path/img.jpg", "points": [[x,y], ...], "labels": [1,0,...]}
+
+    Generate one sample per index i in 0..len(points)-1:
+      - first input image: the image itself (RGB)
+      - second input image (gray):
+          i == 0  -> all-zero gray image
+          i > 0   -> load mask at {sam_dir}/{stem}/{i-1}.png
+      - target: (points[i], labels[i])
+
+    Notes:
+      - stem is derived from the image file name (without extension)
+      - both images are resized to the fixed ImageSize; flips are applied synchronously
+    """
+
+    def __init__(
+        self,
+        jsonl_path: str,
+        sam_dir: str,
+        image_size: ImageSize,
+        hflip_p: float = 0.5,
+        vflip_p: float = 0.0,
+        mean_rgb: Tuple[float, float, float] = (0.485, 0.456, 0.406),
+        std_rgb: Tuple[float, float, float] = (0.229, 0.224, 0.225),
+        mean_gray: float = 0.5,
+        std_gray: float = 0.5,
+        training: bool = True,
+    ) -> None:
+        super().__init__()
+        self.entries: List[Dict[str, object]] = []
+        with open(jsonl_path, "r", encoding="utf-8") as f:
+            for line_num, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                    if not isinstance(obj, dict):
+                        continue
+                    # minimal validation
+                    if "image" not in obj or "points" not in obj or "labels" not in obj:
+                        continue
+                    points = obj.get("points", [])
+                    labels = obj.get("labels", [])
+                    if not isinstance(points, list) or not isinstance(labels, list) or len(points) != len(labels) or len(points) == 0:
+                        continue
+                    self.entries.append(obj)
+                except Exception:
+                    continue
+
+        if len(self.entries) == 0:
+            raise ValueError(f"No valid entries found in {jsonl_path}")
+
+        self.sam_dir = os.path.abspath(sam_dir)
+        self.image_size = image_size
+        self.hflip_p = hflip_p
+        self.vflip_p = vflip_p
+        self.mean_rgb = mean_rgb
+        self.std_rgb = std_rgb
+        self.mean_gray = float(mean_gray)
+        self.std_gray = float(std_gray)
+        self.training = training
+
+        # Build (entry_idx, point_idx) index
+        self.index: List[Tuple[int, int]] = []
+        for ei, obj in enumerate(self.entries):
+            pts = obj.get("points", [])  # type: ignore
+            for i in range(len(pts)):
+                self.index.append((ei, i))
+
+    def __len__(self) -> int:
+        return len(self.index)
+
+    def _stem(self, path: str) -> str:
+        name = os.path.basename(path)
+        base, _ext = os.path.splitext(name)
+        return base
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        ei, pi = self.index[idx]
+        e = self.entries[ei]
+        assert isinstance(e, dict)
+        img_path = str(e["image"])  # absolute or relative
+        pts = e.get("points", [])  # type: ignore
+        labs = e.get("labels", [])  # type: ignore
+        point = pts[pi]
+        label = labs[pi]
+        x = float(point[0])
+        y = float(point[1])
+        label_int = int(label)
+
+        # load RGB image
+        image = Image.open(img_path).convert("RGB")
+        image = _ensure_rgb(image)
+
+        # build conditional gray image
+        if pi == 0:
+            cond_img = Image.new("L", (image.width, image.height), color=0)
+        else:
+            stem = self._stem(img_path)
+            mask_path = os.path.join(self.sam_dir, stem, f"{pi - 1}.png")
+            try:
+                cond_img = Image.open(mask_path).convert("L")
+            except Exception:
+                cond_img = Image.new("L", (image.width, image.height), color=0)
+
+        # Resize and coordinate scaling (use RGB image as reference for scaling)
+        image, (x, y) = _resize_with_coords(image, (x, y), self.image_size)
+        cond_img = cond_img.resize((self.image_size.width, self.image_size.height), resample=Image.NEAREST)
+
+        # Synchronized flips
+        if self.training:
+            do_h = (np.random.rand() < self.hflip_p)
+            do_v = (np.random.rand() < self.vflip_p)
+            if do_h:
+                w, _ = image.size
+                image = image.transpose(Image.FLIP_LEFT_RIGHT)
+                cond_img = cond_img.transpose(Image.FLIP_LEFT_RIGHT)
+                x = (w - 1) - x
+            if do_v:
+                _, h = image.size
+                image = image.transpose(Image.FLIP_TOP_BOTTOM)
+                cond_img = cond_img.transpose(Image.FLIP_TOP_BOTTOM)
+                y = (h - 1) - y
+
+        # To tensor and normalize
+        image_t = TF.to_tensor(image)
+        image_t = TF.normalize(image_t, mean=self.mean_rgb, std=self.std_rgb)
+        cond_t = TF.to_tensor(cond_img)
+        cond_t = (cond_t - self.mean_gray) / max(self.std_gray, 1e-6)
+        image_pair = torch.cat([image_t, cond_t], dim=0)
+
+        target_xy = torch.tensor([x, y], dtype=torch.float32)
+        target_label = torch.tensor(label_int, dtype=torch.long)
+
+        sample = {
+            "image": image_pair,
+            "image_rgb": image_t,
+            "image_gray": cond_t,
+            "target_xy": target_xy,
+            "target_label": target_label,
+            "meta": {
+                "path": img_path,
+                "height": self.image_size.height,
+                "width": self.image_size.width,
+                "step_idx": pi,
+            },
+        }
+        return sample
+
+
+
+```
+
+```python
+from __future__ import annotations
+
+import argparse
+import os
+from typing import Tuple, List
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, Subset
+from PIL import Image
+
+try:
+    from .datasets import JsonlPointDataset, SamSequencePointDataset, ImageSize, collate_fn
+    from .model import ModelConfig, PointHeatmapModel, argmax_from_logits, soft_argmax_from_logits
+    from .losses import ce_over_pixels, kl_to_gaussian_targets, mse_to_gaussian_targets
+    from .utils import save_checkpoint
+    from .utils import draw_cross, draw_triangle, draw_diagonal_cross, overlay_heatmap, make_grid
+except ImportError:  # allow running as a script without package context
+    import sys as _sys
+    import os as _os
+    _pkg_root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    if _pkg_root not in _sys.path:
+        _sys.path.insert(0, _pkg_root)
+    from heatmap.datasets import JsonlPointDataset, SamSequencePointDataset, ImageSize, collate_fn
+    from heatmap.model import ModelConfig, PointHeatmapModel, argmax_from_logits, soft_argmax_from_logits
+    from heatmap.losses import ce_over_pixels, kl_to_gaussian_targets, mse_to_gaussian_targets
+    from heatmap.utils import save_checkpoint
+    from heatmap.utils import draw_cross, draw_triangle, draw_diagonal_cross, overlay_heatmap, make_grid
+
+"""
+训练热力图分类点定位模型，支持软高斯目标分布
+
+数据准备 - 从mask生成训练数据:
+python seg-rl/annotator/gen_point_jsonl_from_masks.py \\
+  --images_dir /path/to/images \\
+  --masks_dir /path/to/masks \\
+  --output_jsonl /path/to/training_data.jsonl
+
+支持的JSONL格式:
+  新格式: {"image": "/path/img.jpg", "points": [[x,y]], "labels": [1]}
+  旧格式: {"image": "/path/img.jpg", "x": x, "y": y}
+
+推荐用法（UNet + KL软目标，更适合生成平滑的距离衰减热力图）:
+python -m seg-rl.heatmap.train \
+  --data_jsonl /root/autodl-tmp/works/Seg-R0/datasets/seg_r1_md/Task01_BrainTumour/mask_salient_points-0.jsonl \
+  --height 512 --width 512 \
+  --arch unet_s \
+  --loss kl --sigma 6.0 --tau 1.0 \
+  --batch_size 16 --epochs 40 --amp \
+  --val_ratio 0.1 --test_ratio 0.1 --seed 42 \
+  --eval_thresh 5.0 --save_every 5 \
+  --out_dir /root/autodl-tmp/works/Seg-R0/outputs/seg_r1_md/Task01_BrainTumour/heatmap_train-0 \
+  --vis_mode sample --vis_count 16
+
+高分辨率场景（增大sigma获得更软的分布）:
+python -m seg-rl.heatmap.train \
+  --data_jsonl /root/autodl-tmp/works/Seg-R0/datasets/seg_r1_md/Task01_BrainTumour/mask_salient_points-0.jsonl \
+  --height 1024 --width 1024 \
+  --arch unet_s \
+  --loss kl --sigma 10.0 --tau 1.2 \
+  --batch_size 8 --epochs 50 --amp \
+  --lr 1e-4 --weight_decay 1e-4 \
+  --out_dir /root/autodl-tmp/works/Seg-R0/outputs/seg_r1_md/Task01_BrainTumour/heatmap_train-0 \
+  --vis_mode sample --vis_count 16
+
+MSE损失选项（更稳定的形状匹配）:
+python -m seg-rl.heatmap.train \
+  --data_jsonl /path/to/your/data.jsonl \
+  --arch unet_s --loss mse --sigma 8.0 \
+  --epochs 30 --amp
+"""
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Train heatmap model with self-supervised sequence dataset (RGB + Gray)")
+    p.add_argument("--jsonl", type=str, required=True, help="Path to JSONL (points+labels per image)")
+    p.add_argument("--sam_dir", type=str, required=True, help="Directory of SAM masks per step: {sam_dir}/{stem}/{k}.png")
+    p.add_argument("--height", type=int, default=512)
+    p.add_argument("--width", type=int, default=512)
+    p.add_argument("--batch_size", type=int, default=16)
+    p.add_argument("--epochs", type=int, default=20)
+    p.add_argument("--save_every", type=int, default=1, help="Save checkpoint every N epochs")
+    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--weight_decay", type=float, default=1e-4)
+    p.add_argument("--arch", type=str, choices=["unet_s", "resnet18"], default="unet_s")
+    p.add_argument("--loss", type=str, choices=["ce", "kl", "mse"], default="kl")
+    p.add_argument("--sigma", type=float, default=3.0, help="Gaussian sigma for KL/MSE targets")
+    p.add_argument("--tau", type=float, default=1.0, help="Temperature for KL/model softmax")
+    p.add_argument("--amp", action="store_true")
+    p.add_argument("--workers", type=int, default=8)
+    p.add_argument("--out_dir", type=str, default="./outputs/seg_rl")
+    p.add_argument("--plots_dir", type=str, default=None, help="Directory to save loss/PCK plots; default under out_dir/plots")
+    p.add_argument("--pretrained", action="store_true")
+    p.add_argument("--resume", type=str, default=None)
+    p.add_argument("--eval_thresh", type=float, default=5.0, help="PCK threshold in pixels")
+    p.add_argument("--val_ratio", type=float, default=0.1, help="Validation split ratio from the full dataset")
+    p.add_argument("--test_ratio", type=float, default=0.0, help="Test split ratio from the full dataset")
+    p.add_argument("--seed", type=int, default=42, help="Random seed for splitting")
+    p.add_argument("--vis_mode", type=str, choices=["none", "sample", "all"], default="none", help="Visualization mode")
+    p.add_argument("--vis_count", type=int, default=16, help="When vis_mode=sample, number of samples to visualize")
+    p.add_argument("--vis_dir", type=str, default=None, help="Directory to save visualization images; default under out_dir/vis")
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    amp_enabled = args.amp and (device.type == "cuda")
+
+    os.makedirs(args.out_dir, exist_ok=True)
+    plots_dir = args.plots_dir or os.path.join(args.out_dir, "plots")
+    os.makedirs(plots_dir, exist_ok=True)
+    vis_dir = args.vis_dir or os.path.join(args.out_dir, "vis")
+    os.makedirs(vis_dir, exist_ok=True)
+
+    image_size = ImageSize(height=args.height, width=args.width)
+    # Load once to get length for splitting
+    full_ds_for_len = SamSequencePointDataset(args.jsonl, sam_dir=args.sam_dir, image_size=image_size, training=True)
+    n = len(full_ds_for_len)
+    assert 0.0 <= args.val_ratio < 1.0 and 0.0 <= args.test_ratio < 1.0 and args.val_ratio + args.test_ratio < 1.0, "Invalid split ratios"
+    n_test = int(round(n * args.test_ratio))
+    n_val = int(round(n * args.val_ratio))
+    n_train = n - n_val - n_test
+    g = torch.Generator()
+    g.manual_seed(args.seed)
+    perm = torch.randperm(n, generator=g).tolist()
+    idx_train = perm[:n_train]
+    idx_val = perm[n_train:n_train + n_val]
+    idx_test = perm[n_train + n_val:]
+
+    # Build datasets per split to control augmentation flag
+    train_base = SamSequencePointDataset(args.jsonl, sam_dir=args.sam_dir, image_size=image_size, training=True)
+    val_base = SamSequencePointDataset(args.jsonl, sam_dir=args.sam_dir, image_size=image_size, training=False) if n_val > 0 else None
+    test_base = SamSequencePointDataset(args.jsonl, sam_dir=args.sam_dir, image_size=image_size, training=False) if n_test > 0 else None
+
+    train_ds = Subset(train_base, idx_train)
+    val_ds = Subset(val_base, idx_val) if val_base is not None else None
+    test_ds = Subset(test_base, idx_test) if test_base is not None else None
+
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.workers, pin_memory=True, collate_fn=collate_fn)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True, collate_fn=collate_fn) if val_ds is not None else None
+    test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True, collate_fn=collate_fn) if test_ds is not None else None
+
+    cfg = ModelConfig(backbone=args.arch, pretrained=args.pretrained, in_channels=4)
+    model = PointHeatmapModel(cfg).to(device)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scaler = torch.amp.GradScaler(enabled=amp_enabled)
+
+    start_epoch = 0
+    global_step = 0
+    if args.resume and os.path.isfile(args.resume):
+        from .utils import load_checkpoint
+        ckpt = load_checkpoint(args.resume, model, optimizer, scaler)
+        start_epoch = ckpt.epoch
+        global_step = ckpt.step
+
+    history = {"train_loss": [], "val_pck": [], "test_pck": []}
+
+    def evaluate(loader: DataLoader | None, split_name: str) -> float:
+        if loader is None:
+            return float("nan")
+        model.eval()
+        total = 0
+        correct = 0
+        with torch.no_grad():
+            for batch in loader:
+                img = batch["image"].to(device, non_blocking=True)
+                tgt = batch["target_xy"].to(device, non_blocking=True)
+                logits, label_logits = model(img)
+                pred_xy = soft_argmax_from_logits(logits)
+                d = torch.linalg.norm(pred_xy - tgt, dim=1)
+                correct += (d <= args.eval_thresh).sum().item()
+                total += d.numel()
+        pck = correct / max(1, total)
+        print(f"{split_name} PCK@{args.eval_thresh}: {pck:.4f}")
+        return pck
+
+    def plot_curves():
+        try:
+            import matplotlib.pyplot as plt
+            import numpy as np
+            epochs_axis = np.arange(1, len(history["train_loss"]) + 1)
+            # Loss
+            plt.figure()
+            plt.plot(epochs_axis, history["train_loss"], label="train_loss")
+            plt.xlabel("Epoch")
+            plt.ylabel("Loss")
+            plt.legend()
+            plt.grid(True, ls=":", alpha=0.4)
+            plt.tight_layout()
+            plt.savefig(os.path.join(plots_dir, "loss.png"))
+            plt.close()
+            # PCK
+            plt.figure()
+            if any(not np.isnan(v) for v in history["val_pck"]):
+                plt.plot(epochs_axis, history["val_pck"], label="val_pck")
+            if any(not np.isnan(v) for v in history["test_pck"]):
+                plt.plot(epochs_axis, history["test_pck"], label="test_pck")
+            plt.xlabel("Epoch")
+            plt.ylabel(f"PCK@{args.eval_thresh}")
+            plt.legend()
+            plt.grid(True, ls=":", alpha=0.4)
+            plt.tight_layout()
+            plt.savefig(os.path.join(plots_dir, "pck.png"))
+            plt.close()
+        except Exception as e:
+            print(f"Plotting failed: {e}")
+
+    def visualize_dataset(loader: DataLoader | None, split_name: str):
+        if loader is None or args.vis_mode == "none":
+            return
+        model.eval()
+        import torchvision.transforms.functional as TF
+        import numpy as np
+        saved_images: List[Image.Image] = []
+        count = 0
+        max_count = args.vis_count if args.vis_mode == "sample" else float("inf")
+        with torch.no_grad():
+            for batch in loader:
+                img_t = batch["image_rgb"]  # [B,3,H,W] use RGB for visualization
+                tgt = batch["target_xy"]  # [B,2]
+                # Build 4ch input for the model: RGB + Gray
+                img4 = torch.cat([img_t.to(device), batch["image_gray"].to(device)], dim=1)
+                logits, label_logits = model(img4)
+                # ensure logits match image resolution for precise overlay
+                _, _, H_img, W_img = img_t.shape
+                if logits.shape[-2] != H_img or logits.shape[-1] != W_img:
+                    logits = torch.nn.functional.interpolate(logits, size=(H_img, W_img), mode="bilinear", align_corners=False)
+                # probability heatmap for stable visualization
+                bsz, _, H, W = logits.shape
+                probs = torch.softmax(logits.view(bsz, -1), dim=1).view(bsz, 1, H, W)
+                # compute soft-argmax pred on CPU for simplicity
+                pred_xy = soft_argmax_from_logits(logits).cpu()
+                for i in range(img_t.size(0)):
+                    if count >= max_count:
+                        break
+                    # unnormalize to [0,1] for visualization (ImageNet stats)
+                    mean = np.array([0.485, 0.456, 0.406]).reshape(3, 1, 1)
+                    std = np.array([0.229, 0.224, 0.225]).reshape(3, 1, 1)
+                    arr = img_t[i].cpu().float().numpy()
+                    arr = (arr * std + mean).clip(0.0, 1.0)
+                    pil_img = TF.to_pil_image(torch.from_numpy(arr))
+                    # overlay probability heatmap instead of raw logits
+                    hm = probs[i, 0].detach().cpu().float().numpy()
+                    # show base image in grayscale while keeping heatmap colored
+                    over = overlay_heatmap(pil_img.convert("L"), hm, alpha=0.5)
+                    # clamp coords to image bounds to ensure visibility
+                    h, w = img_t.size(-2), img_t.size(-1)
+                    gx = float(max(0.0, min(w - 1.0, float(tgt[i, 0]))))
+                    gy = float(max(0.0, min(h - 1.0, float(tgt[i, 1]))))
+                    px = float(max(0.0, min(w - 1.0, float(pred_xy[i, 0]))))
+                    py = float(max(0.0, min(h - 1.0, float(pred_xy[i, 1]))))
+                    # draw GT and Pred (GT + Pred both crosses; Pred is 45-degree red cross)
+                    over = draw_cross(over, (gx, gy), color=(0, 255, 0))
+                    over = draw_diagonal_cross(over, (px, py), color=(255, 0, 0), size=10)
+                    saved_images.append(over)
+                    count += 1
+                if count >= max_count:
+                    break
+        # save grid or per-sample
+        if args.vis_mode == "sample":
+            grid = make_grid(saved_images, cols=4)
+            grid.save(os.path.join(vis_dir, f"{split_name}_vis.png"))
+        else:  # all
+            split_dir = os.path.join(vis_dir, split_name)
+            os.makedirs(split_dir, exist_ok=True)
+            for i, img in enumerate(saved_images):
+                img.save(os.path.join(split_dir, f"{i:05d}.png"))
+
+    for epoch in range(start_epoch, args.epochs):
+        model.train()
+        running_loss = 0.0
+        for batch in train_loader:
+            img = batch["image"].to(device, non_blocking=True)
+            tgt = batch["target_xy"].to(device, non_blocking=True)
+
+            optimizer.zero_grad(set_to_none=True)
+            with torch.amp.autocast(device_type=device.type, enabled=amp_enabled):
+                logits, label_logits = model(img)
+                if args.loss == "ce":
+                    loss_hm = ce_over_pixels(logits, tgt)
+                elif args.loss == "kl":
+                    loss_hm = kl_to_gaussian_targets(logits, tgt, sigma=args.sigma, tau=args.tau)
+                else:
+                    loss_hm = mse_to_gaussian_targets(logits, tgt, sigma=args.sigma)
+                loss_label = nn.CrossEntropyLoss()(label_logits, batch["target_label"].to(device))
+                loss = loss_hm + 0.2 * loss_label
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            running_loss += loss.item()
+            global_step += 1
+
+        avg_loss = running_loss / max(1, len(train_loader))
+        history["train_loss"].append(avg_loss)
+        print(f"Epoch {epoch+1}/{args.epochs} - train loss: {avg_loss:.4f}")
+
+        # Validation
+        val_pck = evaluate(val_loader, "val") if val_loader is not None else float("nan")
+        history["val_pck"].append(val_pck)
+        test_pck = evaluate(test_loader, "test") if test_loader is not None else float("nan")
+        history["test_pck"].append(test_pck)
+
+        # plots
+        plot_curves()
+
+        # visualizations
+        if args.vis_mode != "none":
+            visualize_dataset(val_loader or train_loader, split_name="val_or_train")
+
+        # Save
+        if ((epoch + 1) % max(1, args.save_every)) == 0:
+            save_path = os.path.join(args.out_dir, f"model_epoch_{epoch+1}.pt")
+            save_checkpoint(save_path, model, optimizer, scaler, epoch=epoch+1, step=global_step)
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+```
+
+- 新增数据集 SamSequencePointDataset
+  - 遍历 JSONL 的每个样本 `image`，对 `points/labels` 的每个索引 i 生成一个训练样本。
+  - 第二张灰度输入：i=0 用全零图；i>0 从 `{sam_dir}/{stem}/{i-1}.png` 读取掩膜（不存在则回退零图）。
+  - 同步 resize 与翻转（对两图与坐标统一一次随机决策）。
+  - 输出 4 通道输入（RGB+Gray）、`target_xy`、`target_label`，并保留 `image_rgb/image_gray` 便于可视化。
+
+- 训练脚本改造
+  - 参数改为：
+    - --jsonl: JSON 路径（如 `datasets/.../segrl_pretrain_braintumour-251001.jsonl`）
+    - --sam_dir: SAM 掩膜序列根目录（如 `datasets/.../pretrain_gt_masks-251001`）
+  - 使用 `SamSequencePointDataset` 进行 train/val/test 划分与加载。
+  - 模型输入设为 4 通道；前向返回 `(heatmap_logits, label_logits)`。
+  - 损失：热图损失（CE/KL/MSE 三选一）+ 0.2×标签 CE。
+  - 评估 PCK：基于热图 soft-argmax 坐标；可视化叠加热力图。
+
+- RL 适配
+  - 已提供联合动作采样与概率接口：
+    - `sample_joint_label_cell_offset(...)`
+    - `log_prob_of_joint_action(...)`
+  - 用于 GRPO 时，动作可定义为 `(label, cell, subpixel)`，总 log_prob 为三者之和。
+
+你可以直接运行训练脚本示例：
+- 512×512 + KL 软目标
+```bash
+python -m seg-rl.heatmap.train \
+  --jsonl datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour-251001.jsonl \
+  --sam_dir datasets/seg_r1_md/Task01_BrainTumour/pretrain_gt_masks-251001 \
+  --height 512 --width 512 \
+  --arch unet_s \
+  --loss kl --sigma 6.0 --tau 1.0 \
+  --batch_size 16 --epochs 40 --amp \
+  --val_ratio 0.1 --test_ratio 0.1 --seed 42 \
+  --eval_thresh 5.0 --save_every 5 \
+  --out_dir output/seg_r1_md/Task01_BrainTumour/heatmap_train
+```
+
+- 评估输出
+  - 训练中保存 loss 曲线和 PCK 曲线到 `out_dir/plots`。
+  - 可选可视化到 `out_dir/vis`（按脚本已有参数控制）。
+
+如需把 test 集增加标签精度指标（label accuracy）或在可视化图上渲染标签，我可以继续补充。
+
+```shellscript
+python -m seg-rl.heatmap.train \
+  --jsonl datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour-251001.jsonl \
+  --sam_dir datasets/seg_r1_md/Task01_BrainTumour/pretrain_gt_masks-251001 \
+  --height 512 --width 512 \
+  --arch unet_s \
+  --loss kl --sigma 6.0 --tau 1.0 \
+  --batch_size 16 --epochs 40 --amp \
+  --val_ratio 0.1 --test_ratio 0.1 --seed 42 \
+  --eval_thresh 5.0 --save_every 5 \
+  --out_dir output/seg_r1_md/Task01_BrainTumour/heatmap_train
+```
 

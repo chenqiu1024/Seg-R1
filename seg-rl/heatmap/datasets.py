@@ -32,6 +32,7 @@ from PIL import Image
 import torch
 from torch.utils.data import Dataset
 import torchvision.transforms.functional as TF
+import os
 
 
 @dataclass
@@ -160,28 +161,26 @@ class JsonlPointDataset(Dataset):
                 print(f"[WARN] Line {line_num}: 'points' and 'labels' must have same length")
                 return False
             
-            # Find first positive point (label=1)
-            positive_point = None
-            for point, label in zip(points, labels):
-                if label == 1:
-                    if not isinstance(point, (list, tuple)) or len(point) != 2:
-                        print(f"[WARN] Line {line_num}: Invalid point format {point}")
-                        return False
-                    positive_point = point
-                    break
-                    
-            if positive_point is None:
-                print(f"[WARN] Line {line_num}: No positive points (label=1) found")
+            # Choose the first (point,label) pair deterministically
+            first_point = points[0]
+            first_label = labels[0]
+            if not isinstance(first_point, (list, tuple)) or len(first_point) != 2:
+                print(f"[WARN] Line {line_num}: Invalid point format {first_point}")
                 return False
-                
+            if first_label not in (0, 1):
+                print(f"[WARN] Line {line_num}: Invalid label value {first_label}, expected 0 or 1")
+                return False
             # Store in internal format
-            obj["_x"] = float(positive_point[0])
-            obj["_y"] = float(positive_point[1])
+            obj["_x"] = float(first_point[0])
+            obj["_y"] = float(first_point[1])
+            obj["_label"] = int(first_label)
             
         elif "x" in obj and "y" in obj:
             # Legacy format
             obj["_x"] = float(obj["x"])
             obj["_y"] = float(obj["y"])
+            # If legacy has label field, use it; else default to 1
+            obj["_label"] = int(obj.get("label", 1))
             
         else:
             print(f"[WARN] Line {line_num}: Missing coordinate data (need 'points'+'labels' or 'x'+'y')")
@@ -242,12 +241,14 @@ class JsonlPointDataset(Dataset):
 
         # Pack target as tensor [2]
         target_xy = torch.tensor([x, y], dtype=torch.float32)
+        target_label = torch.tensor(int(e.get("_label", 1)), dtype=torch.long)
 
         sample = {
             "image": image_pair,
             "image_rgb": image_t,
             "image_gray": cond_t,
             "target_xy": target_xy,
+            "target_label": target_label,
             "meta": {
                 "path": img_path,
                 "cond_path": cond_path,
@@ -260,8 +261,163 @@ class JsonlPointDataset(Dataset):
 
 def collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
     images = torch.stack([b["image"] for b in batch], dim=0)
-    targets = torch.stack([b["target_xy"] for b in batch], dim=0)
+    targets_xy = torch.stack([b["target_xy"] for b in batch], dim=0)
+    targets_label = torch.stack([b["target_label"] for b in batch], dim=0)
     metas = [b["meta"] for b in batch]
-    return {"image": images, "target_xy": targets, "meta": metas}
+    return {"image": images, "target_xy": targets_xy, "target_label": targets_label, "meta": metas}
+
+
+class SamSequencePointDataset(Dataset):
+    """Dataset for self-supervised heatmap training from segmentation sequences.
+
+    For each entry in JSONL containing fields:
+      {"image": "/path/img.jpg", "points": [[x,y], ...], "labels": [1,0,...]}
+
+    Generate one sample per index i in 0..len(points)-1:
+      - first input image: the image itself (RGB)
+      - second input image (gray):
+          i == 0  -> all-zero gray image
+          i > 0   -> load mask at {sam_dir}/{stem}/{i-1}.png
+      - target: (points[i], labels[i])
+
+    Notes:
+      - stem is derived from the image file name (without extension)
+      - both images are resized to the fixed ImageSize; flips are applied synchronously
+    """
+
+    def __init__(
+        self,
+        jsonl_path: str,
+        sam_dir: str,
+        image_size: ImageSize,
+        hflip_p: float = 0.5,
+        vflip_p: float = 0.0,
+        mean_rgb: Tuple[float, float, float] = (0.485, 0.456, 0.406),
+        std_rgb: Tuple[float, float, float] = (0.229, 0.224, 0.225),
+        mean_gray: float = 0.5,
+        std_gray: float = 0.5,
+        training: bool = True,
+    ) -> None:
+        super().__init__()
+        self.entries: List[Dict[str, object]] = []
+        with open(jsonl_path, "r", encoding="utf-8") as f:
+            for line_num, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                    if not isinstance(obj, dict):
+                        continue
+                    # minimal validation
+                    if "image" not in obj or "points" not in obj or "labels" not in obj:
+                        continue
+                    points = obj.get("points", [])
+                    labels = obj.get("labels", [])
+                    if not isinstance(points, list) or not isinstance(labels, list) or len(points) != len(labels) or len(points) == 0:
+                        continue
+                    self.entries.append(obj)
+                except Exception:
+                    continue
+
+        if len(self.entries) == 0:
+            raise ValueError(f"No valid entries found in {jsonl_path}")
+
+        self.sam_dir = os.path.abspath(sam_dir)
+        self.image_size = image_size
+        self.hflip_p = hflip_p
+        self.vflip_p = vflip_p
+        self.mean_rgb = mean_rgb
+        self.std_rgb = std_rgb
+        self.mean_gray = float(mean_gray)
+        self.std_gray = float(std_gray)
+        self.training = training
+
+        # Build (entry_idx, point_idx) index
+        self.index: List[Tuple[int, int]] = []
+        for ei, obj in enumerate(self.entries):
+            pts = obj.get("points", [])  # type: ignore
+            for i in range(len(pts)):
+                self.index.append((ei, i))
+
+    def __len__(self) -> int:
+        return len(self.index)
+
+    def _stem(self, path: str) -> str:
+        name = os.path.basename(path)
+        base, _ext = os.path.splitext(name)
+        return base
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        ei, pi = self.index[idx]
+        e = self.entries[ei]
+        assert isinstance(e, dict)
+        img_path = str(e["image"])  # absolute or relative
+        pts = e.get("points", [])  # type: ignore
+        labs = e.get("labels", [])  # type: ignore
+        point = pts[pi]
+        label = labs[pi]
+        x = float(point[0])
+        y = float(point[1])
+        label_int = int(label)
+
+        # load RGB image
+        image = Image.open(img_path).convert("RGB")
+        image = _ensure_rgb(image)
+
+        # build conditional gray image
+        if pi == 0:
+            cond_img = Image.new("L", (image.width, image.height), color=0)
+        else:
+            stem = self._stem(img_path)
+            mask_path = os.path.join(self.sam_dir, stem, f"{pi - 1}.png")
+            try:
+                cond_img = Image.open(mask_path).convert("L")
+            except Exception:
+                cond_img = Image.new("L", (image.width, image.height), color=0)
+
+        # Resize and coordinate scaling (use RGB image as reference for scaling)
+        image, (x, y) = _resize_with_coords(image, (x, y), self.image_size)
+        cond_img = cond_img.resize((self.image_size.width, self.image_size.height), resample=Image.NEAREST)
+
+        # Synchronized flips
+        if self.training:
+            do_h = (np.random.rand() < self.hflip_p)
+            do_v = (np.random.rand() < self.vflip_p)
+            if do_h:
+                w, _ = image.size
+                image = image.transpose(Image.FLIP_LEFT_RIGHT)
+                cond_img = cond_img.transpose(Image.FLIP_LEFT_RIGHT)
+                x = (w - 1) - x
+            if do_v:
+                _, h = image.size
+                image = image.transpose(Image.FLIP_TOP_BOTTOM)
+                cond_img = cond_img.transpose(Image.FLIP_TOP_BOTTOM)
+                y = (h - 1) - y
+
+        # To tensor and normalize
+        image_t = TF.to_tensor(image)
+        image_t = TF.normalize(image_t, mean=self.mean_rgb, std=self.std_rgb)
+        cond_t = TF.to_tensor(cond_img)
+        cond_t = (cond_t - self.mean_gray) / max(self.std_gray, 1e-6)
+        image_pair = torch.cat([image_t, cond_t], dim=0)
+
+        target_xy = torch.tensor([x, y], dtype=torch.float32)
+        target_label = torch.tensor(label_int, dtype=torch.long)
+
+        sample = {
+            "image": image_pair,
+            "image_rgb": image_t,
+            "image_gray": cond_t,
+            "target_xy": target_xy,
+            "target_label": target_label,
+            "meta": {
+                "path": img_path,
+                "height": self.image_size.height,
+                "width": self.image_size.width,
+                "step_idx": pi,
+            },
+        }
+        return sample
 
 

@@ -39,6 +39,21 @@ class HeatmapHead(nn.Module):
         return self.head(x)
 
 
+class LabelHead(nn.Module):
+    def __init__(self, in_channels: int, mid_channels: int = 256, num_classes: int = 2) -> None:
+        super().__init__()
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Conv2d(in_channels, mid_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(mid_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid_channels, num_classes, kernel_size=1, bias=True),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.pool(x)
+        return self.fc(x).flatten(1)
+
 class DoubleConv(nn.Module):
     def __init__(self, in_ch: int, out_ch: int) -> None:
         super().__init__()
@@ -70,6 +85,7 @@ class UNetSmall(nn.Module):
     def __init__(self, in_channels: int = 3, base_ch: int = 64) -> None:
         super().__init__()
         c1, c2, c3, c4 = base_ch, base_ch * 2, base_ch * 4, base_ch * 8
+        self.out_ch = c1
         self.enc1 = DoubleConv(in_channels, c1)
         self.enc2 = DoubleConv(c1, c2)
         self.enc3 = DoubleConv(c2, c3)
@@ -101,6 +117,8 @@ class UNetSmall(nn.Module):
         d1 = self.up1(d2)
         d1 = torch.cat([d1, e1], dim=1)
         d1 = self.dec1(d1)
+        # expose last decoder feature for classification head
+        self.last_dec = d1
         return self.final(d1)
 
 
@@ -138,28 +156,37 @@ class PointHeatmapModel(nn.Module):
             self.layer4 = base.layer4  # stride 32
             in_channels = 512
             self.head = HeatmapHead(in_channels)
+            self.label_head = LabelHead(in_channels)
             self._is_unet = False
         elif cfg.backbone == "unet_s":
             self.unet = UNetSmall(in_channels=cfg.in_channels, base_ch=64)
+            self.label_head_unet = LabelHead(self.unet.out_ch)
             self._is_unet = True
         else:
             raise ValueError(f"Unsupported backbone: {cfg.backbone}")
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         b, c, h, w = x.shape
         if getattr(self, "_is_unet", False):
             logits = self.unet(x)
-            return logits
+            # use last decoder feature for label
+            feat = getattr(self.unet, "last_dec", None)
+            if feat is None:
+                # fallback to using input averaged with logits if feature missing
+                feat = x
+            label_logits = self.label_head_unet(feat)
+            return logits, label_logits
         x = self.stem(x)
         x = self.layer1(x)
         x = self.layer2(x)
         x = self.layer3(x)
         x = self.layer4(x)
         logits_low = self.head(x)  # [B,1,h',w']
+        label_logits = self.label_head(x)  # [B,2]
         if self.cfg.upsample_to_input:
             logits = F.interpolate(logits_low, size=(h, w), mode="bilinear", align_corners=False)
-            return logits
-        return logits_low
+            return logits, label_logits
+        return logits_low, label_logits
 
 
 def argmax_from_logits(logits: torch.Tensor) -> torch.Tensor:
@@ -285,4 +312,77 @@ def log_prob_of_action(
     sub_logp = torch.log_softmax(within_logits, dim=1).gather(1, sub_idx.view(B, 1)).squeeze(1)
 
     return cell_logp + sub_logp
+
+
+# ==========================
+# 联合策略：标签 + cell + cell内子像素
+# 提供采样与log_prob计算，便于GRPO等算法直接使用
+# ==========================
+
+@torch.no_grad()
+def sample_joint_label_cell_offset(
+    logits: torch.Tensor,
+    label_logits: torch.Tensor,
+    stride: int,
+    temperature_pixel: float = 1.0,
+    temperature_label: float = 1.0,
+) -> dict:
+    """Sample a joint action (label, cell, subpixel) and return combined log_prob.
+
+    Args:
+        logits: [B,1,H,W] heatmap logits over pixels
+        label_logits: [B,2] binary label logits
+        stride: cell stride size (pixels)
+        temperature_pixel: temperature for pixel distribution
+        temperature_label: temperature for label distribution
+    Returns:
+        dict with keys:
+          - label_idx: [B]
+          - cell_idx, cell_ij, sub_idx, sub_ij, pixel_xy, offset (same as sample_cell_and_offset)
+          - log_prob_label: [B]
+          - log_prob_pixel: [B]  (cell + sub)
+          - log_prob: [B]        (sum)
+          - grid_hw, stride
+    """
+    T_label = max(temperature_label, 1e-6)
+    label_dist = torch.distributions.Categorical(logits=label_logits / T_label)
+    label_idx = label_dist.sample()
+    logp_label = label_dist.log_prob(label_idx)
+
+    pixel = sample_cell_and_offset(logits, stride=stride, temperature=temperature_pixel)
+    logp_pixel = pixel["log_prob"]
+
+    out = dict(pixel)
+    out["label_idx"] = label_idx
+    out["log_prob_label"] = logp_label
+    out["log_prob_pixel"] = logp_pixel
+    out["log_prob"] = logp_label + logp_pixel
+    return out
+
+
+def log_prob_of_joint_action(
+    logits: torch.Tensor,
+    label_logits: torch.Tensor,
+    stride: int,
+    label_idx: torch.Tensor,
+    cell_idx: torch.Tensor,
+    sub_idx: torch.Tensor,
+    temperature_pixel: float = 1.0,
+    temperature_label: float = 1.0,
+) -> torch.Tensor:
+    """Compute log_prob(label) + log_prob(cell) + log_prob(sub|cell) for a given action."""
+    # label term
+    T_label = max(temperature_label, 1e-6)
+    ll = torch.log_softmax(label_logits / T_label, dim=1)
+    logp_label = ll.gather(1, label_idx.view(-1, 1)).squeeze(1)
+
+    # pixel terms
+    logp_pixel = log_prob_of_action(
+        logits=logits,
+        stride=stride,
+        cell_idx=cell_idx,
+        sub_idx=sub_idx,
+        temperature=temperature_pixel,
+    )
+    return logp_label + logp_pixel
 
