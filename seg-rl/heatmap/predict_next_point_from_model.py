@@ -30,22 +30,20 @@ Modes:
 
 Examples:
   # Initial generation
-  python -m seg-rl.heatmap.predict_next_point_from_model \
-    --model_path /path/to/ckpt.pt \
+  /opt/anaconda3/envs/seg-r1/bin/python -m seg-rl.heatmap.predict_next_point_from_model \
+    --model_path outputs/braintumour/points_predictor-251001-50epochs.pt \
     --images_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/images \
-    --sam_dir datasets/seg_r1_md/Task01_BrainTumour/pretrain_gt_masks-251001 \
-    --output_json datasets/seg_r1_md/Task01_BrainTumour/pred_points-init.json
+    --masks_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/masks \
+    --output_json datasets/seg_r1_md/Task01_BrainTumour/pred_points-251001.jsonl
 
   # Append mode
-  python -m seg-rl.heatmap.predict_next_point_from_model \
-    --model_path /path/to/ckpt.pt \
-    --appendto_json datasets/seg_r1_md/Task01_BrainTumour/pred_points-init.json \
-    --sam_dir datasets/seg_r1_md/Task01_BrainTumour/pretrain_gt_masks-251001
+  /opt/anaconda3/envs/seg-r1/bin/python -m seg-rl.heatmap.predict_next_point_from_model \
+    --model_path outputs/braintumour/points_predictor-251001-50epochs.pt \
+    --appendto_json datasets/seg_r1_md/Task01_BrainTumour/pred_points-251001.jsonl
 
   # Debug visualization only
-  python -m seg-rl.heatmap.predict_next_point_from_model \
-    --debug_json datasets/seg_r1_md/Task01_BrainTumour/pred_points-init.json \
-    --sam_dir datasets/seg_r1_md/Task01_BrainTumour/pretrain_gt_masks-251001 \
+  /opt/anaconda3/envs/seg-r1/bin/python -m seg-rl.heatmap.predict_next_point_from_model \
+    --debug_json datasets/seg_r1_md/Task01_BrainTumour/pred_points-init.jsonl \
     --debug_output_dir output/braintumour/dbg_model_pred
 
 Notes:
@@ -59,7 +57,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Callable
 
 import numpy as np
 from PIL import Image
@@ -79,14 +77,31 @@ except Exception:
         _sys.path.insert(0, _pkg_root)
     from heatmap.model import ModelConfig, PointHeatmapModel, soft_argmax_from_logits
 
-try:
-    # reuse annotator visualization helper if available
-    from seg_rl.annotator.gen_point_jsonl_from_masks import _render_diff_panels_with_point  # type: ignore
-except Exception:
+import importlib.util as _importlib_util
+
+def _import_render_helper() -> Optional[Callable]:
+    """Dynamically import _render_diff_panels_with_point from annotator script by file path.
+
+    This avoids package-name issues due to hyphen in 'seg-rl'.
+    """
     try:
-        from seg-rl.annotator.gen_point_jsonl_from_masks import _render_diff_panels_with_point  # type: ignore
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # seg-rl
+        target = os.path.join(base_dir, "annotator", "gen_point_jsonl_from_masks.py")
+        if not os.path.isfile(target):
+            return None
+        spec = _importlib_util.spec_from_file_location("gen_point_jsonl_from_masks", target)
+        if spec is None or spec.loader is None:
+            return None
+        module = _importlib_util.module_from_spec(spec)
+        spec.loader.exec_module(module)  # type: ignore[attr-defined]
+        func = getattr(module, "_render_diff_panels_with_point", None)
+        if callable(func):
+            return func  # type: ignore[return-value]
     except Exception:
-        _render_diff_panels_with_point = None  # type: ignore
+        return None
+    return None
+
+_render_diff_panels_with_point: Optional[Callable] = _import_render_helper()
 
 
 def parse_args() -> argparse.Namespace:
@@ -98,7 +113,8 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--model_path", type=str, required=False, help="Path to trained model checkpoint (.pt)")
     p.add_argument("--images_dir", type=str, default=None, help="Directory of input images (initial mode)")
-    p.add_argument("--sam_dir", type=str, required=True, help="Directory of predicted SAM masks per step: {sam_dir}/{stem}/{k}.png")
+    p.add_argument("--masks_dir", type=str, default=None, help="Ground-truth masks directory (initial mode only, to fill 'gt_mask' field)")
+    p.add_argument("--sam_dir", type=str, default=None, help="Directory of predicted SAM masks per step: {sam_dir}/{stem}/{k}.png (initial/debug mode)")
     p.add_argument("--height", type=int, default=512)
     p.add_argument("--width", type=int, default=512)
     p.add_argument("--tau", type=float, default=1.0, help="Softmax temperature for heatmap -> probability")
@@ -176,6 +192,8 @@ def _stem(path: str) -> str:
 def run_initial(args: argparse.Namespace) -> None:
     if not args.images_dir or not args.output_json:
         raise RuntimeError("--images_dir and --output_json are required for initial mode")
+    if not args.masks_dir:
+        raise RuntimeError("--masks_dir is required for initial mode to fill 'gt_mask' field")
     device, amp_enabled, autocast_device_type = _device_and_amp(args)
     model = _load_model(args.model_path, device)
     H, W = int(args.height), int(args.width)
@@ -195,12 +213,18 @@ def run_initial(args: argparse.Namespace) -> None:
         x4 = _to_tensor_4ch(img_path, gray_mask=None, out_hw=(H, W))
         with torch.amp.autocast(device_type=autocast_device_type, enabled=amp_enabled):
             x, y, lab = _predict_point(model, x4, device, args.tau)
+        stem = _stem(img_path)
+        gt_mask_path = os.path.join(args.masks_dir, f"{stem}.png")
         rec = {
             "image": os.path.abspath(img_path),
-            "sam_masks_dir": os.path.abspath(args.sam_dir),
+            "gt_mask": os.path.abspath(gt_mask_path),
+            "sam_masks_dir": os.path.abspath(args.sam_dir) if args.sam_dir else None,
             "points": [[float(x), float(y)]],
             "labels": [int(lab)],
         }
+        # keep sam_masks_dir only if provided
+        if rec["sam_masks_dir"] is None:
+            del rec["sam_masks_dir"]
         records.append(rec)
 
     os.makedirs(os.path.dirname(args.output_json) or ".", exist_ok=True)
@@ -222,11 +246,20 @@ def run_append(args: argparse.Namespace) -> None:
     H, W = int(args.height), int(args.width)
 
     updated = 0
+    # progress bar
+    rec_iter = arr
+    pbar = None
+    if args.progress:
+        try:
+            from tqdm import tqdm  # type: ignore
+            pbar = tqdm(total=len(arr), desc="Append predict")
+        except Exception:
+            pbar = None
     for rec in arr:
         if not isinstance(rec, dict):
             continue
         img_path = rec.get("image")
-        sam_dir = rec.get("sam_masks_dir") or args.sam_dir
+        sam_dir = rec.get("sam_masks_dir")
         pts = rec.get("points", [])
         labs = rec.get("labels", [])
         if not img_path:
@@ -244,9 +277,15 @@ def run_append(args: argparse.Namespace) -> None:
             x, y, lab = _predict_point(model, x4, device, args.tau)
         rec["points"] = (pts or []) + [[float(x), float(y)]]
         rec["labels"] = (labs or []) + [int(lab)]
-        if not rec.get("sam_masks_dir"):
-            rec["sam_masks_dir"] = os.path.abspath(args.sam_dir)
+        # sam_masks_dir should be set by external segmenter; do not inject here
         updated += 1
+        if pbar is not None:
+            pbar.update(1)
+        elif updated % max(1, len(arr)//10 or 1) == 0:
+            print(f"Processed {updated}/{len(arr)} records")
+
+    if pbar is not None:
+        pbar.close()
 
     with open(args.appendto_json, "w", encoding="utf-8") as f:
         json.dump(arr, f, indent=2, ensure_ascii=False)
@@ -264,6 +303,24 @@ def run_debug(args: argparse.Namespace) -> None:
     os.makedirs(args.debug_output_dir, exist_ok=True)
 
     num_generated = 0
+    # optional progress over total steps
+    total_steps = 0
+    if args.progress:
+        try:
+            for rec in arr:
+                if isinstance(rec, dict):
+                    pts = rec.get("points", []) if isinstance(rec.get("points", []), list) else []
+                    total_steps += len(pts)
+        except Exception:
+            total_steps = 0
+    pbar = None
+    if args.progress and total_steps > 0:
+        try:
+            from tqdm import tqdm  # type: ignore
+            pbar = tqdm(total=total_steps, desc="Debug render")
+        except Exception:
+            pbar = None
+
     for rec in arr:
         if not isinstance(rec, dict):
             continue
@@ -296,6 +353,10 @@ def run_debug(args: argparse.Namespace) -> None:
             if _render_diff_panels_with_point is not None and out_path is not None:
                 _render_diff_panels_with_point(prev_u8, cur_u8, (float(pt[0]), float(pt[1])), int(lb), out_path)
                 num_generated += 1
+            if pbar is not None:
+                pbar.update(1)
+    if pbar is not None:
+        pbar.close()
     print(f"Generated debug images for {num_generated} steps into {args.debug_output_dir}")
 
 
