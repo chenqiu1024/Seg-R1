@@ -275,90 +275,112 @@ def largest_diff_component_representative(A, B, connectivity=2, min_area=0, dbg_
     D = distance_transform_edt(comp)
     (centroidY, centroidX) = np.unravel_index(np.argmax(D), D.shape)
 
-    # 调试可视化
+    # 调试可视化（改用统一的渲染函数，保持风格一致）
     if dbg_out_path:
         try:
-            h, w = A.shape[:2]
-            # Panel 1: A/B overlay (A=green, B=red)
-            overlay1 = np.zeros((h, w, 3), dtype=np.uint8)
-            overlay1[..., 1] = (A > 0).astype(np.uint8) * 255  # G
-            overlay1[..., 2] = (B > 0).astype(np.uint8) * 255  # R
-            bg = np.zeros_like(overlay1)
-            panel1 = cv2.addWeighted(bg, 1.0, overlay1, 0.6, 0.0)
-
-            # Panel 2: signed diff C (positive green, negative red)
-            C = A.astype(np.int8) - B.astype(np.int8)
-            panel2 = np.zeros((h, w, 3), dtype=np.uint8)
-            pos = (C > 0)
-            neg = (C < 0)
-            panel2[pos, 1] = 255
-            panel2[neg, 2] = 255
-
-            # Panel 3: connected components colored + final X marker
-            panel3 = np.zeros((h, w, 3), dtype=np.uint8)
-            # Color positive comps
-            for sgn, mask in ((1, C > 0), (-1, C < 0)):
-                if not mask.any():
-                    continue
-                lab, n = label(mask, structure=np.ones((3,3), dtype=np.uint8) if connectivity == 2 else np.array([[0,1,0],[1,1,1],[0,1,0]], dtype=np.uint8))
-                if n == 0:
-                    continue
-                # generate distinct vivid colors
-                rng = np.random.default_rng(12345 if sgn > 0 else 54321)
-                colors = (rng.integers(0, 256, size=(n, 3))).astype(np.uint8)
-                colors = np.clip(colors + 100, 0, 255)  # brighten
-                for i in range(1, n + 1):
-                    panel3[lab == i] = colors[i - 1]
-
-            # draw marker at centroid: foreground -> caret '^', background -> 'X'
-            cx, cy = int(round(centroidX)), int(round(centroidY))
-            # outline black then white (match viz script style)
-            def _draw_cross(img, x, y, size=6, color=(255,255,255), thickness=2):
-                cv2.line(img, (x - size, y - size), (x + size, y + size), (0,0,0), thickness + 2, lineType=cv2.LINE_AA)
-                cv2.line(img, (x - size, y + size), (x + size, y - size), (0,0,0), thickness + 2, lineType=cv2.LINE_AA)
-                cv2.line(img, (x - size, y - size), (x + size, y + size), color, thickness, lineType=cv2.LINE_AA)
-                cv2.line(img, (x - size, y + size), (x + size, y - size), color, thickness, lineType=cv2.LINE_AA)
-            def _draw_caret(img, x, y, size=6, color=(255,255,255), thickness=2):
-                p_top = (int(x), int(y - size))
-                p_left = (int(x - size), int(y + size))
-                p_right = (int(x + size), int(y + size))
-                # outline
-                cv2.line(img, p_left, p_top, (0,0,0), thickness + 2, lineType=cv2.LINE_AA)
-                cv2.line(img, p_right, p_top, (0,0,0), thickness + 2, lineType=cv2.LINE_AA)
-                # stroke
-                cv2.line(img, p_left, p_top, color, thickness, lineType=cv2.LINE_AA)
-                cv2.line(img, p_right, p_top, color, thickness, lineType=cv2.LINE_AA)
-
-            if int(sign) > 0:
-                _draw_caret(panel3, cx, cy, size=6, color=(255,255,255), thickness=2)
-            else:
-                _draw_cross(panel3, cx, cy, size=6, color=(255,255,255), thickness=2)
-
-            # Add panel titles for clarity
-            def _add_title(img: np.ndarray, text: str) -> None:
-                band_h = max(20, min(48, img.shape[0] // 20))
-                roi = img[0:band_h, :, :]
-                overlay = roi.copy()
-                cv2.rectangle(overlay, (0, 0), (img.shape[1] - 1, band_h - 1), (0, 0, 0), thickness=-1)
-                cv2.addWeighted(overlay, 0.5, roi, 0.5, 0, dst=roi)
-                # outlined text
-                org = (8, band_h - 6)
-                cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, lineType=cv2.LINE_AA)
-                cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, lineType=cv2.LINE_AA)
-
-            _add_title(panel1, "Overlay A (green) vs B (red)")
-            _add_title(panel2, "Signed diff C: + (green), - (red)")
-            _add_title(panel3, "Components + selected X")
-
-            # concat panels
-            canvas = np.concatenate([panel1, panel2, panel3], axis=1)
-            os.makedirs(os.path.dirname(dbg_out_path) or ".", exist_ok=True)
-            # from PIL import Image as _PIL
-            _PIL.fromarray(canvas[..., ::-1]).save(dbg_out_path)  # BGR->RGB flip
-        except Exception as _:
+            _render_diff_panels_with_point(
+                A=A,
+                B=B,
+                point_xy=(float(centroidX), float(centroidY)),
+                label=1 if int(sign) > 0 else 0,
+                dbg_out_path=dbg_out_path,
+                connectivity=connectivity,
+            )
+        except Exception:
             pass
 
     return dict(sign=sign, area=area, y=int(centroidY), x=int(centroidX), max_radius=float(D[centroidY, centroidX]))
+
+
+def _render_diff_panels_with_point(
+    A: np.ndarray,
+    B: np.ndarray,
+    point_xy: Tuple[float, float],
+    label: int,
+    dbg_out_path: Optional[str],
+    connectivity: int = 2,
+) -> None:
+    """Render 3-panel debug image reusing the visualization style in
+    largest_diff_component_representative, but mark a provided point instead of
+    the recomputed centroid.
+    - Panel 1: A (green) vs B (red) overlay
+    - Panel 2: signed diff C (positive green, negative red)
+    - Panel 3: connected components colored, with marker at point_xy
+    """
+    try:
+        if dbg_out_path is None:
+            return
+        h, w = A.shape[:2]
+        # Panel 1: A/B overlay (A=green, B=red)
+        overlay1 = np.zeros((h, w, 3), dtype=np.uint8)
+        overlay1[..., 1] = (A > 0).astype(np.uint8) * 255  # G
+        overlay1[..., 2] = (B > 0).astype(np.uint8) * 255  # R
+        bg = np.zeros_like(overlay1)
+        panel1 = cv2.addWeighted(bg, 1.0, overlay1, 0.6, 0.0)
+
+        # Panel 2: signed diff C (positive green, negative red)
+        C = A.astype(np.int8) - B.astype(np.int8)
+        panel2 = np.zeros((h, w, 3), dtype=np.uint8)
+        pos = (C > 0)
+        neg = (C < 0)
+        panel2[pos, 1] = 255
+        panel2[neg, 2] = 255
+
+        # Panel 3: connected components colored + provided point marker
+        panel3 = np.zeros((h, w, 3), dtype=np.uint8)
+        st = np.ones((3,3), dtype=np.uint8) if connectivity == 2 else np.array([[0,1,0],[1,1,1],[0,1,0]], dtype=np.uint8)
+        for sgn, mask in ((1, C > 0), (-1, C < 0)):
+            if not mask.any():
+                continue
+            lab, n = label(mask, structure=st)
+            if n == 0:
+                continue
+            rng = np.random.default_rng(12345 if sgn > 0 else 54321)
+            colors = (rng.integers(0, 256, size=(n, 3))).astype(np.uint8)
+            colors = np.clip(colors + 100, 0, 255)
+            for i in range(1, n + 1):
+                panel3[lab == i] = colors[i - 1]
+
+        # draw marker at provided (x,y): foreground -> caret '^', background -> 'X'
+        cx = int(round(float(point_xy[0])))
+        cy = int(round(float(point_xy[1])))
+        def _draw_cross(img, x, y, size=6, color=(255,255,255), thickness=2):
+            cv2.line(img, (x - size, y - size), (x + size, y + size), (0,0,0), thickness + 2, lineType=cv2.LINE_AA)
+            cv2.line(img, (x - size, y + size), (x + size, y - size), (0,0,0), thickness + 2, lineType=cv2.LINE_AA)
+            cv2.line(img, (x - size, y - size), (x + size, y + size), color, thickness, lineType=cv2.LINE_AA)
+            cv2.line(img, (x - size, y + size), (x + size, y - size), color, thickness, lineType=cv2.LINE_AA)
+        def _draw_caret(img, x, y, size=6, color=(255,255,255), thickness=2):
+            p_top = (int(x), int(y - size))
+            p_left = (int(x - size), int(y + size))
+            p_right = (int(x + size), int(y + size))
+            cv2.line(img, p_left, p_top, (0,0,0), thickness + 2, lineType=cv2.LINE_AA)
+            cv2.line(img, p_right, p_top, (0,0,0), thickness + 2, lineType=cv2.LINE_AA)
+            cv2.line(img, p_left, p_top, color, thickness, lineType=cv2.LINE_AA)
+            cv2.line(img, p_right, p_top, color, thickness, lineType=cv2.LINE_AA)
+        if int(label) > 0:
+            _draw_caret(panel3, cx, cy, size=6, color=(255,255,255), thickness=2)
+        else:
+            _draw_cross(panel3, cx, cy, size=6, color=(255,255,255), thickness=2)
+
+        # Titles
+        def _add_title(img: np.ndarray, text: str) -> None:
+            band_h = max(20, min(48, img.shape[0] // 20))
+            roi = img[0:band_h, :, :]
+            overlay = roi.copy()
+            cv2.rectangle(overlay, (0, 0), (img.shape[1] - 1, band_h - 1), (0, 0, 0), thickness=-1)
+            cv2.addWeighted(overlay, 0.5, roi, 0.5, 0, dst=roi)
+            org = (8, band_h - 6)
+            cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, lineType=cv2.LINE_AA)
+            cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, lineType=cv2.LINE_AA)
+        _add_title(panel1, "Overlay A (green) vs B (red)")
+        _add_title(panel2, "Signed diff C: + (green), - (red)")
+        _add_title(panel3, "Components + selected point")
+
+        canvas = np.concatenate([panel1, panel2, panel3], axis=1)
+        os.makedirs(os.path.dirname(dbg_out_path) or ".", exist_ok=True)
+        _PIL.fromarray(canvas[..., ::-1]).save(dbg_out_path)
+    except Exception:
+        pass
 
 def find_corresponding_image(
     images_dir: str,
@@ -445,39 +467,40 @@ def main() -> None:
             if not isinstance(rec, dict):
                 continue
             image_path = rec.get("image")
-            gt_mask_path = rec.get("gt_mask")
             sam_masks_dir = rec.get("sam_masks_dir")
-            if not (image_path and gt_mask_path and sam_masks_dir):
+            points = rec.get("points", [])
+            labels = rec.get("labels", [])
+            if not (image_path and sam_masks_dir and isinstance(points, list) and isinstance(labels, list)):
                 continue
-            # For each numeric mask under sam_masks_dir/<stem>/, iterate k over existing masks except the max
-            sample_stem = stem(gt_mask_path)
-            candidate_dir = os.path.join(sam_masks_dir, sample_stem)
-            if not os.path.isdir(candidate_dir):
+            if len(points) != len(labels):
                 continue
-            # Collect numeric mask indices
-            numeric_indices = []
-            for name in os.listdir(candidate_dir):
-                if not name.lower().endswith('.png'):
-                    continue
-                s = os.path.splitext(name)[0]
+            sample_stem = stem(image_path)
+            # Load gt as all-zero array to preserve panel structure; we visualize differences of predicted masks only
+            for i, (pt, lb) in enumerate(zip(points, labels)):
+                # For step i, compare masks of step i and i-1 (i==0 uses empty prev)
                 try:
-                    k = int(s)
+                    cur_path = os.path.join(sam_masks_dir, sample_stem, f"{i}.png")
+                    cur = np.array(_PIL.open(to_abs(cur_path)).convert("L"), dtype=np.uint8) if os.path.isfile(cur_path) else None
                 except Exception:
+                    cur = None
+                if cur is None:
                     continue
-                numeric_indices.append(k)
-            if not numeric_indices:
-                continue
-            numeric_indices = sorted(set(numeric_indices))
-            if len(numeric_indices) <= 1:
-                continue
-            # For each k except max, call calculate_next_point with current_points_len = k + 1
-            for k in numeric_indices[:-1]:
-                _ = calculate_next_point(
-                    gt_mask_path,
-                    sam_masks_dir,
-                    k + 1,
-                    dbg_out_dir=args.debug_output_dir,
-                )
+                if i == 0:
+                    prev = np.zeros_like(cur, dtype=np.uint8)
+                else:
+                    try:
+                        prev_path = os.path.join(sam_masks_dir, sample_stem, f"{i-1}.png")
+                        prev = np.array(_PIL.open(to_abs(prev_path)).convert("L"), dtype=np.uint8) if os.path.isfile(prev_path) else np.zeros_like(cur, dtype=np.uint8)
+                    except Exception:
+                        prev = np.zeros_like(cur, dtype=np.uint8)
+                # Render panels with provided point
+                try:
+                    subdir = os.path.join(args.debug_output_dir, sample_stem)
+                    os.makedirs(subdir, exist_ok=True)
+                    dbg_path = os.path.join(subdir, f"dbg_{i}.png")
+                except Exception:
+                    dbg_path = None
+                _render_diff_panels_with_point(prev, cur, (float(pt[0]), float(pt[1])), int(lb), dbg_path)
                 num_generated += 1
         print(f"Generated debug images for {num_generated} steps into {args.debug_output_dir}")
         return
