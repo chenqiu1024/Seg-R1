@@ -57,6 +57,8 @@ except ImportError:  # allow running as a script without package context
   --sam_dir datasets/seg_r1_md/Task01_BrainTumour/pretrain_gt_masks-251001 \
   --height 512 --width 512 --arch unet_s \
   --loss kl --sigma 6.0 --tau 1.0 \
+  --eval_thresh 10.0 \
+  --label_loss_weight 0.3 \
   --batch_size 16 --epochs 50 --amp \
   --val_ratio 0.1 --test_ratio 0.1 --seed 42 \
   --save_every 1 --save_steps 500 --progress --auto_resume \
@@ -94,6 +96,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--loss", type=str, choices=["ce", "kl", "mse"], default="kl")
     p.add_argument("--sigma", type=float, default=3.0, help="Gaussian sigma for KL/MSE targets")
     p.add_argument("--tau", type=float, default=1.0, help="Temperature for KL/model softmax")
+    p.add_argument("--label_loss_weight", type=float, default=0.2, help="Weight for label CE in total loss (recommended: 0.1~0.3)")
     p.add_argument("--amp", action="store_true")
     p.add_argument("--workers", type=int, default=8)
     p.add_argument("--out_dir", type=str, default="./outputs/seg_rl")
@@ -160,7 +163,7 @@ def main() -> None:
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True, collate_fn=collate_fn) if val_ds is not None else None
     test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True, collate_fn=collate_fn) if test_ds is not None else None
 
-    cfg = ModelConfig(backbone=args.arch, pretrained=args.pretrained, in_channels=4)
+    cfg = ModelConfig(backbone=args.arch, pretrained=args.pretrained, main_in_channels=3, cond_in_channels=1)
     model = PointHeatmapModel(cfg).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -197,7 +200,9 @@ def main() -> None:
             for batch in loader:
                 img = batch["image"].to(device, non_blocking=True)
                 tgt = batch["target_xy"].to(device, non_blocking=True)
-                logits, label_logits = model(img)
+                main_img = img[:, :3]
+                cond_img = img[:, 3:4]
+                logits, label_logits = model(main_img, cond=cond_img)
                 pred_xy = soft_argmax_from_logits(logits)
                 d = torch.linalg.norm(pred_xy - tgt, dim=1)
                 correct += (d <= args.eval_thresh).sum().item()
@@ -316,7 +321,9 @@ def main() -> None:
 
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type=autocast_device_type, enabled=amp_enabled):
-                logits, label_logits = model(img)
+                main_img = img[:, :3]
+                cond_img = img[:, 3:4]
+                logits, label_logits = model(main_img, cond=cond_img)
                 if args.loss == "ce":
                     loss_hm = ce_over_pixels(logits, tgt)
                 elif args.loss == "kl":
@@ -324,7 +331,7 @@ def main() -> None:
                 else:
                     loss_hm = mse_to_gaussian_targets(logits, tgt, sigma=args.sigma)
                 loss_label = nn.CrossEntropyLoss()(label_logits, batch["target_label"].to(device))
-                loss = loss_hm + 0.2 * loss_label
+                loss = loss_hm + float(args.label_loss_weight) * loss_label
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()

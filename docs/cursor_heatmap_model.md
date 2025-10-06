@@ -1,5 +1,5 @@
 # 有监督学习任务的网络模型设计
-_Exported on 10/5/2025 at 00:41:57 PDT from Cursor (1.7.33)_
+_Exported on 10/6/2025 at 01:15:54 PDT from Cursor (1.7.33)_
 
 ---
 
@@ -4035,4 +4035,7447 @@ python -m seg-rl.heatmap.train \
   --eval_thresh 5.0 --save_every 5 \
   --out_dir output/seg_r1_md/Task01_BrainTumour/heatmap_train
 ```
+
+---
+
+**User**
+
+datasets.py对于JSON文件的读取存在问题：JSON数组未必以每行一个元素的形式表示，所以你应该把文件整体作为一个JSON对象解析，再遍历作为该JSON根对象的数组，而不是逐行读取文件再处理
+
+---
+
+**Cursor**
+
+I'll modify the dataset loaders to parse the whole file as a JSON array first (preferred), with a safe fallback to line-wise JSONL if needed, and update both dataset classes to use this function. Then I'll lint the changed file.
+
+```python
+from __future__ import annotations
+
+"""
+JSONL点定位数据集支持多种格式
+
+新格式 (来自 gen_point_jsonl_from_masks.py):
+    {"image": "/path/to/img.jpg", "points": [[x1,y1], [x2,y2], ...], "labels": [1, 0, ...]}
+    - points: 坐标点列表，每个点为[x,y]格式
+    - labels: 对应的标签，1表示正类（前景），0表示负类（背景）
+    - 只使用label=1的点进行训练，如有多个正类点则选择第一个
+    
+旧格式 (向后兼容):
+    {"image": "/path/to/img.jpg", "x": 123.4, "y": 456.7}
+    - 直接包含单个点的x,y坐标
+
+生成工具:
+    python seg-rl/annotator/gen_point_jsonl_from_masks.py \\
+      --images_dir /path/to/images \\
+      --masks_dir /path/to/masks \\
+      --output_jsonl /path/to/output.jsonl
+"""
+
+import json
+import math
+import os
+from dataclasses import dataclass
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
+
+import numpy as np
+from PIL import Image
+
+import torch
+from torch.utils.data import Dataset
+import torchvision.transforms.functional as TF
+import os
+
+
+@dataclass
+class ImageSize:
+    height: int
+    width: int
+
+
+def _ensure_rgb(image: Image.Image) -> Image.Image:
+    if image.mode == "RGB":
+        return image
+    if image.mode in {"L", "I;16", "I", "F"}:
+        return image.convert("RGB")
+    return image.convert("RGB")
+
+
+def _resize_with_coords(image: Image.Image, xy: Tuple[float, float], out_size: ImageSize) -> Tuple[Image.Image, Tuple[float, float]]:
+    orig_w, orig_h = image.size
+    x, y = xy
+    # Simple direct resize, scale coords accordingly
+    scale_x = out_size.width / float(orig_w)
+    scale_y = out_size.height / float(orig_h)
+    x_resized = x * scale_x
+    y_resized = y * scale_y
+    image_resized = image.resize((out_size.width, out_size.height), resample=Image.BILINEAR)
+    return image_resized, (x_resized, y_resized)
+
+
+def _random_hflip(image: Image.Image, xy: Tuple[float, float], p: float = 0.5) -> Tuple[Image.Image, Tuple[float, float]]:
+    if np.random.rand() >= p:
+        return image, xy
+    w, _ = image.size
+    x, y = xy
+    image = image.transpose(Image.FLIP_LEFT_RIGHT)
+    x_flipped = (w - 1) - x
+    return image, (x_flipped, y)
+
+
+def _random_vflip(image: Image.Image, xy: Tuple[float, float], p: float = 0.0) -> Tuple[Image.Image, Tuple[float, float]]:
+    if np.random.rand() >= p:
+        return image, xy
+    w, h = image.size
+    x, y = xy
+    image = image.transpose(Image.FLIP_TOP_BOTTOM)
+    y_flipped = (h - 1) - y
+    return image, (x, y_flipped)
+
+
+class JsonlPointDataset(Dataset):
+    """Dataset for JSONL lines supporting multiple formats:
+    
+    New format (from gen_point_jsonl_from_masks.py):
+        {"image": "/path/to/img.jpg", "points": [[x1,y1], [x2,y2], ...], "labels": [1, 0, ...]}
+    
+    Legacy format (backward compatibility):
+        {"image": "/path/to/img.jpg", "x": x1, "y": y1}
+    
+    For new format:
+        - Uses only points with label=1 (positive/foreground)
+        - If multiple positive points exist, picks the first one
+        - Skips samples with no positive points
+    
+    Options:
+        - resize: resize to fixed HxW and scale coordinates
+        - random flips: horizontal/vertical (vflip off by default)
+        - normalization: mean/std to Tensor
+    """
+
+    def __init__(
+        self,
+        jsonl_path: str,
+        image_size: ImageSize,
+        hflip_p: float = 0.5,
+        vflip_p: float = 0.0,
+        mean_rgb: Tuple[float, float, float] = (0.485, 0.456, 0.406),
+        std_rgb: Tuple[float, float, float] = (0.229, 0.224, 0.225),
+        mean_gray: float = 0.5,
+        std_gray: float = 0.5,
+        training: bool = True,
+    ) -> None:
+        super().__init__()
+        self.entries: List[Dict[str, object]] = []
+        # Read entire file as JSON array if possible; fallback to JSONL per-line
+        recs: List[Dict] = []
+        try:
+            with open(jsonl_path, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+            data = json.loads(content)
+            if isinstance(data, list):
+                recs = [obj for obj in data if isinstance(obj, dict)]
+            else:
+                raise ValueError("Root is not a JSON array")
+        except Exception:
+            # Fallback: JSONL lines
+            with open(jsonl_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                        if isinstance(obj, dict):
+                            recs.append(obj)
+                    except Exception:
+                        continue
+        # Validate/process
+        for i, obj in enumerate(recs, 1):
+            try:
+                if not self._validate_and_process_entry(obj, i):
+                    continue
+                self.entries.append(obj)
+            except (ValueError, KeyError, IndexError) as e:
+                print(f"[WARN] Skipping invalid JSON at idx {i}: {e}")
+                continue
+        
+        if len(self.entries) == 0:
+            raise ValueError(f"No valid entries found in {jsonl_path}")
+        
+        self.image_size = image_size
+        self.hflip_p = hflip_p
+        self.vflip_p = vflip_p
+        self.mean_rgb = mean_rgb
+        self.std_rgb = std_rgb
+        self.mean_gray = float(mean_gray)
+        self.std_gray = float(std_gray)
+        self.training = training
+        
+    def _validate_and_process_entry(self, obj: Dict, line_num: int) -> bool:
+        """Validate and normalize entry to internal format. Returns True if valid."""
+        if "image" not in obj:
+            print(f"[WARN] Line {line_num}: Missing 'image' field")
+            return False
+            
+        # Check format: new format has "points" and "labels", legacy has "x" and "y"
+        if "points" in obj and "labels" in obj:
+            # New format
+            points = obj["points"]
+            labels = obj["labels"]
+            
+            if not isinstance(points, list) or not isinstance(labels, list):
+                print(f"[WARN] Line {line_num}: 'points' and 'labels' must be lists")
+                return False
+                
+            if len(points) != len(labels):
+                print(f"[WARN] Line {line_num}: 'points' and 'labels' must have same length")
+                return False
+            
+            # Choose the first (point,label) pair deterministically
+            first_point = points[0]
+            first_label = labels[0]
+            if not isinstance(first_point, (list, tuple)) or len(first_point) != 2:
+                print(f"[WARN] Line {line_num}: Invalid point format {first_point}")
+                return False
+            if first_label not in (0, 1):
+                print(f"[WARN] Line {line_num}: Invalid label value {first_label}, expected 0 or 1")
+                return False
+            # Store in internal format
+            obj["_x"] = float(first_point[0])
+            obj["_y"] = float(first_point[1])
+            obj["_label"] = int(first_label)
+            
+        elif "x" in obj and "y" in obj:
+            # Legacy format
+            obj["_x"] = float(obj["x"])
+            obj["_y"] = float(obj["y"])
+            # If legacy has label field, use it; else default to 1
+            obj["_label"] = int(obj.get("label", 1))
+            
+        else:
+            print(f"[WARN] Line {line_num}: Missing coordinate data (need 'points'+'labels' or 'x'+'y')")
+            return False
+            
+        return True
+
+    def __len__(self) -> int:
+        return len(self.entries)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        e = self.entries[idx]
+        img_path = e["image"]
+        # Prefer explicit conditional image path if provided; otherwise fallback to gt_mask as grayscale condition
+        cond_path = e.get("cond") if isinstance(e, dict) else None
+        if cond_path is None:
+            cond_path = e.get("gt_mask") if isinstance(e, dict) else None
+        # Use normalized internal coordinates
+        x = float(e["_x"])  # pixel coordinates in original image
+        y = float(e["_y"])
+
+        image = Image.open(img_path).convert("RGB")
+        image = _ensure_rgb(image)
+        cond_img: Image.Image
+        if cond_path is None:
+            # If second image missing, fall back to grayscale of the RGB image to keep channel count stable
+            cond_img = image.convert("L")
+        else:
+            cond_img = Image.open(cond_path).convert("L")
+
+        # Resize and coordinate scaling
+        image, (x, y) = _resize_with_coords(image, (x, y), self.image_size)
+        cond_img, _ = _resize_with_coords(cond_img, (x, y), self.image_size)
+
+        # Augmentations (flip) - apply identical transforms to both images and update coords once
+        if self.training:
+            # decide flips once
+            do_h = (np.random.rand() < self.hflip_p)
+            do_v = (np.random.rand() < self.vflip_p)
+            if do_h:
+                w, _ = image.size
+                image = image.transpose(Image.FLIP_LEFT_RIGHT)
+                cond_img = cond_img.transpose(Image.FLIP_LEFT_RIGHT)
+                x = (w - 1) - x
+            if do_v:
+                _, h = image.size
+                image = image.transpose(Image.FLIP_TOP_BOTTOM)
+                cond_img = cond_img.transpose(Image.FLIP_TOP_BOTTOM)
+                y = (h - 1) - y
+
+        # To tensor and normalize
+        image_t = TF.to_tensor(image)  # [3,H,W], 0..1
+        image_t = TF.normalize(image_t, mean=self.mean_rgb, std=self.std_rgb)
+        cond_t = TF.to_tensor(cond_img)  # [1,H,W]
+        cond_t = (cond_t - self.mean_gray) / max(self.std_gray, 1e-6)
+        # Stack to 4 channels: RGB + Gray
+        image_pair = torch.cat([image_t, cond_t], dim=0)  # [4,H,W]
+
+        # Pack target as tensor [2]
+        target_xy = torch.tensor([x, y], dtype=torch.float32)
+        target_label = torch.tensor(int(e.get("_label", 1)), dtype=torch.long)
+
+        sample = {
+            "image": image_pair,
+            "image_rgb": image_t,
+            "image_gray": cond_t,
+            "target_xy": target_xy,
+            "target_label": target_label,
+            "meta": {
+                "path": img_path,
+                "cond_path": cond_path,
+                "height": self.image_size.height,
+                "width": self.image_size.width,
+            },
+        }
+        return sample
+
+
+def collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+    images = torch.stack([b["image"] for b in batch], dim=0)
+    targets_xy = torch.stack([b["target_xy"] for b in batch], dim=0)
+    targets_label = torch.stack([b["target_label"] for b in batch], dim=0)
+    metas = [b["meta"] for b in batch]
+    return {"image": images, "target_xy": targets_xy, "target_label": targets_label, "meta": metas}
+
+
+class SamSequencePointDataset(Dataset):
+    """Dataset for self-supervised heatmap training from segmentation sequences.
+
+    For each entry in JSONL containing fields:
+      {"image": "/path/img.jpg", "points": [[x,y], ...], "labels": [1,0,...]}
+
+    Generate one sample per index i in 0..len(points)-1:
+      - first input image: the image itself (RGB)
+      - second input image (gray):
+          i == 0  -> all-zero gray image
+          i > 0   -> load mask at {sam_dir}/{stem}/{i-1}.png
+      - target: (points[i], labels[i])
+
+    Notes:
+      - stem is derived from the image file name (without extension)
+      - both images are resized to the fixed ImageSize; flips are applied synchronously
+    """
+
+    def __init__(
+        self,
+        jsonl_path: str,
+        sam_dir: str,
+        image_size: ImageSize,
+        hflip_p: float = 0.5,
+        vflip_p: float = 0.0,
+        mean_rgb: Tuple[float, float, float] = (0.485, 0.456, 0.406),
+        std_rgb: Tuple[float, float, float] = (0.229, 0.224, 0.225),
+        mean_gray: float = 0.5,
+        std_gray: float = 0.5,
+        training: bool = True,
+    ) -> None:
+        super().__init__()
+        self.entries: List[Dict[str, object]] = []
+        # Prefer JSON array; fallback to JSONL
+        recs: List[Dict] = []
+        try:
+            with open(jsonl_path, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+            data = json.loads(content)
+            if isinstance(data, list):
+                recs = [obj for obj in data if isinstance(obj, dict)]
+            else:
+                raise ValueError("Root is not a JSON array")
+        except Exception:
+            with open(jsonl_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                        if isinstance(obj, dict):
+                            recs.append(obj)
+                    except Exception:
+                        continue
+        for obj in recs:
+            # minimal validation
+            if "image" not in obj or "points" not in obj or "labels" not in obj:
+                continue
+            points = obj.get("points", [])
+            labels = obj.get("labels", [])
+            if not isinstance(points, list) or not isinstance(labels, list) or len(points) != len(labels) or len(points) == 0:
+                continue
+            self.entries.append(obj)
+
+        if len(self.entries) == 0:
+            raise ValueError(f"No valid entries found in {jsonl_path}")
+
+        self.sam_dir = os.path.abspath(sam_dir)
+        self.image_size = image_size
+        self.hflip_p = hflip_p
+        self.vflip_p = vflip_p
+        self.mean_rgb = mean_rgb
+        self.std_rgb = std_rgb
+        self.mean_gray = float(mean_gray)
+        self.std_gray = float(std_gray)
+        self.training = training
+
+        # Build (entry_idx, point_idx) index
+        self.index: List[Tuple[int, int]] = []
+        for ei, obj in enumerate(self.entries):
+            pts = obj.get("points", [])  # type: ignore
+            for i in range(len(pts)):
+                self.index.append((ei, i))
+
+    def __len__(self) -> int:
+        return len(self.index)
+
+    def _stem(self, path: str) -> str:
+        name = os.path.basename(path)
+        base, _ext = os.path.splitext(name)
+        return base
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        ei, pi = self.index[idx]
+        e = self.entries[ei]
+        assert isinstance(e, dict)
+        img_path = str(e["image"])  # absolute or relative
+        pts = e.get("points", [])  # type: ignore
+        labs = e.get("labels", [])  # type: ignore
+        point = pts[pi]
+        label = labs[pi]
+        x = float(point[0])
+        y = float(point[1])
+        label_int = int(label)
+
+        # load RGB image
+        image = Image.open(img_path).convert("RGB")
+        image = _ensure_rgb(image)
+
+        # build conditional gray image
+        if pi == 0:
+            cond_img = Image.new("L", (image.width, image.height), color=0)
+        else:
+            stem = self._stem(img_path)
+            mask_path = os.path.join(self.sam_dir, stem, f"{pi - 1}.png")
+            try:
+                cond_img = Image.open(mask_path).convert("L")
+            except Exception:
+                cond_img = Image.new("L", (image.width, image.height), color=0)
+
+        # Resize and coordinate scaling (use RGB image as reference for scaling)
+        image, (x, y) = _resize_with_coords(image, (x, y), self.image_size)
+        cond_img = cond_img.resize((self.image_size.width, self.image_size.height), resample=Image.NEAREST)
+
+        # Synchronized flips
+        if self.training:
+            do_h = (np.random.rand() < self.hflip_p)
+            do_v = (np.random.rand() < self.vflip_p)
+            if do_h:
+                w, _ = image.size
+                image = image.transpose(Image.FLIP_LEFT_RIGHT)
+                cond_img = cond_img.transpose(Image.FLIP_LEFT_RIGHT)
+                x = (w - 1) - x
+            if do_v:
+                _, h = image.size
+                image = image.transpose(Image.FLIP_TOP_BOTTOM)
+                cond_img = cond_img.transpose(Image.FLIP_TOP_BOTTOM)
+                y = (h - 1) - y
+
+        # To tensor and normalize
+        image_t = TF.to_tensor(image)
+        image_t = TF.normalize(image_t, mean=self.mean_rgb, std=self.std_rgb)
+        cond_t = TF.to_tensor(cond_img)
+        cond_t = (cond_t - self.mean_gray) / max(self.std_gray, 1e-6)
+        image_pair = torch.cat([image_t, cond_t], dim=0)
+
+        target_xy = torch.tensor([x, y], dtype=torch.float32)
+        target_label = torch.tensor(label_int, dtype=torch.long)
+
+        sample = {
+            "image": image_pair,
+            "image_rgb": image_t,
+            "image_gray": cond_t,
+            "target_xy": target_xy,
+            "target_label": target_label,
+            "meta": {
+                "path": img_path,
+                "height": self.image_size.height,
+                "width": self.image_size.width,
+                "step_idx": pi,
+            },
+        }
+        return sample
+
+
+
+```
+
+已修正：两个数据集类现在优先将整个文件解析为一个JSON数组，再遍历数组元素；若解析失败，才回退为逐行JSONL解析。这样可同时兼容“标准JSON数组文件”和“每行一JSON对象”的两种格式。
+
+---
+
+**User**
+
+请在train.py里加入保存/加载 训练断点，以及在控制台输出中显示训练进度的功能。
+
+---
+
+**Cursor**
+
+Adding periodic and last checkpoint saving plus tqdm-based progress display to the training loop, and ensuring resume works cleanly with these new checkpoints. I'll update seg-rl/heatmap/train.py accordingly and keep existing behavior intact.
+
+```python
+from __future__ import annotations
+
+import argparse
+import os
+from typing import Tuple, List
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, Subset
+from PIL import Image
+
+try:
+    from .datasets import JsonlPointDataset, SamSequencePointDataset, ImageSize, collate_fn
+    from .model import ModelConfig, PointHeatmapModel, argmax_from_logits, soft_argmax_from_logits
+    from .losses import ce_over_pixels, kl_to_gaussian_targets, mse_to_gaussian_targets
+    from .utils import save_checkpoint
+    from .utils import draw_cross, draw_triangle, draw_diagonal_cross, overlay_heatmap, make_grid
+except ImportError:  # allow running as a script without package context
+    import sys as _sys
+    import os as _os
+    _pkg_root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    if _pkg_root not in _sys.path:
+        _sys.path.insert(0, _pkg_root)
+    from heatmap.datasets import JsonlPointDataset, SamSequencePointDataset, ImageSize, collate_fn
+    from heatmap.model import ModelConfig, PointHeatmapModel, argmax_from_logits, soft_argmax_from_logits
+    from heatmap.losses import ce_over_pixels, kl_to_gaussian_targets, mse_to_gaussian_targets
+    from heatmap.utils import save_checkpoint
+    from heatmap.utils import draw_cross, draw_triangle, draw_diagonal_cross, overlay_heatmap, make_grid
+
+"""
+训练热力图分类点定位模型，支持软高斯目标分布
+
+数据准备 - 从mask生成训练数据:
+python seg-rl/annotator/gen_point_jsonl_from_masks.py \\
+  --images_dir /path/to/images \\
+  --masks_dir /path/to/masks \\
+  --output_jsonl /path/to/training_data.jsonl
+
+支持的JSONL格式:
+  新格式: {"image": "/path/img.jpg", "points": [[x,y]], "labels": [1]}
+  旧格式: {"image": "/path/img.jpg", "x": x, "y": y}
+
+推荐用法（UNet + KL软目标，更适合生成平滑的距离衰减热力图）:
+python -m seg-rl.heatmap.train \
+  --data_jsonl /root/autodl-tmp/works/Seg-R0/datasets/seg_r1_md/Task01_BrainTumour/mask_salient_points-0.jsonl \
+  --height 512 --width 512 \
+  --arch unet_s \
+  --loss kl --sigma 6.0 --tau 1.0 \
+  --batch_size 16 --epochs 40 --amp \
+  --val_ratio 0.1 --test_ratio 0.1 --seed 42 \
+  --eval_thresh 5.0 --save_every 5 \
+  --out_dir /root/autodl-tmp/works/Seg-R0/outputs/seg_r1_md/Task01_BrainTumour/heatmap_train-0 \
+  --vis_mode sample --vis_count 16
+
+高分辨率场景（增大sigma获得更软的分布）:
+python -m seg-rl.heatmap.train \
+  --data_jsonl /root/autodl-tmp/works/Seg-R0/datasets/seg_r1_md/Task01_BrainTumour/mask_salient_points-0.jsonl \
+  --height 1024 --width 1024 \
+  --arch unet_s \
+  --loss kl --sigma 10.0 --tau 1.2 \
+  --batch_size 8 --epochs 50 --amp \
+  --lr 1e-4 --weight_decay 1e-4 \
+  --out_dir /root/autodl-tmp/works/Seg-R0/outputs/seg_r1_md/Task01_BrainTumour/heatmap_train-0 \
+  --vis_mode sample --vis_count 16
+
+MSE损失选项（更稳定的形状匹配）:
+python -m seg-rl.heatmap.train \
+  --data_jsonl /path/to/your/data.jsonl \
+  --arch unet_s --loss mse --sigma 8.0 \
+  --epochs 30 --amp
+"""
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Train heatmap model with self-supervised sequence dataset (RGB + Gray)")
+    p.add_argument("--jsonl", type=str, required=True, help="Path to JSONL (points+labels per image)")
+    p.add_argument("--sam_dir", type=str, required=True, help="Directory of SAM masks per step: {sam_dir}/{stem}/{k}.png")
+    p.add_argument("--height", type=int, default=512)
+    p.add_argument("--width", type=int, default=512)
+    p.add_argument("--batch_size", type=int, default=16)
+    p.add_argument("--epochs", type=int, default=20)
+    p.add_argument("--save_every", type=int, default=1, help="Save checkpoint every N epochs")
+    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--weight_decay", type=float, default=1e-4)
+    p.add_argument("--arch", type=str, choices=["unet_s", "resnet18"], default="unet_s")
+    p.add_argument("--loss", type=str, choices=["ce", "kl", "mse"], default="kl")
+    p.add_argument("--sigma", type=float, default=3.0, help="Gaussian sigma for KL/MSE targets")
+    p.add_argument("--tau", type=float, default=1.0, help="Temperature for KL/model softmax")
+    p.add_argument("--amp", action="store_true")
+    p.add_argument("--workers", type=int, default=8)
+    p.add_argument("--out_dir", type=str, default="./outputs/seg_rl")
+    p.add_argument("--plots_dir", type=str, default=None, help="Directory to save loss/PCK plots; default under out_dir/plots")
+    p.add_argument("--pretrained", action="store_true")
+    p.add_argument("--resume", type=str, default=None)
+    p.add_argument("--eval_thresh", type=float, default=5.0, help="PCK threshold in pixels")
+    p.add_argument("--val_ratio", type=float, default=0.1, help="Validation split ratio from the full dataset")
+    p.add_argument("--test_ratio", type=float, default=0.0, help="Test split ratio from the full dataset")
+    p.add_argument("--seed", type=int, default=42, help="Random seed for splitting")
+    p.add_argument("--vis_mode", type=str, choices=["none", "sample", "all"], default="none", help="Visualization mode")
+    p.add_argument("--vis_count", type=int, default=16, help="When vis_mode=sample, number of samples to visualize")
+    p.add_argument("--vis_dir", type=str, default=None, help="Directory to save visualization images; default under out_dir/vis")
+    p.add_argument("--save_steps", type=int, default=0, help="Save checkpoint every N steps (0 to disable)")
+    p.add_argument("--progress", action="store_true", help="Show tqdm progress bar during training")
+    p.add_argument("--auto_resume", action="store_true", help="If set and --resume not provided, try <out_dir>/last.pt")
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    amp_enabled = args.amp and (device.type == "cuda")
+
+    os.makedirs(args.out_dir, exist_ok=True)
+    plots_dir = args.plots_dir or os.path.join(args.out_dir, "plots")
+    os.makedirs(plots_dir, exist_ok=True)
+    vis_dir = args.vis_dir or os.path.join(args.out_dir, "vis")
+    os.makedirs(vis_dir, exist_ok=True)
+
+    image_size = ImageSize(height=args.height, width=args.width)
+    # Load once to get length for splitting
+    full_ds_for_len = SamSequencePointDataset(args.jsonl, sam_dir=args.sam_dir, image_size=image_size, training=True)
+    n = len(full_ds_for_len)
+    assert 0.0 <= args.val_ratio < 1.0 and 0.0 <= args.test_ratio < 1.0 and args.val_ratio + args.test_ratio < 1.0, "Invalid split ratios"
+    n_test = int(round(n * args.test_ratio))
+    n_val = int(round(n * args.val_ratio))
+    n_train = n - n_val - n_test
+    g = torch.Generator()
+    g.manual_seed(args.seed)
+    perm = torch.randperm(n, generator=g).tolist()
+    idx_train = perm[:n_train]
+    idx_val = perm[n_train:n_train + n_val]
+    idx_test = perm[n_train + n_val:]
+
+    # Build datasets per split to control augmentation flag
+    train_base = SamSequencePointDataset(args.jsonl, sam_dir=args.sam_dir, image_size=image_size, training=True)
+    val_base = SamSequencePointDataset(args.jsonl, sam_dir=args.sam_dir, image_size=image_size, training=False) if n_val > 0 else None
+    test_base = SamSequencePointDataset(args.jsonl, sam_dir=args.sam_dir, image_size=image_size, training=False) if n_test > 0 else None
+
+    train_ds = Subset(train_base, idx_train)
+    val_ds = Subset(val_base, idx_val) if val_base is not None else None
+    test_ds = Subset(test_base, idx_test) if test_base is not None else None
+
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.workers, pin_memory=True, collate_fn=collate_fn)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True, collate_fn=collate_fn) if val_ds is not None else None
+    test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True, collate_fn=collate_fn) if test_ds is not None else None
+
+    cfg = ModelConfig(backbone=args.arch, pretrained=args.pretrained, in_channels=4)
+    model = PointHeatmapModel(cfg).to(device)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scaler = torch.amp.GradScaler(enabled=amp_enabled)
+
+    start_epoch = 0
+    global_step = 0
+    tried_auto = False
+    if args.resume and os.path.isfile(args.resume):
+        from .utils import load_checkpoint
+        ckpt = load_checkpoint(args.resume, model, optimizer, scaler)
+        start_epoch = ckpt.epoch
+        global_step = ckpt.step
+        print(f"[Resume] Loaded checkpoint from {args.resume} (epoch={start_epoch}, step={global_step})")
+    elif args.auto_resume:
+        auto_path = os.path.join(args.out_dir, "last.pt")
+        if os.path.isfile(auto_path):
+            tried_auto = True
+            from .utils import load_checkpoint
+            ckpt = load_checkpoint(auto_path, model, optimizer, scaler)
+            start_epoch = ckpt.epoch
+            global_step = ckpt.step
+            print(f"[Auto-Resume] Loaded checkpoint from {auto_path} (epoch={start_epoch}, step={global_step})")
+
+    history = {"train_loss": [], "val_pck": [], "test_pck": []}
+
+    def evaluate(loader: DataLoader | None, split_name: str) -> float:
+        if loader is None:
+            return float("nan")
+        model.eval()
+        total = 0
+        correct = 0
+        with torch.no_grad():
+            for batch in loader:
+                img = batch["image"].to(device, non_blocking=True)
+                tgt = batch["target_xy"].to(device, non_blocking=True)
+                logits, label_logits = model(img)
+                pred_xy = soft_argmax_from_logits(logits)
+                d = torch.linalg.norm(pred_xy - tgt, dim=1)
+                correct += (d <= args.eval_thresh).sum().item()
+                total += d.numel()
+        pck = correct / max(1, total)
+        print(f"{split_name} PCK@{args.eval_thresh}: {pck:.4f}")
+        return pck
+
+    def plot_curves():
+        try:
+            import matplotlib.pyplot as plt
+            import numpy as np
+            epochs_axis = np.arange(1, len(history["train_loss"]) + 1)
+            # Loss
+            plt.figure()
+            plt.plot(epochs_axis, history["train_loss"], label="train_loss")
+            plt.xlabel("Epoch")
+            plt.ylabel("Loss")
+            plt.legend()
+            plt.grid(True, ls=":", alpha=0.4)
+            plt.tight_layout()
+            plt.savefig(os.path.join(plots_dir, "loss.png"))
+            plt.close()
+            # PCK
+            plt.figure()
+            if any(not np.isnan(v) for v in history["val_pck"]):
+                plt.plot(epochs_axis, history["val_pck"], label="val_pck")
+            if any(not np.isnan(v) for v in history["test_pck"]):
+                plt.plot(epochs_axis, history["test_pck"], label="test_pck")
+            plt.xlabel("Epoch")
+            plt.ylabel(f"PCK@{args.eval_thresh}")
+            plt.legend()
+            plt.grid(True, ls=":", alpha=0.4)
+            plt.tight_layout()
+            plt.savefig(os.path.join(plots_dir, "pck.png"))
+            plt.close()
+        except Exception as e:
+            print(f"Plotting failed: {e}")
+
+    def visualize_dataset(loader: DataLoader | None, split_name: str):
+        if loader is None or args.vis_mode == "none":
+            return
+        model.eval()
+        import torchvision.transforms.functional as TF
+        import numpy as np
+        saved_images: List[Image.Image] = []
+        count = 0
+        max_count = args.vis_count if args.vis_mode == "sample" else float("inf")
+        with torch.no_grad():
+            for batch in loader:
+                img_t = batch["image_rgb"]  # [B,3,H,W] use RGB for visualization
+                tgt = batch["target_xy"]  # [B,2]
+                # Build 4ch input for the model: RGB + Gray
+                img4 = torch.cat([img_t.to(device), batch["image_gray"].to(device)], dim=1)
+                logits, label_logits = model(img4)
+                # ensure logits match image resolution for precise overlay
+                _, _, H_img, W_img = img_t.shape
+                if logits.shape[-2] != H_img or logits.shape[-1] != W_img:
+                    logits = torch.nn.functional.interpolate(logits, size=(H_img, W_img), mode="bilinear", align_corners=False)
+                # probability heatmap for stable visualization
+                bsz, _, H, W = logits.shape
+                probs = torch.softmax(logits.view(bsz, -1), dim=1).view(bsz, 1, H, W)
+                # compute soft-argmax pred on CPU for simplicity
+                pred_xy = soft_argmax_from_logits(logits).cpu()
+                for i in range(img_t.size(0)):
+                    if count >= max_count:
+                        break
+                    # unnormalize to [0,1] for visualization (ImageNet stats)
+                    mean = np.array([0.485, 0.456, 0.406]).reshape(3, 1, 1)
+                    std = np.array([0.229, 0.224, 0.225]).reshape(3, 1, 1)
+                    arr = img_t[i].cpu().float().numpy()
+                    arr = (arr * std + mean).clip(0.0, 1.0)
+                    pil_img = TF.to_pil_image(torch.from_numpy(arr))
+                    # overlay probability heatmap instead of raw logits
+                    hm = probs[i, 0].detach().cpu().float().numpy()
+                    # show base image in grayscale while keeping heatmap colored
+                    over = overlay_heatmap(pil_img.convert("L"), hm, alpha=0.5)
+                    # clamp coords to image bounds to ensure visibility
+                    h, w = img_t.size(-2), img_t.size(-1)
+                    gx = float(max(0.0, min(w - 1.0, float(tgt[i, 0]))))
+                    gy = float(max(0.0, min(h - 1.0, float(tgt[i, 1]))))
+                    px = float(max(0.0, min(w - 1.0, float(pred_xy[i, 0]))))
+                    py = float(max(0.0, min(h - 1.0, float(pred_xy[i, 1]))))
+                    # draw GT and Pred (GT + Pred both crosses; Pred is 45-degree red cross)
+                    over = draw_cross(over, (gx, gy), color=(0, 255, 0))
+                    over = draw_diagonal_cross(over, (px, py), color=(255, 0, 0), size=10)
+                    saved_images.append(over)
+                    count += 1
+                if count >= max_count:
+                    break
+        # save grid or per-sample
+        if args.vis_mode == "sample":
+            grid = make_grid(saved_images, cols=4)
+            grid.save(os.path.join(vis_dir, f"{split_name}_vis.png"))
+        else:  # all
+            split_dir = os.path.join(vis_dir, split_name)
+            os.makedirs(split_dir, exist_ok=True)
+            for i, img in enumerate(saved_images):
+                img.save(os.path.join(split_dir, f"{i:05d}.png"))
+
+    for epoch in range(start_epoch, args.epochs):
+        model.train()
+        running_loss = 0.0
+        # Progress bar setup
+        _iter = train_loader
+        _tqdm = None
+        if args.progress:
+            try:
+                from tqdm import tqdm  # type: ignore
+                _tqdm = tqdm(total=len(train_loader), desc=f"Epoch {epoch+1}/{args.epochs}")
+            except Exception:
+                _tqdm = None
+        for bi, batch in enumerate(train_loader, 1):
+            img = batch["image"].to(device, non_blocking=True)
+            tgt = batch["target_xy"].to(device, non_blocking=True)
+
+            optimizer.zero_grad(set_to_none=True)
+            with torch.amp.autocast(device_type=device.type, enabled=amp_enabled):
+                logits, label_logits = model(img)
+                if args.loss == "ce":
+                    loss_hm = ce_over_pixels(logits, tgt)
+                elif args.loss == "kl":
+                    loss_hm = kl_to_gaussian_targets(logits, tgt, sigma=args.sigma, tau=args.tau)
+                else:
+                    loss_hm = mse_to_gaussian_targets(logits, tgt, sigma=args.sigma)
+                loss_label = nn.CrossEntropyLoss()(label_logits, batch["target_label"].to(device))
+                loss = loss_hm + 0.2 * loss_label
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            running_loss += loss.item()
+            global_step += 1
+
+            # Periodic checkpoint
+            if args.save_steps > 0 and (global_step % args.save_steps == 0):
+                save_path = os.path.join(args.out_dir, f"step_{global_step}.pt")
+                save_checkpoint(save_path, model, optimizer, scaler, epoch=epoch + 1, step=global_step)
+                # also update last.pt symlink-like copy
+                last_path = os.path.join(args.out_dir, "last.pt")
+                save_checkpoint(last_path, model, optimizer, scaler, epoch=epoch + 1, step=global_step)
+
+            # Progress output
+            if _tqdm is not None:
+                _tqdm.set_postfix({"loss": f"{loss.item():.4f}", "lr": f"{optimizer.param_groups[0]['lr']:.2e}"})
+                _tqdm.update(1)
+            elif (bi % max(1, len(train_loader)//10)) == 0:
+                print(f"Epoch {epoch+1}/{args.epochs} [{bi}/{len(train_loader)}] loss={loss.item():.4f} lr={optimizer.param_groups[0]['lr']:.2e}")
+
+        if _tqdm is not None:
+            _tqdm.close()
+
+        avg_loss = running_loss / max(1, len(train_loader))
+        history["train_loss"].append(avg_loss)
+        print(f"Epoch {epoch+1}/{args.epochs} - train loss: {avg_loss:.4f}")
+
+        # Validation
+        val_pck = evaluate(val_loader, "val") if val_loader is not None else float("nan")
+        history["val_pck"].append(val_pck)
+        test_pck = evaluate(test_loader, "test") if test_loader is not None else float("nan")
+        history["test_pck"].append(test_pck)
+
+        # plots
+        plot_curves()
+
+        # visualizations
+        if args.vis_mode != "none":
+            visualize_dataset(val_loader or train_loader, split_name="val_or_train")
+
+        # Save epoch checkpoint and update last.pt
+        if ((epoch + 1) % max(1, args.save_every)) == 0:
+            save_path = os.path.join(args.out_dir, f"model_epoch_{epoch+1}.pt")
+            save_checkpoint(save_path, model, optimizer, scaler, epoch=epoch+1, step=global_step)
+        last_path = os.path.join(args.out_dir, "last.pt")
+        save_checkpoint(last_path, model, optimizer, scaler, epoch=epoch+1, step=global_step)
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+```
+
+- 新增断点保存/恢复
+  - 训练中可按步保存：`--save_steps N` 每N步保存一次并同步更新 `out_dir/last.pt`。
+  - 按epoch保存：沿用 `--save_every`；每个epoch结束也更新 `last.pt`。
+  - 恢复：
+    - 显式 `--resume path.pt` 会加载该断点。
+    - `--auto_resume` 会尝试从 `out_dir/last.pt` 恢复。
+
+- 训练进度显示
+  - `--progress` 启用 tqdm 进度条；若不可用则每个epoch按10等份打印进度与loss、lr。
+
+用法示例
+```bash
+python -m seg-rl.heatmap.train \
+  --jsonl datasets/.../segrl_pretrain_braintumour-251001.jsonl \
+  --sam_dir datasets/.../pretrain_gt_masks-251001 \
+  --height 512 --width 512 --arch unet_s \
+  --loss kl --sigma 6.0 --tau 1.0 \
+  --batch_size 16 --epochs 40 --amp \
+  --val_ratio 0.1 --test_ratio 0.1 --seed 42 \
+  --save_every 1 --save_steps 500 --progress --auto_resume \
+  --out_dir output/seg_r1_md/.../heatmap_train
+```
+
+- 备注
+  - 检查点结构复用现有 `save_checkpoint/load_checkpoint`，包含模型、优化器、混精度scaler、epoch与step。
+
+```shellscript
+python -m seg-rl.heatmap.train \
+  --jsonl datasets/.../segrl_pretrain_braintumour-251001.jsonl \
+  --sam_dir datasets/.../pretrain_gt_masks-251001 \
+  --height 512 --width 512 --arch unet_s \
+  --loss kl --sigma 6.0 --tau 1.0 \
+  --batch_size 16 --epochs 40 --amp \
+  --val_ratio 0.1 --test_ratio 0.1 --seed 42 \
+  --save_every 1 --save_steps 500 --progress --auto_resume \
+  --out_dir output/seg_r1_md/.../heatmap_train
+```
+
+---
+
+**User**
+
+让device可以在Apple Silicon设备上自适应选择mps
+
+---
+
+**Cursor**
+
+I'll update the training script to select the device in this priority: CUDA if available, then MPS (Apple Silicon), otherwise CPU. I'll also ensure AMP is only enabled for CUDA and adjust autocast accordingly to avoid errors on MPS. Then I'll run a quick lint check.
+
+```python
+from __future__ import annotations
+
+import argparse
+import os
+from typing import Tuple, List
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, Subset
+from PIL import Image
+
+try:
+    from .datasets import JsonlPointDataset, SamSequencePointDataset, ImageSize, collate_fn
+    from .model import ModelConfig, PointHeatmapModel, argmax_from_logits, soft_argmax_from_logits
+    from .losses import ce_over_pixels, kl_to_gaussian_targets, mse_to_gaussian_targets
+    from .utils import save_checkpoint
+    from .utils import draw_cross, draw_triangle, draw_diagonal_cross, overlay_heatmap, make_grid
+except ImportError:  # allow running as a script without package context
+    import sys as _sys
+    import os as _os
+    _pkg_root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    if _pkg_root not in _sys.path:
+        _sys.path.insert(0, _pkg_root)
+    from heatmap.datasets import JsonlPointDataset, SamSequencePointDataset, ImageSize, collate_fn
+    from heatmap.model import ModelConfig, PointHeatmapModel, argmax_from_logits, soft_argmax_from_logits
+    from heatmap.losses import ce_over_pixels, kl_to_gaussian_targets, mse_to_gaussian_targets
+    from heatmap.utils import save_checkpoint
+    from heatmap.utils import draw_cross, draw_triangle, draw_diagonal_cross, overlay_heatmap, make_grid
+
+"""
+训练热力图分类点定位模型，支持软高斯目标分布
+
+数据准备 - 从mask生成训练数据:
+python seg-rl/annotator/gen_point_jsonl_from_masks.py \\
+  --images_dir /path/to/images \\
+  --masks_dir /path/to/masks \\
+  --output_jsonl /path/to/training_data.jsonl
+
+支持的JSONL格式:
+  新格式: {"image": "/path/img.jpg", "points": [[x,y]], "labels": [1]}
+  旧格式: {"image": "/path/img.jpg", "x": x, "y": y}
+
+推荐用法（UNet + KL软目标，更适合生成平滑的距离衰减热力图）:
+python -m seg-rl.heatmap.train \
+  --data_jsonl /root/autodl-tmp/works/Seg-R0/datasets/seg_r1_md/Task01_BrainTumour/mask_salient_points-0.jsonl \
+  --height 512 --width 512 \
+  --arch unet_s \
+  --loss kl --sigma 6.0 --tau 1.0 \
+  --batch_size 16 --epochs 40 --amp \
+  --val_ratio 0.1 --test_ratio 0.1 --seed 42 \
+  --eval_thresh 5.0 --save_every 5 \
+  --out_dir /root/autodl-tmp/works/Seg-R0/outputs/seg_r1_md/Task01_BrainTumour/heatmap_train-0 \
+  --vis_mode sample --vis_count 16
+
+/opt/anaconda3/envs/seg-r1/bin/python -m seg-rl.heatmap.train \
+  --jsonl datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour-251001.jsonl \
+  --sam_dir datasets/seg_r1_md/Task01_BrainTumour/pretrain_gt_masks-251001 \
+  --height 512 --width 512 --arch unet_s \
+  --loss kl --sigma 6.0 --tau 1.0 \
+  --batch_size 16 --epochs 40 --amp \
+  --val_ratio 0.1 --test_ratio 0.1 --seed 42 \
+  --save_every 1 --save_steps 500 --progress --auto_resume \
+  --out_dir output/seg_r1_md/Task01_BrainTumour/heatmap_train-251001
+
+高分辨率场景（增大sigma获得更软的分布）:
+python -m seg-rl.heatmap.train \
+  --data_jsonl /root/autodl-tmp/works/Seg-R0/datasets/seg_r1_md/Task01_BrainTumour/mask_salient_points-0.jsonl \
+  --height 1024 --width 1024 \
+  --arch unet_s \
+  --loss kl --sigma 10.0 --tau 1.2 \
+  --batch_size 8 --epochs 50 --amp \
+  --lr 1e-4 --weight_decay 1e-4 \
+  --out_dir /root/autodl-tmp/works/Seg-R0/outputs/seg_r1_md/Task01_BrainTumour/heatmap_train-0 \
+  --vis_mode sample --vis_count 16
+
+MSE损失选项（更稳定的形状匹配）:
+python -m seg-rl.heatmap.train \
+  --data_jsonl /path/to/your/data.jsonl \
+  --arch unet_s --loss mse --sigma 8.0 \
+  --epochs 30 --amp
+"""
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Train heatmap model with self-supervised sequence dataset (RGB + Gray)")
+    p.add_argument("--jsonl", type=str, required=True, help="Path to JSONL (points+labels per image)")
+    p.add_argument("--sam_dir", type=str, required=True, help="Directory of SAM masks per step: {sam_dir}/{stem}/{k}.png")
+    p.add_argument("--height", type=int, default=512)
+    p.add_argument("--width", type=int, default=512)
+    p.add_argument("--batch_size", type=int, default=16)
+    p.add_argument("--epochs", type=int, default=20)
+    p.add_argument("--save_every", type=int, default=1, help="Save checkpoint every N epochs")
+    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--weight_decay", type=float, default=1e-4)
+    p.add_argument("--arch", type=str, choices=["unet_s", "resnet18"], default="unet_s")
+    p.add_argument("--loss", type=str, choices=["ce", "kl", "mse"], default="kl")
+    p.add_argument("--sigma", type=float, default=3.0, help="Gaussian sigma for KL/MSE targets")
+    p.add_argument("--tau", type=float, default=1.0, help="Temperature for KL/model softmax")
+    p.add_argument("--amp", action="store_true")
+    p.add_argument("--workers", type=int, default=8)
+    p.add_argument("--out_dir", type=str, default="./outputs/seg_rl")
+    p.add_argument("--plots_dir", type=str, default=None, help="Directory to save loss/PCK plots; default under out_dir/plots")
+    p.add_argument("--pretrained", action="store_true")
+    p.add_argument("--resume", type=str, default=None)
+    p.add_argument("--eval_thresh", type=float, default=5.0, help="PCK threshold in pixels")
+    p.add_argument("--val_ratio", type=float, default=0.1, help="Validation split ratio from the full dataset")
+    p.add_argument("--test_ratio", type=float, default=0.0, help="Test split ratio from the full dataset")
+    p.add_argument("--seed", type=int, default=42, help="Random seed for splitting")
+    p.add_argument("--vis_mode", type=str, choices=["none", "sample", "all"], default="none", help="Visualization mode")
+    p.add_argument("--vis_count", type=int, default=16, help="When vis_mode=sample, number of samples to visualize")
+    p.add_argument("--vis_dir", type=str, default=None, help="Directory to save visualization images; default under out_dir/vis")
+    p.add_argument("--save_steps", type=int, default=0, help="Save checkpoint every N steps (0 to disable)")
+    p.add_argument("--progress", action="store_true", help="Show tqdm progress bar during training")
+    p.add_argument("--auto_resume", action="store_true", help="If set and --resume not provided, try <out_dir>/last.pt")
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    # Prefer CUDA, then Apple Metal (MPS), else CPU
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+    # AMP only on CUDA for stability
+    amp_enabled = args.amp and (device.type == "cuda")
+    autocast_device_type = "cuda" if device.type == "cuda" else "cpu"
+
+    os.makedirs(args.out_dir, exist_ok=True)
+    plots_dir = args.plots_dir or os.path.join(args.out_dir, "plots")
+    os.makedirs(plots_dir, exist_ok=True)
+    vis_dir = args.vis_dir or os.path.join(args.out_dir, "vis")
+    os.makedirs(vis_dir, exist_ok=True)
+
+    image_size = ImageSize(height=args.height, width=args.width)
+    # Load once to get length for splitting
+    full_ds_for_len = SamSequencePointDataset(args.jsonl, sam_dir=args.sam_dir, image_size=image_size, training=True)
+    n = len(full_ds_for_len)
+    assert 0.0 <= args.val_ratio < 1.0 and 0.0 <= args.test_ratio < 1.0 and args.val_ratio + args.test_ratio < 1.0, "Invalid split ratios"
+    n_test = int(round(n * args.test_ratio))
+    n_val = int(round(n * args.val_ratio))
+    n_train = n - n_val - n_test
+    g = torch.Generator()
+    g.manual_seed(args.seed)
+    perm = torch.randperm(n, generator=g).tolist()
+    idx_train = perm[:n_train]
+    idx_val = perm[n_train:n_train + n_val]
+    idx_test = perm[n_train + n_val:]
+
+    # Build datasets per split to control augmentation flag
+    train_base = SamSequencePointDataset(args.jsonl, sam_dir=args.sam_dir, image_size=image_size, training=True)
+    val_base = SamSequencePointDataset(args.jsonl, sam_dir=args.sam_dir, image_size=image_size, training=False) if n_val > 0 else None
+    test_base = SamSequencePointDataset(args.jsonl, sam_dir=args.sam_dir, image_size=image_size, training=False) if n_test > 0 else None
+
+    train_ds = Subset(train_base, idx_train)
+    val_ds = Subset(val_base, idx_val) if val_base is not None else None
+    test_ds = Subset(test_base, idx_test) if test_base is not None else None
+
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.workers, pin_memory=True, collate_fn=collate_fn)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True, collate_fn=collate_fn) if val_ds is not None else None
+    test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True, collate_fn=collate_fn) if test_ds is not None else None
+
+    cfg = ModelConfig(backbone=args.arch, pretrained=args.pretrained, in_channels=4)
+    model = PointHeatmapModel(cfg).to(device)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scaler = torch.amp.GradScaler(enabled=amp_enabled)
+
+    start_epoch = 0
+    global_step = 0
+    tried_auto = False
+    if args.resume and os.path.isfile(args.resume):
+        from .utils import load_checkpoint
+        ckpt = load_checkpoint(args.resume, model, optimizer, scaler)
+        start_epoch = ckpt.epoch
+        global_step = ckpt.step
+        print(f"[Resume] Loaded checkpoint from {args.resume} (epoch={start_epoch}, step={global_step})")
+    elif args.auto_resume:
+        auto_path = os.path.join(args.out_dir, "last.pt")
+        if os.path.isfile(auto_path):
+            tried_auto = True
+            from .utils import load_checkpoint
+            ckpt = load_checkpoint(auto_path, model, optimizer, scaler)
+            start_epoch = ckpt.epoch
+            global_step = ckpt.step
+            print(f"[Auto-Resume] Loaded checkpoint from {auto_path} (epoch={start_epoch}, step={global_step})")
+
+    history = {"train_loss": [], "val_pck": [], "test_pck": []}
+
+    def evaluate(loader: DataLoader | None, split_name: str) -> float:
+        if loader is None:
+            return float("nan")
+        model.eval()
+        total = 0
+        correct = 0
+        with torch.no_grad():
+            for batch in loader:
+                img = batch["image"].to(device, non_blocking=True)
+                tgt = batch["target_xy"].to(device, non_blocking=True)
+                logits, label_logits = model(img)
+                pred_xy = soft_argmax_from_logits(logits)
+                d = torch.linalg.norm(pred_xy - tgt, dim=1)
+                correct += (d <= args.eval_thresh).sum().item()
+                total += d.numel()
+        pck = correct / max(1, total)
+        print(f"{split_name} PCK@{args.eval_thresh}: {pck:.4f}")
+        return pck
+
+    def plot_curves():
+        try:
+            import matplotlib.pyplot as plt
+            import numpy as np
+            epochs_axis = np.arange(1, len(history["train_loss"]) + 1)
+            # Loss
+            plt.figure()
+            plt.plot(epochs_axis, history["train_loss"], label="train_loss")
+            plt.xlabel("Epoch")
+            plt.ylabel("Loss")
+            plt.legend()
+            plt.grid(True, ls=":", alpha=0.4)
+            plt.tight_layout()
+            plt.savefig(os.path.join(plots_dir, "loss.png"))
+            plt.close()
+            # PCK
+            plt.figure()
+            if any(not np.isnan(v) for v in history["val_pck"]):
+                plt.plot(epochs_axis, history["val_pck"], label="val_pck")
+            if any(not np.isnan(v) for v in history["test_pck"]):
+                plt.plot(epochs_axis, history["test_pck"], label="test_pck")
+            plt.xlabel("Epoch")
+            plt.ylabel(f"PCK@{args.eval_thresh}")
+            plt.legend()
+            plt.grid(True, ls=":", alpha=0.4)
+            plt.tight_layout()
+            plt.savefig(os.path.join(plots_dir, "pck.png"))
+            plt.close()
+        except Exception as e:
+            print(f"Plotting failed: {e}")
+
+    def visualize_dataset(loader: DataLoader | None, split_name: str):
+        if loader is None or args.vis_mode == "none":
+            return
+        model.eval()
+        import torchvision.transforms.functional as TF
+        import numpy as np
+        saved_images: List[Image.Image] = []
+        count = 0
+        max_count = args.vis_count if args.vis_mode == "sample" else float("inf")
+        with torch.no_grad():
+            for batch in loader:
+                img_t = batch["image_rgb"]  # [B,3,H,W] use RGB for visualization
+                tgt = batch["target_xy"]  # [B,2]
+                # Build 4ch input for the model: RGB + Gray
+                img4 = torch.cat([img_t.to(device), batch["image_gray"].to(device)], dim=1)
+                logits, label_logits = model(img4)
+                # ensure logits match image resolution for precise overlay
+                _, _, H_img, W_img = img_t.shape
+                if logits.shape[-2] != H_img or logits.shape[-1] != W_img:
+                    logits = torch.nn.functional.interpolate(logits, size=(H_img, W_img), mode="bilinear", align_corners=False)
+                # probability heatmap for stable visualization
+                bsz, _, H, W = logits.shape
+                probs = torch.softmax(logits.view(bsz, -1), dim=1).view(bsz, 1, H, W)
+                # compute soft-argmax pred on CPU for simplicity
+                pred_xy = soft_argmax_from_logits(logits).cpu()
+                for i in range(img_t.size(0)):
+                    if count >= max_count:
+                        break
+                    # unnormalize to [0,1] for visualization (ImageNet stats)
+                    mean = np.array([0.485, 0.456, 0.406]).reshape(3, 1, 1)
+                    std = np.array([0.229, 0.224, 0.225]).reshape(3, 1, 1)
+                    arr = img_t[i].cpu().float().numpy()
+                    arr = (arr * std + mean).clip(0.0, 1.0)
+                    pil_img = TF.to_pil_image(torch.from_numpy(arr))
+                    # overlay probability heatmap instead of raw logits
+                    hm = probs[i, 0].detach().cpu().float().numpy()
+                    # show base image in grayscale while keeping heatmap colored
+                    over = overlay_heatmap(pil_img.convert("L"), hm, alpha=0.5)
+                    # clamp coords to image bounds to ensure visibility
+                    h, w = img_t.size(-2), img_t.size(-1)
+                    gx = float(max(0.0, min(w - 1.0, float(tgt[i, 0]))))
+                    gy = float(max(0.0, min(h - 1.0, float(tgt[i, 1]))))
+                    px = float(max(0.0, min(w - 1.0, float(pred_xy[i, 0]))))
+                    py = float(max(0.0, min(h - 1.0, float(pred_xy[i, 1]))))
+                    # draw GT and Pred (GT + Pred both crosses; Pred is 45-degree red cross)
+                    over = draw_cross(over, (gx, gy), color=(0, 255, 0))
+                    over = draw_diagonal_cross(over, (px, py), color=(255, 0, 0), size=10)
+                    saved_images.append(over)
+                    count += 1
+                if count >= max_count:
+                    break
+        # save grid or per-sample
+        if args.vis_mode == "sample":
+            grid = make_grid(saved_images, cols=4)
+            grid.save(os.path.join(vis_dir, f"{split_name}_vis.png"))
+        else:  # all
+            split_dir = os.path.join(vis_dir, split_name)
+            os.makedirs(split_dir, exist_ok=True)
+            for i, img in enumerate(saved_images):
+                img.save(os.path.join(split_dir, f"{i:05d}.png"))
+
+    for epoch in range(start_epoch, args.epochs):
+        model.train()
+        running_loss = 0.0
+        # Progress bar setup
+        _iter = train_loader
+        _tqdm = None
+        if args.progress:
+            try:
+                from tqdm import tqdm  # type: ignore
+                _tqdm = tqdm(total=len(train_loader), desc=f"Epoch {epoch+1}/{args.epochs}")
+            except Exception:
+                _tqdm = None
+        for bi, batch in enumerate(train_loader, 1):
+            img = batch["image"].to(device, non_blocking=True)
+            tgt = batch["target_xy"].to(device, non_blocking=True)
+
+            optimizer.zero_grad(set_to_none=True)
+            with torch.amp.autocast(device_type=autocast_device_type, enabled=amp_enabled):
+                logits, label_logits = model(img)
+                if args.loss == "ce":
+                    loss_hm = ce_over_pixels(logits, tgt)
+                elif args.loss == "kl":
+                    loss_hm = kl_to_gaussian_targets(logits, tgt, sigma=args.sigma, tau=args.tau)
+                else:
+                    loss_hm = mse_to_gaussian_targets(logits, tgt, sigma=args.sigma)
+                loss_label = nn.CrossEntropyLoss()(label_logits, batch["target_label"].to(device))
+                loss = loss_hm + 0.2 * loss_label
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            running_loss += loss.item()
+            global_step += 1
+
+            # Periodic checkpoint
+            if args.save_steps > 0 and (global_step % args.save_steps == 0):
+                save_path = os.path.join(args.out_dir, f"step_{global_step}.pt")
+                save_checkpoint(save_path, model, optimizer, scaler, epoch=epoch + 1, step=global_step)
+                # also update last.pt symlink-like copy
+                last_path = os.path.join(args.out_dir, "last.pt")
+                save_checkpoint(last_path, model, optimizer, scaler, epoch=epoch + 1, step=global_step)
+
+            # Progress output
+            if _tqdm is not None:
+                _tqdm.set_postfix({"loss": f"{loss.item():.4f}", "lr": f"{optimizer.param_groups[0]['lr']:.2e}"})
+                _tqdm.update(1)
+            elif (bi % max(1, len(train_loader)//10)) == 0:
+                print(f"Epoch {epoch+1}/{args.epochs} [{bi}/{len(train_loader)}] loss={loss.item():.4f} lr={optimizer.param_groups[0]['lr']:.2e}")
+
+        if _tqdm is not None:
+            _tqdm.close()
+
+        avg_loss = running_loss / max(1, len(train_loader))
+        history["train_loss"].append(avg_loss)
+        print(f"Epoch {epoch+1}/{args.epochs} - train loss: {avg_loss:.4f}")
+
+        # Validation
+        val_pck = evaluate(val_loader, "val") if val_loader is not None else float("nan")
+        history["val_pck"].append(val_pck)
+        test_pck = evaluate(test_loader, "test") if test_loader is not None else float("nan")
+        history["test_pck"].append(test_pck)
+
+        # plots
+        plot_curves()
+
+        # visualizations
+        if args.vis_mode != "none":
+            visualize_dataset(val_loader or train_loader, split_name="val_or_train")
+
+        # Save epoch checkpoint and update last.pt
+        if ((epoch + 1) % max(1, args.save_every)) == 0:
+            save_path = os.path.join(args.out_dir, f"model_epoch_{epoch+1}.pt")
+            save_checkpoint(save_path, model, optimizer, scaler, epoch=epoch+1, step=global_step)
+        last_path = os.path.join(args.out_dir, "last.pt")
+        save_checkpoint(last_path, model, optimizer, scaler, epoch=epoch+1, step=global_step)
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+```
+
+- 已在训练脚本中启用设备自适应选择顺序：CUDA > MPS(Apple Silicon) > CPU。
+- AMP 只在 CUDA 上启用；在 MPS/CPU 上关闭混精并用 CPU autocast 兜底，避免报错。
+
+---
+
+**User**
+
+seg-rl/annotator/gen_point_jsonl_from_masks.py中的调试模式（当debug_json不为None时）应该不需要使用largest_diff_component_representative重新计算，因为在这种模式下我们期望输入的JSON描述中已有之前已经计算得到的所有提示点序列，所以直接使用JSON数组中对应于第i个预测mask {$sam_masks_dir}/{$sample_stem}/{$i}.png的提示点(points[i], labels[i])即可。请修改
+
+---
+
+**Cursor**
+
+```python
+#!/usr/bin/env python3
+
+"""
+Generate JSONL supervision (image,x,y) by computing a "deep interior" point of
+binary masks using the Euclidean Distance Transform (EDT) maximum.
+
+Each output line is a JSON object like:
+  {"image": "/abs/path/to/image.jpg", "gt_mask": "/abs/path/to/mask.png", "points": [[123.4,456.7]], "labels": [1]}
+
+Coordinates are in pixel space of the original image/mask pair.
+Designed for Seg-R1 heatmap-classification pretraining pipelines.
+
+Example usage:
+  # 1) 首次生成（计算首个最佳提示点）
+  python seg-rl/annotator/gen_point_jsonl_from_masks.py \
+    --images_dir /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/canonical/images \
+    --masks_dir  /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/canonical/masks \
+    --output_jsonl /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour.jsonl
+
+  /opt/anaconda3/envs/seg-r1/bin/python seg-rl/annotator/gen_point_jsonl_from_masks.py \
+    --images_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/images \
+    --masks_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/masks \
+    --output_jsonl datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour-251002.jsonl
+
+  # 2) 追加模式（为每条记录计算后续的第2个及以后提示点）
+  python seg-rl/annotator/gen_point_jsonl_from_masks.py \
+    --appendto_jsonl /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour.jsonl
+
+  /opt/anaconda3/envs/seg-r1/bin/python seg-rl/annotator/gen_point_jsonl_from_masks.py \
+    --appendto_jsonl datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour-251003.jsonl
+
+  # 3) 调试模式（生成调试图像）
+  /opt/anaconda3/envs/seg-r1/bin/python seg-rl/annotator/gen_point_jsonl_from_masks.py \
+    --debug_json datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour-1.jsonl \
+    --debug_output_dir output/braintumour/dbg_gen_point
+
+Notes:
+- Foreground is defined as any non-zero pixel in the mask.
+- Target point is the pixel farthest from the background (EDT argmax), which
+  is guaranteed to lie inside the foreground, robust to holes and thin parts.
+- Samples with empty masks are skipped by default (override with --skip_empty false).
+"""
+
+import argparse
+import json
+import os
+from typing import Dict, Iterable, List, Optional, Tuple
+
+import numpy as np
+# from PIL import Image, ImageDraw
+from PIL import Image as _PIL
+from scipy.ndimage import label, distance_transform_edt
+import cv2  # type: ignore
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Create/Append deepest-point prompts from masks using EDT")
+    # 互斥：首写输出 vs 追加到已存在的JSON数组
+    group = p.add_mutually_exclusive_group(required=True)
+    group.add_argument("--output_jsonl", type=str, help="Path to write JSONL lines for first prompts")
+    group.add_argument("--appendto_jsonl", type=str, help="Path to existing JSON array to append next prompts")
+    group.add_argument("--debug_json", type=str, help="Path to JSON array to read for debug visualization only")
+
+    # 首次生成模式需要的参数（在追加模式下将被忽略）
+    p.add_argument("--images_dir", type=str, default=None, help="Directory containing images (e.g., JPG)")
+    p.add_argument("--masks_dir", type=str, default=None, help="Directory containing PNG masks aligned to images")
+    p.add_argument("--abs_paths", type=lambda s: s.lower() in {"1","true","yes","y"}, default=True,
+                   help="Write absolute image paths (default: True)")
+    p.add_argument("--skip_empty", type=lambda s: s.lower() in {"1","true","yes","y"}, default=True,
+                   help="Skip samples where mask is empty (default: True)")
+    p.add_argument("--image_exts", type=str, default=".jpg,.jpeg,.png",
+                   help="Comma-separated acceptable image extensions (default: .jpg,.jpeg,.png)")
+    p.add_argument("--viz_dir", type=str, default=None, help="Optional directory to save overlay visualizations")
+    p.add_argument("--viz_alpha", type=float, default=0.35, help="Alpha for mask overlay (0-1)")
+    p.add_argument("--viz_radius", type=int, default=4, help="Radius (pixels) for deepest-point circle")
+    p.add_argument("--debug_output_dir", type=str, default=None,
+                   help="If set, write per-sample debug images for diff component selection")
+    return p.parse_args()
+
+
+def list_files_with_exts(directory: str, allowed_exts: Tuple[str, ...]) -> List[str]:
+    directory = to_abs(directory) or directory
+    if not os.path.isdir(directory):
+        raise FileNotFoundError(f"Directory not found: {directory}")
+    out: List[str] = []
+    for name in os.listdir(directory):
+        if os.path.isdir(os.path.join(directory, name)):
+            continue
+        if any(name.lower().endswith(ext) for ext in allowed_exts):
+            out.append(name)
+    return sorted(out)
+
+
+def stem(path: str) -> str:
+    name = os.path.basename(path)
+    # Remove common two-part extensions like .nii.gz by iterative splitext
+    base, ext = os.path.splitext(name)
+    return base
+
+
+def to_abs(path: Optional[str]) -> Optional[str]:
+    if path is None:
+        return None
+    return os.path.abspath(path) if not os.path.isabs(path) else path
+
+
+def _find_latest_mask_path(sam_masks_dir: str, image_stem: str, current_points_len: int) -> Optional[str]:
+    """返回该图像在sam_masks_dir下的最新预测mask路径。
+    优先尝试 sam_masks_dir/<stem>/<current_points_len-1>.png；若不存在，
+    则在该目录下寻找最大数字文件名的png。
+    """
+    candidate_dir = os.path.join(sam_masks_dir, image_stem)
+    if not os.path.isdir(candidate_dir):
+        return None
+    k = max(0, int(current_points_len - 1))
+    preferred = os.path.join(candidate_dir, f"{k}.png")
+    if os.path.isfile(preferred):
+        return preferred
+    # fallback: find max numeric png
+    best_idx = -1
+    best_path = None
+    for name in os.listdir(candidate_dir):
+        if not name.lower().endswith(".png"):
+            continue
+        s = os.path.splitext(name)[0]
+        try:
+            idx = int(s)
+        except Exception:
+            continue
+        if idx > best_idx:
+            best_idx = idx
+            best_path = os.path.join(candidate_dir, name)
+    return best_path
+
+from scipy import ndimage as ndi
+
+def farthest_point_from_boundary(mask: np.ndarray) -> Optional[Tuple[float, float]]:
+    # mask: 二值数组，区域为 True/1，背景为 False/0
+    mask = (mask > 0)
+    dist = ndi.distance_transform_edt(mask)  # 区域内每点到背景的欧氏距离
+    y, x = np.unravel_index(np.argmax(dist), dist.shape)
+    # r = float(dist[y, x])  # 到边界的最大最小距离
+    # return (y, x), r
+    return (float(x), float(y))
+
+def compute_centroid(mask_u8: np.ndarray) -> Optional[Tuple[float, float]]:
+    """
+    Compute a robust interior point (x,y) for the foreground mask as the
+    Euclidean Distance Transform (EDT) maximum (i.e., the pixel farthest from
+    the background). Returns None if the mask has no foreground.
+    """
+    if mask_u8.ndim == 3:
+        # If mask has channels, convert to single channel by any non-zero across channels
+        mask_u8 = (mask_u8.any(axis=2)).astype(np.uint8) * 255
+    m = (mask_u8 > 0).astype(np.uint8)
+    # Preprocess: keep largest connected component and fill holes for robustness
+    try:
+        from scipy import ndimage as ndi  # type: ignore
+        if m.sum() > 0:
+            labels, nlab = ndi.label(m, structure=np.array([[1,1,1],[1,1,1],[1,1,1]], dtype=np.uint8))
+            if nlab > 1:
+                sizes = ndi.sum(m, labels, index=range(1, nlab + 1))
+                largest_idx = int(np.argmax(sizes)) + 1
+                m = (labels == largest_idx).astype(np.uint8)
+            # Fill holes
+            m = ndi.binary_fill_holes(m > 0).astype(np.uint8)
+    except Exception:
+        try:
+            import cv2  # type: ignore
+            if m.sum() > 0:
+                # Connected components with stats; background is label 0
+                num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+                if num_labels > 2:
+                    # Find largest non-background component by area (stats[:, cv2.CC_STAT_AREA])
+                    areas = stats[1:, cv2.CC_STAT_AREA]
+                    largest_idx = 1 + int(np.argmax(areas))
+                    m = (labels == largest_idx).astype(np.uint8)
+                elif num_labels == 2:
+                    # Only one foreground component
+                    m = (labels == 1).astype(np.uint8)
+                # Fill holes via flood fill on background
+                h, w = m.shape
+                inv = (1 - m) * 255
+                ff = inv.copy()
+                mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+                cv2.floodFill(ff, mask, seedPoint=(0, 0), newVal=128)
+                holes = (ff != 128)  # interior background
+                m = ((1 - inv/255).astype(np.uint8) | holes.astype(np.uint8))
+        except Exception:
+            # If no morphology libs, proceed without preprocessing
+            pass
+    if m.sum() == 0:
+        return None
+    # Prefer SciPy's true Euclidean distance; fallback to OpenCV if SciPy unavailable
+    dist = None
+    try:
+        from scipy import ndimage as ndi  # type: ignore
+        dist = ndi.distance_transform_edt(m)
+    except Exception:
+        try:
+            import cv2  # type: ignore
+            dist = cv2.distanceTransform(m, distanceType=cv2.DIST_L2, maskSize=5)
+        except Exception:
+            # As a last resort, use cityblock (L1) via iterative distance on uint8
+            # This is a coarse fallback and less accurate than EDT.
+            # Here we approximate by growing distance in four-neighborhood.
+            h, w = m.shape
+            dist = np.zeros_like(m, dtype=np.float32)
+            # Forward pass
+            for y in range(h):
+                for x in range(w):
+                    if m[y, x] == 0:
+                        continue
+                    v = dist[y, x]
+                    if y > 0:
+                        v = max(v, dist[y - 1, x] + 1.0)
+                    if x > 0:
+                        v = max(v, dist[y, x - 1] + 1.0)
+                    dist[y, x] = v
+            # Backward pass
+            for y in range(h - 1, -1, -1):
+                for x in range(w - 1, -1, -1):
+                    if m[y, x] == 0:
+                        continue
+                    v = dist[y, x]
+                    if y + 1 < h:
+                        v = max(v, dist[y + 1, x] + 1.0)
+                    if x + 1 < w:
+                        v = max(v, dist[y, x + 1] + 1.0)
+                    dist[y, x] = v
+    # Argmax returns (y, x)
+    y, x = np.unravel_index(np.argmax(dist), dist.shape)
+    return (float(x), float(y))
+
+def largest_diff_component_representative(A, B, connectivity=2, min_area=0, dbg_out_path: Optional[str] = None):
+    # A, B: 2D uint8 arrays, values {0,1} 或 {0,255}
+    A = (A > 0).astype(np.uint8)
+    B = (B > 0).astype(np.uint8)
+    C = A.astype(np.int8) - B.astype(np.int8)  # {-1, 0, +1}
+
+    regions = []
+    # 8 邻域结构元（connectivity=2 表示 8 邻域；=1 表示 4 邻域）
+    st = np.ones((3,3), dtype=np.uint8) if connectivity == 2 else np.array([[0,1,0],[1,1,1],[0,1,0]], dtype=np.uint8)
+
+    for sign, mask in ((1, C > 0), (-1, C < 0)):
+        if not mask.any():
+            continue
+        lab, n = label(mask, structure=st)
+        if n == 0:
+            continue
+        areas = np.bincount(lab.ravel())[1:]  # 忽略背景0
+        if min_area > 0:
+            keep_ids = np.where(areas >= min_area)[0] + 1
+            if keep_ids.size == 0:
+                continue
+            mask2 = np.isin(lab, keep_ids)
+            lab, n = label(mask2, structure=st)
+            if n == 0:
+                continue
+            areas = np.bincount(lab.ravel())[1:]
+
+        k = np.argmax(areas) + 1
+        comp = (lab == k)
+        regions.append((sign, int(areas[k-1]), comp))
+
+    if not regions:
+        return None  # 无非零差异
+
+    # 选面积最大的分量；若需以“最深”优先，可在 key 中加入 max EDT 作为次序
+    sign, area, comp = max(regions, key=lambda t: t[1])
+
+    # centroid = farthest_point_from_boundary(comp)
+    # # centroid = compute_centroid(comp)
+    # if centroid is None:
+    #     return None
+    D = distance_transform_edt(comp)
+    (centroidY, centroidX) = np.unravel_index(np.argmax(D), D.shape)
+
+    # 调试可视化
+    if dbg_out_path:
+        try:
+            h, w = A.shape[:2]
+            # Panel 1: A/B overlay (A=green, B=red)
+            overlay1 = np.zeros((h, w, 3), dtype=np.uint8)
+            overlay1[..., 1] = (A > 0).astype(np.uint8) * 255  # G
+            overlay1[..., 2] = (B > 0).astype(np.uint8) * 255  # R
+            bg = np.zeros_like(overlay1)
+            panel1 = cv2.addWeighted(bg, 1.0, overlay1, 0.6, 0.0)
+
+            # Panel 2: signed diff C (positive green, negative red)
+            C = A.astype(np.int8) - B.astype(np.int8)
+            panel2 = np.zeros((h, w, 3), dtype=np.uint8)
+            pos = (C > 0)
+            neg = (C < 0)
+            panel2[pos, 1] = 255
+            panel2[neg, 2] = 255
+
+            # Panel 3: connected components colored + final X marker
+            panel3 = np.zeros((h, w, 3), dtype=np.uint8)
+            # Color positive comps
+            for sgn, mask in ((1, C > 0), (-1, C < 0)):
+                if not mask.any():
+                    continue
+                lab, n = label(mask, structure=np.ones((3,3), dtype=np.uint8) if connectivity == 2 else np.array([[0,1,0],[1,1,1],[0,1,0]], dtype=np.uint8))
+                if n == 0:
+                    continue
+                # generate distinct vivid colors
+                rng = np.random.default_rng(12345 if sgn > 0 else 54321)
+                colors = (rng.integers(0, 256, size=(n, 3))).astype(np.uint8)
+                colors = np.clip(colors + 100, 0, 255)  # brighten
+                for i in range(1, n + 1):
+                    panel3[lab == i] = colors[i - 1]
+
+            # draw marker at centroid: foreground -> caret '^', background -> 'X'
+            cx, cy = int(round(centroidX)), int(round(centroidY))
+            # outline black then white (match viz script style)
+            def _draw_cross(img, x, y, size=6, color=(255,255,255), thickness=2):
+                cv2.line(img, (x - size, y - size), (x + size, y + size), (0,0,0), thickness + 2, lineType=cv2.LINE_AA)
+                cv2.line(img, (x - size, y + size), (x + size, y - size), (0,0,0), thickness + 2, lineType=cv2.LINE_AA)
+                cv2.line(img, (x - size, y - size), (x + size, y + size), color, thickness, lineType=cv2.LINE_AA)
+                cv2.line(img, (x - size, y + size), (x + size, y - size), color, thickness, lineType=cv2.LINE_AA)
+            def _draw_caret(img, x, y, size=6, color=(255,255,255), thickness=2):
+                p_top = (int(x), int(y - size))
+                p_left = (int(x - size), int(y + size))
+                p_right = (int(x + size), int(y + size))
+                # outline
+                cv2.line(img, p_left, p_top, (0,0,0), thickness + 2, lineType=cv2.LINE_AA)
+                cv2.line(img, p_right, p_top, (0,0,0), thickness + 2, lineType=cv2.LINE_AA)
+                # stroke
+                cv2.line(img, p_left, p_top, color, thickness, lineType=cv2.LINE_AA)
+                cv2.line(img, p_right, p_top, color, thickness, lineType=cv2.LINE_AA)
+
+            if int(sign) > 0:
+                _draw_caret(panel3, cx, cy, size=6, color=(255,255,255), thickness=2)
+            else:
+                _draw_cross(panel3, cx, cy, size=6, color=(255,255,255), thickness=2)
+
+            # Add panel titles for clarity
+            def _add_title(img: np.ndarray, text: str) -> None:
+                band_h = max(20, min(48, img.shape[0] // 20))
+                roi = img[0:band_h, :, :]
+                overlay = roi.copy()
+                cv2.rectangle(overlay, (0, 0), (img.shape[1] - 1, band_h - 1), (0, 0, 0), thickness=-1)
+                cv2.addWeighted(overlay, 0.5, roi, 0.5, 0, dst=roi)
+                # outlined text
+                org = (8, band_h - 6)
+                cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, lineType=cv2.LINE_AA)
+                cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, lineType=cv2.LINE_AA)
+
+            _add_title(panel1, "Overlay A (green) vs B (red)")
+            _add_title(panel2, "Signed diff C: + (green), - (red)")
+            _add_title(panel3, "Components + selected X")
+
+            # concat panels
+            canvas = np.concatenate([panel1, panel2, panel3], axis=1)
+            os.makedirs(os.path.dirname(dbg_out_path) or ".", exist_ok=True)
+            # from PIL import Image as _PIL
+            _PIL.fromarray(canvas[..., ::-1]).save(dbg_out_path)  # BGR->RGB flip
+        except Exception as _:
+            pass
+
+    return dict(sign=sign, area=area, y=int(centroidY), x=int(centroidX), max_radius=float(D[centroidY, centroidX]))
+
+def find_corresponding_image(
+    images_dir: str,
+    sample_stem: str,
+    allowed_exts: Tuple[str, ...],
+) -> Optional[str]:
+    images_dir_abs = to_abs(images_dir)
+    for ext in allowed_exts:
+        candidate = os.path.join(images_dir_abs, sample_stem + ext)
+        if os.path.isfile(candidate):
+            return candidate
+    # Fallback: scan directory and match by stem (handles mixed-case extensions or uncommon extensions)
+    for name in os.listdir(images_dir_abs):
+        if stem(name).lower() == sample_stem.lower():
+            return os.path.join(images_dir_abs, name)
+    return None
+
+def calculate_next_point(gt_mask_path, sam_masks_dir, current_points_len, dbg_out_dir: Optional[str] = None):
+    # 读取gt与pred
+    try:
+        gt_u8 = np.array(_PIL.open(to_abs(gt_mask_path)), dtype=np.uint8)
+        if current_points_len > 0:
+            last_mask_path = _find_latest_mask_path(sam_masks_dir, stem(gt_mask_path), current_points_len)
+            if not last_mask_path or not os.path.isfile(last_mask_path):
+                print(f"[WARN] Skip: last mask not found under {sam_masks_dir}")
+                return None, None, None
+            pred_u8 = np.array(_PIL.open(to_abs(last_mask_path)), dtype=np.uint8)
+        else:
+            pred_u8 = np.zeros_like(gt_u8)
+    except Exception as e:
+        print(f"[WARN] Skip: failed to read masks ({e})")
+        return None, None, None
+
+    # 若形状不同，将pred按最近邻缩放到gt尺寸
+    h_g, w_g = gt_u8.shape[:2]
+    h_p, w_p = pred_u8.shape[:2]
+    if (h_g, w_g) != (h_p, w_p):
+        try:
+            # from PIL import Image as _PIL
+            pred_u8 = np.array(_PIL.fromarray(pred_u8).resize((w_g, h_g), resample=_PIL.NEAREST), dtype=np.uint8)
+        except Exception:
+            pass
+
+    # 计算差异的最大连通分量代表点
+    dbg_path = None
+    if dbg_out_dir:
+        try:
+            subdir = os.path.join(dbg_out_dir, stem(gt_mask_path))
+            os.makedirs(subdir, exist_ok=True)
+            dbg_path = os.path.join(subdir, f"dbg_{max(0, int(current_points_len))}.png")
+        except Exception:
+            dbg_path = None
+    rep = largest_diff_component_representative(gt_u8, pred_u8, connectivity=2, min_area=0, dbg_out_path=dbg_path)
+    if rep is None:
+        print(f"[INFO] no diff component; skip append")
+        return None, None, None
+    x_next = int(rep["x"])  # 列
+    y_next = int(rep["y"])  # 行
+    label_next = 1 if int(rep["sign"]) > 0 else 0
+    return x_next, y_next, label_next
+
+def main() -> None:
+    global _PIL
+    args = parse_args()
+
+    # Debug-only mode: read JSON array that already contains full prompt sequences,
+    # and generate visualization by pairing points[i], labels[i] with {sam_dir}/{stem}/{i}.png.
+    if args.debug_json:
+        if not args.debug_output_dir:
+            raise RuntimeError("--debug_output_dir is required when --debug_json is set")
+        json_path = args.debug_json
+        if not os.path.isfile(json_path):
+            raise FileNotFoundError(f"Debug JSON not found: {json_path}")
+        with open(json_path, 'r', encoding='utf-8') as f:
+            content = f.read().strip()
+        try:
+            arr = json.loads(content)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"Debug JSON must be a JSON array: {e}")
+        if not isinstance(arr, list):
+            raise RuntimeError("Debug JSON root must be a JSON array")
+
+        os.makedirs(args.debug_output_dir, exist_ok=True)
+        from PIL import ImageDraw
+        num_generated = 0
+        for rec in arr:
+            if not isinstance(rec, dict):
+                continue
+            image_path = rec.get("image")
+            sam_masks_dir = rec.get("sam_masks_dir")
+            points = rec.get("points", [])
+            labels = rec.get("labels", [])
+            if not (image_path and sam_masks_dir and isinstance(points, list) and isinstance(labels, list)):
+                continue
+            if len(points) != len(labels):
+                continue
+            sample_stem = stem(image_path)
+            # load base image
+            try:
+                im_rgb = _PIL.open(to_abs(image_path)).convert("RGB")
+            except Exception:
+                continue
+            w_im, h_im = im_rgb.size
+            # ensure sample dir
+            out_dir = os.path.join(args.debug_output_dir, sample_stem)
+            os.makedirs(out_dir, exist_ok=True)
+            # iterate each step i
+            for i, (pt, lb) in enumerate(zip(points, labels)):
+                try:
+                    x, y = float(pt[0]), float(pt[1])
+                except Exception:
+                    continue
+                # load predicted mask for this step (i)
+                mask_path = os.path.join(to_abs(sam_masks_dir), sample_stem, f"{i}.png")
+                try:
+                    m = _PIL.open(mask_path)
+                    m = m.convert("L")
+                except Exception:
+                    m = _PIL.new("L", (w_im, h_im), 0)
+                if m.size != im_rgb.size:
+                    m = m.resize((w_im, h_im), resample=_PIL.NEAREST)
+                # overlay mask
+                overlay = _PIL.new("RGBA", (w_im, h_im), (0, 0, 0, 0))
+                mask_alpha = 128
+                color = (255, 0, 0, mask_alpha) if int(lb) == 1 else (0, 0, 255, mask_alpha)
+                alpha_img = _PIL.fromarray((np.array(m) > 0).astype(np.uint8) * mask_alpha, mode="L")
+                color_img = _PIL.new("RGBA", (w_im, h_im), color)
+                overlay.paste(color_img, (0, 0), mask=alpha_img)
+                comp = im_rgb.convert("RGBA")
+                comp = _PIL.alpha_composite(comp, overlay)
+                # draw the point
+                draw = ImageDraw.Draw(comp)
+                r = 4
+                col = (0, 255, 0, 255) if int(lb) == 1 else (255, 255, 0, 255)
+                draw.ellipse((x - r, y - r, x + r, y + r), outline=col, width=2)
+                # save
+                comp.convert("RGB").save(os.path.join(out_dir, f"dbg_{i}.png"))
+                num_generated += 1
+        print(f"Generated debug images for {num_generated} steps into {args.debug_output_dir}")
+        return
+
+    # 追加模式：读取已有JSON数组，计算下一提示点并写回
+    if args.appendto_jsonl:
+        json_path = args.appendto_jsonl
+        if not os.path.isfile(json_path):
+            raise FileNotFoundError(f"Append target not found: {json_path}")
+        with open(json_path, 'r', encoding='utf-8') as f:
+            content = f.read().strip()
+        try:
+            arr = json.loads(content)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"Append target must be a JSON array: {e}")
+        if not isinstance(arr, list):
+            raise RuntimeError("Append target root must be a JSON array")
+
+        updated = 0
+        for idx, rec in enumerate(arr):
+            if not isinstance(rec, dict):
+                continue
+            image_path = rec.get("image")
+            gt_mask_path = rec.get("gt_mask")
+            sam_masks_dir = rec.get("sam_masks_dir")
+            points_list = rec.get("points", [])
+            labels_list = rec.get("labels", [])
+
+            if not (image_path and gt_mask_path and sam_masks_dir):
+                print(f"[WARN] Skip idx {idx}: missing fields")
+                continue
+
+            x_next, y_next, label_next = calculate_next_point(
+                gt_mask_path,
+                sam_masks_dir,
+                len(points_list),
+                dbg_out_dir=args.debug_output_dir,
+            )
+            if x_next is None or y_next is None or label_next is None:
+                continue
+
+            # 追加points与labels
+            if not isinstance(points_list, list):
+                points_list = []
+            if not isinstance(labels_list, list):
+                labels_list = []
+            points_list.append([x_next, y_next])
+            labels_list.append(int(label_next))
+            rec["points"] = points_list
+            rec["labels"] = labels_list
+            updated += 1
+
+        # 回写同一文件
+        with open(json_path, 'w', encoding='utf-8') as f:
+            json.dump(arr, f, indent=2, ensure_ascii=False)
+        print(f"Appended next prompts to {json_path} (updated {updated} items)")
+        return
+
+    # 否则：首写模式，生成首个提示点（与之前逻辑一致）
+    if not args.images_dir or not args.masks_dir or not args.output_jsonl:
+        raise RuntimeError("images_dir, masks_dir and output_jsonl are required for initial generation mode")
+
+    images_dir = args.images_dir
+    masks_dir = args.masks_dir
+    output_jsonl = args.output_jsonl
+    allowed_image_exts = tuple(e.strip().lower() for e in args.image_exts.split(",") if e.strip())
+
+    os.makedirs(os.path.dirname(output_jsonl) or ".", exist_ok=True)
+    # Visualization output disabled
+    # if args.viz_dir:
+    #     os.makedirs(args.viz_dir, exist_ok=True)
+
+    # Gather masks as the source of truth
+    mask_files = list_files_with_exts(masks_dir, allowed_exts=(".png",))
+    if len(mask_files) == 0:
+        raise RuntimeError(f"No mask PNG files found under {masks_dir}")
+
+    num_written = 0
+    num_skipped_empty = 0
+    num_missing_images = 0
+    num_size_mismatch = 0
+
+    with open(output_jsonl, "w", encoding="utf-8") as out_f:
+        for mask_name in mask_files:
+            sample_stem = stem(mask_name)
+            mask_path = os.path.join(masks_dir, mask_name)
+            
+            # Load mask
+            try:
+                mask_img = _PIL.open(to_abs(mask_path))
+                mask_u8 = np.array(mask_img, dtype=np.uint8)
+            except Exception as e:
+                print(f"[WARN] Skipping unreadable mask: {mask_path} ({e})")
+                continue
+            
+            x_next, y_next, label_next = calculate_next_point(
+                mask_path,
+                None,
+                0,
+                dbg_out_dir=args.debug_output_dir,
+            )
+            if x_next is None or y_next is None or label_next is None:
+                if args.skip_empty:
+                    num_skipped_empty += 1
+                    continue
+                else:
+                    # For empty masks and skip_empty=False, place centroid at image center
+                    h, w = mask_u8.shape[:2]
+                    centroid = (float(w - 1) / 2.0, float(h - 1) / 2.0)
+            centroid = (x_next, y_next)
+
+            # Find corresponding image
+            img_path = find_corresponding_image(images_dir, sample_stem, allowed_image_exts)
+            if img_path is None:
+                num_missing_images += 1
+                print(f"[WARN] Missing image for mask stem '{sample_stem}' in {images_dir}")
+                continue
+           
+            image_field = os.path.abspath(img_path) if args.abs_paths else img_path
+            mask_field = os.path.abspath(mask_path) if args.abs_paths else mask_path
+            record = {"image": image_field, "gt_mask": mask_field, "points": [[float(centroid[0]), float(centroid[1])]], "labels": [1]}
+            out_f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            num_written += 1
+
+            # Visualization
+            if False and args.viz_dir:
+                try:
+                    # Load image RGB
+                    with _PIL.open(to_abs(img_path)) as im_rgb:
+                        im_rgb = im_rgb.convert("RGB")
+                        w_im, h_im = im_rgb.size
+                        
+                        # Ensure mask size matches visualization image
+                        m = mask_u8
+                        if (m.shape[1], m.shape[0]) != (w_im, h_im):
+                            # resize nearest for mask
+                            m_img = Image.fromarray(m)
+                            m_img = m_img.resize((w_im, h_im), resample=Image.NEAREST)
+                            m = np.array(m_img, dtype=np.uint8)
+                        
+                        # Create colored mask overlay
+                        overlay = Image.new("RGBA", (w_im, h_im), (0, 0, 0, 0))
+                        mask_alpha = int(max(0.0, min(1.0, args.viz_alpha)) * 255)
+                        color = (255, 0, 0, mask_alpha)
+                        # Build alpha mask where foreground>0
+                        fg = (m > 0).astype(np.uint8) * mask_alpha
+                        alpha_img = Image.fromarray(fg, mode="L")
+                        color_img = Image.new("RGBA", (w_im, h_im), color)
+                        overlay.paste(color_img, (0, 0), mask=alpha_img)
+                        
+                        # Compose overlay on image
+                        comp = im_rgb.convert("RGBA")
+                        comp = Image.alpha_composite(comp, overlay)
+                        
+                        # Draw the deepest point
+                        draw = ImageDraw.Draw(comp)
+                        px, py = float(centroid[0]), float(centroid[1])
+                        r = max(1, int(args.viz_radius))
+                        draw.ellipse((px - r, py - r, px + r, py + r), outline=(0, 255, 0, 255), width=2)
+                        
+                        # Save
+                        out_name = f"{sample_stem}.png"
+                        comp.convert("RGB").save(os.path.join(args.viz_dir, out_name))
+                except Exception as e:
+                    print(f"[WARN] Visualization failed for {img_path}: {e}")
+
+    print(f"Wrote {num_written} samples to {output_jsonl}")
+    if num_skipped_empty:
+        print(f"Skipped empty masks: {num_skipped_empty}")
+    if num_missing_images:
+        print(f"Masks with missing images: {num_missing_images}")
+    if num_size_mismatch:
+        print(f"Image/Mask size mismatches adjusted: {num_size_mismatch}")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+```
+
+已修改调试模式逻辑：
+- 不再调用 largest_diff_component_representative 重新计算点。
+- 直接遍历输入 JSON 数组中每个样本的 `points[i], labels[i]`，并与 `sam_masks_dir/{stem}/{i}.png` 对应的预测掩膜配对生成可视化。
+- 将 mask 叠加到原图（正类红色、负类蓝色半透明），并在上面绘制第 i 个提示点（正类绿点、负类黄点），保存到 `--debug_output_dir/{stem}/dbg_{i}.png`。
+
+---
+
+**User**
+
+不要重新编写可视化部分的代码，而是复用largest_diff_component_representative里的，这样可以保持与之前可视化方式的一致性。你可以把其中的逻辑抽取成专门的函数。再次强调重点：除了下一提示点是从JSON中获取已经计算好的数据而非重新使用两个masks去计算以外，其它的逻辑应最大程度与当前保持一致。请重新完成该任务
+
+---
+
+**Cursor**
+
+Let me update the debug mode to reuse the existing visualization style by refactoring the panel-drawing logic from largest_diff_component_representative into a helper, and in debug mode use points from JSON to annotate without recomputing them. I'll implement the edits now.
+
+```python
+#!/usr/bin/env python3
+
+"""
+Generate JSONL supervision (image,x,y) by computing a "deep interior" point of
+binary masks using the Euclidean Distance Transform (EDT) maximum.
+
+Each output line is a JSON object like:
+  {"image": "/abs/path/to/image.jpg", "gt_mask": "/abs/path/to/mask.png", "points": [[123.4,456.7]], "labels": [1]}
+
+Coordinates are in pixel space of the original image/mask pair.
+Designed for Seg-R1 heatmap-classification pretraining pipelines.
+
+Example usage:
+  # 1) 首次生成（计算首个最佳提示点）
+  python seg-rl/annotator/gen_point_jsonl_from_masks.py \
+    --images_dir /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/canonical/images \
+    --masks_dir  /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/canonical/masks \
+    --output_jsonl /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour.jsonl
+
+  /opt/anaconda3/envs/seg-r1/bin/python seg-rl/annotator/gen_point_jsonl_from_masks.py \
+    --images_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/images \
+    --masks_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/masks \
+    --output_jsonl datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour-251002.jsonl
+
+  # 2) 追加模式（为每条记录计算后续的第2个及以后提示点）
+  python seg-rl/annotator/gen_point_jsonl_from_masks.py \
+    --appendto_jsonl /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour.jsonl
+
+  /opt/anaconda3/envs/seg-r1/bin/python seg-rl/annotator/gen_point_jsonl_from_masks.py \
+    --appendto_jsonl datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour-251003.jsonl
+
+  # 3) 调试模式（生成调试图像）
+  /opt/anaconda3/envs/seg-r1/bin/python seg-rl/annotator/gen_point_jsonl_from_masks.py \
+    --debug_json datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour-1.jsonl \
+    --debug_output_dir output/braintumour/dbg_gen_point
+
+Notes:
+- Foreground is defined as any non-zero pixel in the mask.
+- Target point is the pixel farthest from the background (EDT argmax), which
+  is guaranteed to lie inside the foreground, robust to holes and thin parts.
+- Samples with empty masks are skipped by default (override with --skip_empty false).
+"""
+
+import argparse
+import json
+import os
+from typing import Dict, Iterable, List, Optional, Tuple
+
+import numpy as np
+# from PIL import Image, ImageDraw
+from PIL import Image as _PIL
+from scipy.ndimage import label, distance_transform_edt
+import cv2  # type: ignore
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Create/Append deepest-point prompts from masks using EDT")
+    # 互斥：首写输出 vs 追加到已存在的JSON数组
+    group = p.add_mutually_exclusive_group(required=True)
+    group.add_argument("--output_jsonl", type=str, help="Path to write JSONL lines for first prompts")
+    group.add_argument("--appendto_jsonl", type=str, help="Path to existing JSON array to append next prompts")
+    group.add_argument("--debug_json", type=str, help="Path to JSON array to read for debug visualization only")
+
+    # 首次生成模式需要的参数（在追加模式下将被忽略）
+    p.add_argument("--images_dir", type=str, default=None, help="Directory containing images (e.g., JPG)")
+    p.add_argument("--masks_dir", type=str, default=None, help="Directory containing PNG masks aligned to images")
+    p.add_argument("--abs_paths", type=lambda s: s.lower() in {"1","true","yes","y"}, default=True,
+                   help="Write absolute image paths (default: True)")
+    p.add_argument("--skip_empty", type=lambda s: s.lower() in {"1","true","yes","y"}, default=True,
+                   help="Skip samples where mask is empty (default: True)")
+    p.add_argument("--image_exts", type=str, default=".jpg,.jpeg,.png",
+                   help="Comma-separated acceptable image extensions (default: .jpg,.jpeg,.png)")
+    p.add_argument("--viz_dir", type=str, default=None, help="Optional directory to save overlay visualizations")
+    p.add_argument("--viz_alpha", type=float, default=0.35, help="Alpha for mask overlay (0-1)")
+    p.add_argument("--viz_radius", type=int, default=4, help="Radius (pixels) for deepest-point circle")
+    p.add_argument("--debug_output_dir", type=str, default=None,
+                   help="If set, write per-sample debug images for diff component selection")
+    return p.parse_args()
+
+
+def list_files_with_exts(directory: str, allowed_exts: Tuple[str, ...]) -> List[str]:
+    directory = to_abs(directory) or directory
+    if not os.path.isdir(directory):
+        raise FileNotFoundError(f"Directory not found: {directory}")
+    out: List[str] = []
+    for name in os.listdir(directory):
+        if os.path.isdir(os.path.join(directory, name)):
+            continue
+        if any(name.lower().endswith(ext) for ext in allowed_exts):
+            out.append(name)
+    return sorted(out)
+
+
+def stem(path: str) -> str:
+    name = os.path.basename(path)
+    # Remove common two-part extensions like .nii.gz by iterative splitext
+    base, ext = os.path.splitext(name)
+    return base
+
+
+def to_abs(path: Optional[str]) -> Optional[str]:
+    if path is None:
+        return None
+    return os.path.abspath(path) if not os.path.isabs(path) else path
+
+
+def _find_latest_mask_path(sam_masks_dir: str, image_stem: str, current_points_len: int) -> Optional[str]:
+    """返回该图像在sam_masks_dir下的最新预测mask路径。
+    优先尝试 sam_masks_dir/<stem>/<current_points_len-1>.png；若不存在，
+    则在该目录下寻找最大数字文件名的png。
+    """
+    candidate_dir = os.path.join(sam_masks_dir, image_stem)
+    if not os.path.isdir(candidate_dir):
+        return None
+    k = max(0, int(current_points_len - 1))
+    preferred = os.path.join(candidate_dir, f"{k}.png")
+    if os.path.isfile(preferred):
+        return preferred
+    # fallback: find max numeric png
+    best_idx = -1
+    best_path = None
+    for name in os.listdir(candidate_dir):
+        if not name.lower().endswith(".png"):
+            continue
+        s = os.path.splitext(name)[0]
+        try:
+            idx = int(s)
+        except Exception:
+            continue
+        if idx > best_idx:
+            best_idx = idx
+            best_path = os.path.join(candidate_dir, name)
+    return best_path
+
+from scipy import ndimage as ndi
+
+def farthest_point_from_boundary(mask: np.ndarray) -> Optional[Tuple[float, float]]:
+    # mask: 二值数组，区域为 True/1，背景为 False/0
+    mask = (mask > 0)
+    dist = ndi.distance_transform_edt(mask)  # 区域内每点到背景的欧氏距离
+    y, x = np.unravel_index(np.argmax(dist), dist.shape)
+    # r = float(dist[y, x])  # 到边界的最大最小距离
+    # return (y, x), r
+    return (float(x), float(y))
+
+def compute_centroid(mask_u8: np.ndarray) -> Optional[Tuple[float, float]]:
+    """
+    Compute a robust interior point (x,y) for the foreground mask as the
+    Euclidean Distance Transform (EDT) maximum (i.e., the pixel farthest from
+    the background). Returns None if the mask has no foreground.
+    """
+    if mask_u8.ndim == 3:
+        # If mask has channels, convert to single channel by any non-zero across channels
+        mask_u8 = (mask_u8.any(axis=2)).astype(np.uint8) * 255
+    m = (mask_u8 > 0).astype(np.uint8)
+    # Preprocess: keep largest connected component and fill holes for robustness
+    try:
+        from scipy import ndimage as ndi  # type: ignore
+        if m.sum() > 0:
+            labels, nlab = ndi.label(m, structure=np.array([[1,1,1],[1,1,1],[1,1,1]], dtype=np.uint8))
+            if nlab > 1:
+                sizes = ndi.sum(m, labels, index=range(1, nlab + 1))
+                largest_idx = int(np.argmax(sizes)) + 1
+                m = (labels == largest_idx).astype(np.uint8)
+            # Fill holes
+            m = ndi.binary_fill_holes(m > 0).astype(np.uint8)
+    except Exception:
+        try:
+            import cv2  # type: ignore
+            if m.sum() > 0:
+                # Connected components with stats; background is label 0
+                num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+                if num_labels > 2:
+                    # Find largest non-background component by area (stats[:, cv2.CC_STAT_AREA])
+                    areas = stats[1:, cv2.CC_STAT_AREA]
+                    largest_idx = 1 + int(np.argmax(areas))
+                    m = (labels == largest_idx).astype(np.uint8)
+                elif num_labels == 2:
+                    # Only one foreground component
+                    m = (labels == 1).astype(np.uint8)
+                # Fill holes via flood fill on background
+                h, w = m.shape
+                inv = (1 - m) * 255
+                ff = inv.copy()
+                mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+                cv2.floodFill(ff, mask, seedPoint=(0, 0), newVal=128)
+                holes = (ff != 128)  # interior background
+                m = ((1 - inv/255).astype(np.uint8) | holes.astype(np.uint8))
+        except Exception:
+            # If no morphology libs, proceed without preprocessing
+            pass
+    if m.sum() == 0:
+        return None
+    # Prefer SciPy's true Euclidean distance; fallback to OpenCV if SciPy unavailable
+    dist = None
+    try:
+        from scipy import ndimage as ndi  # type: ignore
+        dist = ndi.distance_transform_edt(m)
+    except Exception:
+        try:
+            import cv2  # type: ignore
+            dist = cv2.distanceTransform(m, distanceType=cv2.DIST_L2, maskSize=5)
+        except Exception:
+            # As a last resort, use cityblock (L1) via iterative distance on uint8
+            # This is a coarse fallback and less accurate than EDT.
+            # Here we approximate by growing distance in four-neighborhood.
+            h, w = m.shape
+            dist = np.zeros_like(m, dtype=np.float32)
+            # Forward pass
+            for y in range(h):
+                for x in range(w):
+                    if m[y, x] == 0:
+                        continue
+                    v = dist[y, x]
+                    if y > 0:
+                        v = max(v, dist[y - 1, x] + 1.0)
+                    if x > 0:
+                        v = max(v, dist[y, x - 1] + 1.0)
+                    dist[y, x] = v
+            # Backward pass
+            for y in range(h - 1, -1, -1):
+                for x in range(w - 1, -1, -1):
+                    if m[y, x] == 0:
+                        continue
+                    v = dist[y, x]
+                    if y + 1 < h:
+                        v = max(v, dist[y + 1, x] + 1.0)
+                    if x + 1 < w:
+                        v = max(v, dist[y, x + 1] + 1.0)
+                    dist[y, x] = v
+    # Argmax returns (y, x)
+    y, x = np.unravel_index(np.argmax(dist), dist.shape)
+    return (float(x), float(y))
+
+def largest_diff_component_representative(A, B, connectivity=2, min_area=0, dbg_out_path: Optional[str] = None):
+    # A, B: 2D uint8 arrays, values {0,1} 或 {0,255}
+    A = (A > 0).astype(np.uint8)
+    B = (B > 0).astype(np.uint8)
+    C = A.astype(np.int8) - B.astype(np.int8)  # {-1, 0, +1}
+
+    regions = []
+    # 8 邻域结构元（connectivity=2 表示 8 邻域；=1 表示 4 邻域）
+    st = np.ones((3,3), dtype=np.uint8) if connectivity == 2 else np.array([[0,1,0],[1,1,1],[0,1,0]], dtype=np.uint8)
+
+    for sign, mask in ((1, C > 0), (-1, C < 0)):
+        if not mask.any():
+            continue
+        lab, n = label(mask, structure=st)
+        if n == 0:
+            continue
+        areas = np.bincount(lab.ravel())[1:]  # 忽略背景0
+        if min_area > 0:
+            keep_ids = np.where(areas >= min_area)[0] + 1
+            if keep_ids.size == 0:
+                continue
+            mask2 = np.isin(lab, keep_ids)
+            lab, n = label(mask2, structure=st)
+            if n == 0:
+                continue
+            areas = np.bincount(lab.ravel())[1:]
+
+        k = np.argmax(areas) + 1
+        comp = (lab == k)
+        regions.append((sign, int(areas[k-1]), comp))
+
+    if not regions:
+        return None  # 无非零差异
+
+    # 选面积最大的分量；若需以“最深”优先，可在 key 中加入 max EDT 作为次序
+    sign, area, comp = max(regions, key=lambda t: t[1])
+
+    # centroid = farthest_point_from_boundary(comp)
+    # # centroid = compute_centroid(comp)
+    # if centroid is None:
+    #     return None
+    D = distance_transform_edt(comp)
+    (centroidY, centroidX) = np.unravel_index(np.argmax(D), D.shape)
+
+    # 调试可视化
+    if dbg_out_path:
+        try:
+            h, w = A.shape[:2]
+            # Panel 1: A/B overlay (A=green, B=red)
+            overlay1 = np.zeros((h, w, 3), dtype=np.uint8)
+            overlay1[..., 1] = (A > 0).astype(np.uint8) * 255  # G
+            overlay1[..., 2] = (B > 0).astype(np.uint8) * 255  # R
+            bg = np.zeros_like(overlay1)
+            panel1 = cv2.addWeighted(bg, 1.0, overlay1, 0.6, 0.0)
+
+            # Panel 2: signed diff C (positive green, negative red)
+            C = A.astype(np.int8) - B.astype(np.int8)
+            panel2 = np.zeros((h, w, 3), dtype=np.uint8)
+            pos = (C > 0)
+            neg = (C < 0)
+            panel2[pos, 1] = 255
+            panel2[neg, 2] = 255
+
+            # Panel 3: connected components colored + final X marker
+            panel3 = np.zeros((h, w, 3), dtype=np.uint8)
+            # Color positive comps
+            for sgn, mask in ((1, C > 0), (-1, C < 0)):
+                if not mask.any():
+                    continue
+                lab, n = label(mask, structure=np.ones((3,3), dtype=np.uint8) if connectivity == 2 else np.array([[0,1,0],[1,1,1],[0,1,0]], dtype=np.uint8))
+                if n == 0:
+                    continue
+                # generate distinct vivid colors
+                rng = np.random.default_rng(12345 if sgn > 0 else 54321)
+                colors = (rng.integers(0, 256, size=(n, 3))).astype(np.uint8)
+                colors = np.clip(colors + 100, 0, 255)  # brighten
+                for i in range(1, n + 1):
+                    panel3[lab == i] = colors[i - 1]
+
+            # draw marker at centroid: foreground -> caret '^', background -> 'X'
+            cx, cy = int(round(centroidX)), int(round(centroidY))
+            # outline black then white (match viz script style)
+            def _draw_cross(img, x, y, size=6, color=(255,255,255), thickness=2):
+                cv2.line(img, (x - size, y - size), (x + size, y + size), (0,0,0), thickness + 2, lineType=cv2.LINE_AA)
+                cv2.line(img, (x - size, y + size), (x + size, y - size), (0,0,0), thickness + 2, lineType=cv2.LINE_AA)
+                cv2.line(img, (x - size, y - size), (x + size, y + size), color, thickness, lineType=cv2.LINE_AA)
+                cv2.line(img, (x - size, y + size), (x + size, y - size), color, thickness, lineType=cv2.LINE_AA)
+            def _draw_caret(img, x, y, size=6, color=(255,255,255), thickness=2):
+                p_top = (int(x), int(y - size))
+                p_left = (int(x - size), int(y + size))
+                p_right = (int(x + size), int(y + size))
+                # outline
+                cv2.line(img, p_left, p_top, (0,0,0), thickness + 2, lineType=cv2.LINE_AA)
+                cv2.line(img, p_right, p_top, (0,0,0), thickness + 2, lineType=cv2.LINE_AA)
+                # stroke
+                cv2.line(img, p_left, p_top, color, thickness, lineType=cv2.LINE_AA)
+                cv2.line(img, p_right, p_top, color, thickness, lineType=cv2.LINE_AA)
+
+            if int(sign) > 0:
+                _draw_caret(panel3, cx, cy, size=6, color=(255,255,255), thickness=2)
+            else:
+                _draw_cross(panel3, cx, cy, size=6, color=(255,255,255), thickness=2)
+
+            # Add panel titles for clarity
+            def _add_title(img: np.ndarray, text: str) -> None:
+                band_h = max(20, min(48, img.shape[0] // 20))
+                roi = img[0:band_h, :, :]
+                overlay = roi.copy()
+                cv2.rectangle(overlay, (0, 0), (img.shape[1] - 1, band_h - 1), (0, 0, 0), thickness=-1)
+                cv2.addWeighted(overlay, 0.5, roi, 0.5, 0, dst=roi)
+                # outlined text
+                org = (8, band_h - 6)
+                cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, lineType=cv2.LINE_AA)
+                cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, lineType=cv2.LINE_AA)
+
+            _add_title(panel1, "Overlay A (green) vs B (red)")
+            _add_title(panel2, "Signed diff C: + (green), - (red)")
+            _add_title(panel3, "Components + selected X")
+
+            # concat panels
+            canvas = np.concatenate([panel1, panel2, panel3], axis=1)
+            os.makedirs(os.path.dirname(dbg_out_path) or ".", exist_ok=True)
+            # from PIL import Image as _PIL
+            _PIL.fromarray(canvas[..., ::-1]).save(dbg_out_path)  # BGR->RGB flip
+        except Exception as _:
+            pass
+
+    return dict(sign=sign, area=area, y=int(centroidY), x=int(centroidX), max_radius=float(D[centroidY, centroidX]))
+
+
+def _render_diff_panels_with_point(
+    A: np.ndarray,
+    B: np.ndarray,
+    point_xy: Tuple[float, float],
+    label: int,
+    dbg_out_path: Optional[str],
+    connectivity: int = 2,
+) -> None:
+    """Render 3-panel debug image reusing the visualization style in
+    largest_diff_component_representative, but mark a provided point instead of
+    the recomputed centroid.
+    - Panel 1: A (green) vs B (red) overlay
+    - Panel 2: signed diff C (positive green, negative red)
+    - Panel 3: connected components colored, with marker at point_xy
+    """
+    try:
+        if dbg_out_path is None:
+            return
+        h, w = A.shape[:2]
+        # Panel 1: A/B overlay (A=green, B=red)
+        overlay1 = np.zeros((h, w, 3), dtype=np.uint8)
+        overlay1[..., 1] = (A > 0).astype(np.uint8) * 255  # G
+        overlay1[..., 2] = (B > 0).astype(np.uint8) * 255  # R
+        bg = np.zeros_like(overlay1)
+        panel1 = cv2.addWeighted(bg, 1.0, overlay1, 0.6, 0.0)
+
+        # Panel 2: signed diff C (positive green, negative red)
+        C = A.astype(np.int8) - B.astype(np.int8)
+        panel2 = np.zeros((h, w, 3), dtype=np.uint8)
+        pos = (C > 0)
+        neg = (C < 0)
+        panel2[pos, 1] = 255
+        panel2[neg, 2] = 255
+
+        # Panel 3: connected components colored + provided point marker
+        panel3 = np.zeros((h, w, 3), dtype=np.uint8)
+        st = np.ones((3,3), dtype=np.uint8) if connectivity == 2 else np.array([[0,1,0],[1,1,1],[0,1,0]], dtype=np.uint8)
+        for sgn, mask in ((1, C > 0), (-1, C < 0)):
+            if not mask.any():
+                continue
+            lab, n = label(mask, structure=st)
+            if n == 0:
+                continue
+            rng = np.random.default_rng(12345 if sgn > 0 else 54321)
+            colors = (rng.integers(0, 256, size=(n, 3))).astype(np.uint8)
+            colors = np.clip(colors + 100, 0, 255)
+            for i in range(1, n + 1):
+                panel3[lab == i] = colors[i - 1]
+
+        # draw marker at provided (x,y): foreground -> caret '^', background -> 'X'
+        cx = int(round(float(point_xy[0])))
+        cy = int(round(float(point_xy[1])))
+        def _draw_cross(img, x, y, size=6, color=(255,255,255), thickness=2):
+            cv2.line(img, (x - size, y - size), (x + size, y + size), (0,0,0), thickness + 2, lineType=cv2.LINE_AA)
+            cv2.line(img, (x - size, y + size), (x + size, y - size), (0,0,0), thickness + 2, lineType=cv2.LINE_AA)
+            cv2.line(img, (x - size, y - size), (x + size, y + size), color, thickness, lineType=cv2.LINE_AA)
+            cv2.line(img, (x - size, y + size), (x + size, y - size), color, thickness, lineType=cv2.LINE_AA)
+        def _draw_caret(img, x, y, size=6, color=(255,255,255), thickness=2):
+            p_top = (int(x), int(y - size))
+            p_left = (int(x - size), int(y + size))
+            p_right = (int(x + size), int(y + size))
+            cv2.line(img, p_left, p_top, (0,0,0), thickness + 2, lineType=cv2.LINE_AA)
+            cv2.line(img, p_right, p_top, (0,0,0), thickness + 2, lineType=cv2.LINE_AA)
+            cv2.line(img, p_left, p_top, color, thickness, lineType=cv2.LINE_AA)
+            cv2.line(img, p_right, p_top, color, thickness, lineType=cv2.LINE_AA)
+        if int(label) > 0:
+            _draw_caret(panel3, cx, cy, size=6, color=(255,255,255), thickness=2)
+        else:
+            _draw_cross(panel3, cx, cy, size=6, color=(255,255,255), thickness=2)
+
+        # Titles
+        def _add_title(img: np.ndarray, text: str) -> None:
+            band_h = max(20, min(48, img.shape[0] // 20))
+            roi = img[0:band_h, :, :]
+            overlay = roi.copy()
+            cv2.rectangle(overlay, (0, 0), (img.shape[1] - 1, band_h - 1), (0, 0, 0), thickness=-1)
+            cv2.addWeighted(overlay, 0.5, roi, 0.5, 0, dst=roi)
+            org = (8, band_h - 6)
+            cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, lineType=cv2.LINE_AA)
+            cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, lineType=cv2.LINE_AA)
+        _add_title(panel1, "Overlay A (green) vs B (red)")
+        _add_title(panel2, "Signed diff C: + (green), - (red)")
+        _add_title(panel3, "Components + selected point")
+
+        canvas = np.concatenate([panel1, panel2, panel3], axis=1)
+        os.makedirs(os.path.dirname(dbg_out_path) or ".", exist_ok=True)
+        _PIL.fromarray(canvas[..., ::-1]).save(dbg_out_path)
+    except Exception:
+        pass
+
+def find_corresponding_image(
+    images_dir: str,
+    sample_stem: str,
+    allowed_exts: Tuple[str, ...],
+) -> Optional[str]:
+    images_dir_abs = to_abs(images_dir)
+    for ext in allowed_exts:
+        candidate = os.path.join(images_dir_abs, sample_stem + ext)
+        if os.path.isfile(candidate):
+            return candidate
+    # Fallback: scan directory and match by stem (handles mixed-case extensions or uncommon extensions)
+    for name in os.listdir(images_dir_abs):
+        if stem(name).lower() == sample_stem.lower():
+            return os.path.join(images_dir_abs, name)
+    return None
+
+def calculate_next_point(gt_mask_path, sam_masks_dir, current_points_len, dbg_out_dir: Optional[str] = None):
+    # 读取gt与pred
+    try:
+        gt_u8 = np.array(_PIL.open(to_abs(gt_mask_path)), dtype=np.uint8)
+        if current_points_len > 0:
+            last_mask_path = _find_latest_mask_path(sam_masks_dir, stem(gt_mask_path), current_points_len)
+            if not last_mask_path or not os.path.isfile(last_mask_path):
+                print(f"[WARN] Skip: last mask not found under {sam_masks_dir}")
+                return None, None, None
+            pred_u8 = np.array(_PIL.open(to_abs(last_mask_path)), dtype=np.uint8)
+        else:
+            pred_u8 = np.zeros_like(gt_u8)
+    except Exception as e:
+        print(f"[WARN] Skip: failed to read masks ({e})")
+        return None, None, None
+
+    # 若形状不同，将pred按最近邻缩放到gt尺寸
+    h_g, w_g = gt_u8.shape[:2]
+    h_p, w_p = pred_u8.shape[:2]
+    if (h_g, w_g) != (h_p, w_p):
+        try:
+            # from PIL import Image as _PIL
+            pred_u8 = np.array(_PIL.fromarray(pred_u8).resize((w_g, h_g), resample=_PIL.NEAREST), dtype=np.uint8)
+        except Exception:
+            pass
+
+    # 计算差异的最大连通分量代表点
+    dbg_path = None
+    if dbg_out_dir:
+        try:
+            subdir = os.path.join(dbg_out_dir, stem(gt_mask_path))
+            os.makedirs(subdir, exist_ok=True)
+            dbg_path = os.path.join(subdir, f"dbg_{max(0, int(current_points_len))}.png")
+        except Exception:
+            dbg_path = None
+    rep = largest_diff_component_representative(gt_u8, pred_u8, connectivity=2, min_area=0, dbg_out_path=dbg_path)
+    if rep is None:
+        print(f"[INFO] no diff component; skip append")
+        return None, None, None
+    x_next = int(rep["x"])  # 列
+    y_next = int(rep["y"])  # 行
+    label_next = 1 if int(rep["sign"]) > 0 else 0
+    return x_next, y_next, label_next
+
+def main() -> None:
+    global _PIL
+    args = parse_args()
+
+    # Debug-only mode: read JSON, generate debug images but do not write JSON
+    if args.debug_json:
+        if not args.debug_output_dir:
+            raise RuntimeError("--debug_output_dir is required when --debug_json is set")
+        json_path = args.debug_json
+        if not os.path.isfile(json_path):
+            raise FileNotFoundError(f"Debug JSON not found: {json_path}")
+        with open(json_path, 'r', encoding='utf-8') as f:
+            content = f.read().strip()
+        try:
+            arr = json.loads(content)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"Debug JSON must be a JSON array: {e}")
+        if not isinstance(arr, list):
+            raise RuntimeError("Debug JSON root must be a JSON array")
+
+        num_generated = 0
+        for rec in arr:
+            if not isinstance(rec, dict):
+                continue
+            image_path = rec.get("image")
+            gt_mask_path = rec.get("gt_mask")
+            sam_masks_dir = rec.get("sam_masks_dir")
+            if not (image_path and gt_mask_path and sam_masks_dir):
+                continue
+            # For each numeric mask under sam_masks_dir/<stem>/, iterate k over existing masks except the max
+            sample_stem = stem(gt_mask_path)
+            candidate_dir = os.path.join(sam_masks_dir, sample_stem)
+            if not os.path.isdir(candidate_dir):
+                continue
+            # Collect numeric mask indices
+            numeric_indices = []
+            for name in os.listdir(candidate_dir):
+                if not name.lower().endswith('.png'):
+                    continue
+                s = os.path.splitext(name)[0]
+                try:
+                    k = int(s)
+                except Exception:
+                    continue
+                numeric_indices.append(k)
+            if not numeric_indices:
+                continue
+            numeric_indices = sorted(set(numeric_indices))
+            if len(numeric_indices) <= 1:
+                continue
+            # For each k except max, call calculate_next_point with current_points_len = k + 1
+            for k in numeric_indices[:-1]:
+                _ = calculate_next_point(
+                    gt_mask_path,
+                    sam_masks_dir,
+                    k + 1,
+                    dbg_out_dir=args.debug_output_dir,
+                )
+                num_generated += 1
+        print(f"Generated debug images for {num_generated} steps into {args.debug_output_dir}")
+        return
+
+    # 追加模式：读取已有JSON数组，计算下一提示点并写回
+    if args.appendto_jsonl:
+        json_path = args.appendto_jsonl
+        if not os.path.isfile(json_path):
+            raise FileNotFoundError(f"Append target not found: {json_path}")
+        with open(json_path, 'r', encoding='utf-8') as f:
+            content = f.read().strip()
+        try:
+            arr = json.loads(content)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"Append target must be a JSON array: {e}")
+        if not isinstance(arr, list):
+            raise RuntimeError("Append target root must be a JSON array")
+
+        updated = 0
+        for idx, rec in enumerate(arr):
+            if not isinstance(rec, dict):
+                continue
+            image_path = rec.get("image")
+            gt_mask_path = rec.get("gt_mask")
+            sam_masks_dir = rec.get("sam_masks_dir")
+            points_list = rec.get("points", [])
+            labels_list = rec.get("labels", [])
+
+            if not (image_path and gt_mask_path and sam_masks_dir):
+                print(f"[WARN] Skip idx {idx}: missing fields")
+                continue
+
+            x_next, y_next, label_next = calculate_next_point(
+                gt_mask_path,
+                sam_masks_dir,
+                len(points_list),
+                dbg_out_dir=args.debug_output_dir,
+            )
+            if x_next is None or y_next is None or label_next is None:
+                continue
+
+            # 追加points与labels
+            if not isinstance(points_list, list):
+                points_list = []
+            if not isinstance(labels_list, list):
+                labels_list = []
+            points_list.append([x_next, y_next])
+            labels_list.append(int(label_next))
+            rec["points"] = points_list
+            rec["labels"] = labels_list
+            updated += 1
+
+        # 回写同一文件
+        with open(json_path, 'w', encoding='utf-8') as f:
+            json.dump(arr, f, indent=2, ensure_ascii=False)
+        print(f"Appended next prompts to {json_path} (updated {updated} items)")
+        return
+
+    # 否则：首写模式，生成首个提示点（与之前逻辑一致）
+    if not args.images_dir or not args.masks_dir or not args.output_jsonl:
+        raise RuntimeError("images_dir, masks_dir and output_jsonl are required for initial generation mode")
+
+    images_dir = args.images_dir
+    masks_dir = args.masks_dir
+    output_jsonl = args.output_jsonl
+    allowed_image_exts = tuple(e.strip().lower() for e in args.image_exts.split(",") if e.strip())
+
+    os.makedirs(os.path.dirname(output_jsonl) or ".", exist_ok=True)
+    # Visualization output disabled
+    # if args.viz_dir:
+    #     os.makedirs(args.viz_dir, exist_ok=True)
+
+    # Gather masks as the source of truth
+    mask_files = list_files_with_exts(masks_dir, allowed_exts=(".png",))
+    if len(mask_files) == 0:
+        raise RuntimeError(f"No mask PNG files found under {masks_dir}")
+
+    num_written = 0
+    num_skipped_empty = 0
+    num_missing_images = 0
+    num_size_mismatch = 0
+
+    with open(output_jsonl, "w", encoding="utf-8") as out_f:
+        for mask_name in mask_files:
+            sample_stem = stem(mask_name)
+            mask_path = os.path.join(masks_dir, mask_name)
+            
+            # Load mask
+            try:
+                mask_img = _PIL.open(to_abs(mask_path))
+                mask_u8 = np.array(mask_img, dtype=np.uint8)
+            except Exception as e:
+                print(f"[WARN] Skipping unreadable mask: {mask_path} ({e})")
+                continue
+            
+            x_next, y_next, label_next = calculate_next_point(
+                mask_path,
+                None,
+                0,
+                dbg_out_dir=args.debug_output_dir,
+            )
+            if x_next is None or y_next is None or label_next is None:
+                if args.skip_empty:
+                    num_skipped_empty += 1
+                    continue
+                else:
+                    # For empty masks and skip_empty=False, place centroid at image center
+                    h, w = mask_u8.shape[:2]
+                    centroid = (float(w - 1) / 2.0, float(h - 1) / 2.0)
+            centroid = (x_next, y_next)
+
+            # Find corresponding image
+            img_path = find_corresponding_image(images_dir, sample_stem, allowed_image_exts)
+            if img_path is None:
+                num_missing_images += 1
+                print(f"[WARN] Missing image for mask stem '{sample_stem}' in {images_dir}")
+                continue
+           
+            image_field = os.path.abspath(img_path) if args.abs_paths else img_path
+            mask_field = os.path.abspath(mask_path) if args.abs_paths else mask_path
+            record = {"image": image_field, "gt_mask": mask_field, "points": [[float(centroid[0]), float(centroid[1])]], "labels": [1]}
+            out_f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            num_written += 1
+
+            # Visualization
+            if False and args.viz_dir:
+                try:
+                    # Load image RGB
+                    with _PIL.open(to_abs(img_path)) as im_rgb:
+                        im_rgb = im_rgb.convert("RGB")
+                        w_im, h_im = im_rgb.size
+                        
+                        # Ensure mask size matches visualization image
+                        m = mask_u8
+                        if (m.shape[1], m.shape[0]) != (w_im, h_im):
+                            # resize nearest for mask
+                            m_img = Image.fromarray(m)
+                            m_img = m_img.resize((w_im, h_im), resample=Image.NEAREST)
+                            m = np.array(m_img, dtype=np.uint8)
+                        
+                        # Create colored mask overlay
+                        overlay = Image.new("RGBA", (w_im, h_im), (0, 0, 0, 0))
+                        mask_alpha = int(max(0.0, min(1.0, args.viz_alpha)) * 255)
+                        color = (255, 0, 0, mask_alpha)
+                        # Build alpha mask where foreground>0
+                        fg = (m > 0).astype(np.uint8) * mask_alpha
+                        alpha_img = Image.fromarray(fg, mode="L")
+                        color_img = Image.new("RGBA", (w_im, h_im), color)
+                        overlay.paste(color_img, (0, 0), mask=alpha_img)
+                        
+                        # Compose overlay on image
+                        comp = im_rgb.convert("RGBA")
+                        comp = Image.alpha_composite(comp, overlay)
+                        
+                        # Draw the deepest point
+                        draw = ImageDraw.Draw(comp)
+                        px, py = float(centroid[0]), float(centroid[1])
+                        r = max(1, int(args.viz_radius))
+                        draw.ellipse((px - r, py - r, px + r, py + r), outline=(0, 255, 0, 255), width=2)
+                        
+                        # Save
+                        out_name = f"{sample_stem}.png"
+                        comp.convert("RGB").save(os.path.join(args.viz_dir, out_name))
+                except Exception as e:
+                    print(f"[WARN] Visualization failed for {img_path}: {e}")
+
+    print(f"Wrote {num_written} samples to {output_jsonl}")
+    if num_skipped_empty:
+        print(f"Skipped empty masks: {num_skipped_empty}")
+    if num_missing_images:
+        print(f"Masks with missing images: {num_missing_images}")
+    if num_size_mismatch:
+        print(f"Image/Mask size mismatches adjusted: {num_size_mismatch}")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+```
+
+```python
+#!/usr/bin/env python3
+
+"""
+Generate JSONL supervision (image,x,y) by computing a "deep interior" point of
+binary masks using the Euclidean Distance Transform (EDT) maximum.
+
+Each output line is a JSON object like:
+  {"image": "/abs/path/to/image.jpg", "gt_mask": "/abs/path/to/mask.png", "points": [[123.4,456.7]], "labels": [1]}
+
+Coordinates are in pixel space of the original image/mask pair.
+Designed for Seg-R1 heatmap-classification pretraining pipelines.
+
+Example usage:
+  # 1) 首次生成（计算首个最佳提示点）
+  python seg-rl/annotator/gen_point_jsonl_from_masks.py \
+    --images_dir /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/canonical/images \
+    --masks_dir  /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/canonical/masks \
+    --output_jsonl /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour.jsonl
+
+  /opt/anaconda3/envs/seg-r1/bin/python seg-rl/annotator/gen_point_jsonl_from_masks.py \
+    --images_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/images \
+    --masks_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/masks \
+    --output_jsonl datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour-251002.jsonl
+
+  # 2) 追加模式（为每条记录计算后续的第2个及以后提示点）
+  python seg-rl/annotator/gen_point_jsonl_from_masks.py \
+    --appendto_jsonl /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour.jsonl
+
+  /opt/anaconda3/envs/seg-r1/bin/python seg-rl/annotator/gen_point_jsonl_from_masks.py \
+    --appendto_jsonl datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour-251003.jsonl
+
+  # 3) 调试模式（生成调试图像）
+  /opt/anaconda3/envs/seg-r1/bin/python seg-rl/annotator/gen_point_jsonl_from_masks.py \
+    --debug_json datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour-1.jsonl \
+    --debug_output_dir output/braintumour/dbg_gen_point
+
+Notes:
+- Foreground is defined as any non-zero pixel in the mask.
+- Target point is the pixel farthest from the background (EDT argmax), which
+  is guaranteed to lie inside the foreground, robust to holes and thin parts.
+- Samples with empty masks are skipped by default (override with --skip_empty false).
+"""
+
+import argparse
+import json
+import os
+from typing import Dict, Iterable, List, Optional, Tuple
+
+import numpy as np
+# from PIL import Image, ImageDraw
+from PIL import Image as _PIL
+from scipy.ndimage import label, distance_transform_edt
+import cv2  # type: ignore
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Create/Append deepest-point prompts from masks using EDT")
+    # 互斥：首写输出 vs 追加到已存在的JSON数组
+    group = p.add_mutually_exclusive_group(required=True)
+    group.add_argument("--output_jsonl", type=str, help="Path to write JSONL lines for first prompts")
+    group.add_argument("--appendto_jsonl", type=str, help="Path to existing JSON array to append next prompts")
+    group.add_argument("--debug_json", type=str, help="Path to JSON array to read for debug visualization only")
+
+    # 首次生成模式需要的参数（在追加模式下将被忽略）
+    p.add_argument("--images_dir", type=str, default=None, help="Directory containing images (e.g., JPG)")
+    p.add_argument("--masks_dir", type=str, default=None, help="Directory containing PNG masks aligned to images")
+    p.add_argument("--abs_paths", type=lambda s: s.lower() in {"1","true","yes","y"}, default=True,
+                   help="Write absolute image paths (default: True)")
+    p.add_argument("--skip_empty", type=lambda s: s.lower() in {"1","true","yes","y"}, default=True,
+                   help="Skip samples where mask is empty (default: True)")
+    p.add_argument("--image_exts", type=str, default=".jpg,.jpeg,.png",
+                   help="Comma-separated acceptable image extensions (default: .jpg,.jpeg,.png)")
+    p.add_argument("--viz_dir", type=str, default=None, help="Optional directory to save overlay visualizations")
+    p.add_argument("--viz_alpha", type=float, default=0.35, help="Alpha for mask overlay (0-1)")
+    p.add_argument("--viz_radius", type=int, default=4, help="Radius (pixels) for deepest-point circle")
+    p.add_argument("--debug_output_dir", type=str, default=None,
+                   help="If set, write per-sample debug images for diff component selection")
+    return p.parse_args()
+
+
+def list_files_with_exts(directory: str, allowed_exts: Tuple[str, ...]) -> List[str]:
+    directory = to_abs(directory) or directory
+    if not os.path.isdir(directory):
+        raise FileNotFoundError(f"Directory not found: {directory}")
+    out: List[str] = []
+    for name in os.listdir(directory):
+        if os.path.isdir(os.path.join(directory, name)):
+            continue
+        if any(name.lower().endswith(ext) for ext in allowed_exts):
+            out.append(name)
+    return sorted(out)
+
+
+def stem(path: str) -> str:
+    name = os.path.basename(path)
+    # Remove common two-part extensions like .nii.gz by iterative splitext
+    base, ext = os.path.splitext(name)
+    return base
+
+
+def to_abs(path: Optional[str]) -> Optional[str]:
+    if path is None:
+        return None
+    return os.path.abspath(path) if not os.path.isabs(path) else path
+
+
+def _find_latest_mask_path(sam_masks_dir: str, image_stem: str, current_points_len: int) -> Optional[str]:
+    """返回该图像在sam_masks_dir下的最新预测mask路径。
+    优先尝试 sam_masks_dir/<stem>/<current_points_len-1>.png；若不存在，
+    则在该目录下寻找最大数字文件名的png。
+    """
+    candidate_dir = os.path.join(sam_masks_dir, image_stem)
+    if not os.path.isdir(candidate_dir):
+        return None
+    k = max(0, int(current_points_len - 1))
+    preferred = os.path.join(candidate_dir, f"{k}.png")
+    if os.path.isfile(preferred):
+        return preferred
+    # fallback: find max numeric png
+    best_idx = -1
+    best_path = None
+    for name in os.listdir(candidate_dir):
+        if not name.lower().endswith(".png"):
+            continue
+        s = os.path.splitext(name)[0]
+        try:
+            idx = int(s)
+        except Exception:
+            continue
+        if idx > best_idx:
+            best_idx = idx
+            best_path = os.path.join(candidate_dir, name)
+    return best_path
+
+from scipy import ndimage as ndi
+
+def farthest_point_from_boundary(mask: np.ndarray) -> Optional[Tuple[float, float]]:
+    # mask: 二值数组，区域为 True/1，背景为 False/0
+    mask = (mask > 0)
+    dist = ndi.distance_transform_edt(mask)  # 区域内每点到背景的欧氏距离
+    y, x = np.unravel_index(np.argmax(dist), dist.shape)
+    # r = float(dist[y, x])  # 到边界的最大最小距离
+    # return (y, x), r
+    return (float(x), float(y))
+
+def compute_centroid(mask_u8: np.ndarray) -> Optional[Tuple[float, float]]:
+    """
+    Compute a robust interior point (x,y) for the foreground mask as the
+    Euclidean Distance Transform (EDT) maximum (i.e., the pixel farthest from
+    the background). Returns None if the mask has no foreground.
+    """
+    if mask_u8.ndim == 3:
+        # If mask has channels, convert to single channel by any non-zero across channels
+        mask_u8 = (mask_u8.any(axis=2)).astype(np.uint8) * 255
+    m = (mask_u8 > 0).astype(np.uint8)
+    # Preprocess: keep largest connected component and fill holes for robustness
+    try:
+        from scipy import ndimage as ndi  # type: ignore
+        if m.sum() > 0:
+            labels, nlab = ndi.label(m, structure=np.array([[1,1,1],[1,1,1],[1,1,1]], dtype=np.uint8))
+            if nlab > 1:
+                sizes = ndi.sum(m, labels, index=range(1, nlab + 1))
+                largest_idx = int(np.argmax(sizes)) + 1
+                m = (labels == largest_idx).astype(np.uint8)
+            # Fill holes
+            m = ndi.binary_fill_holes(m > 0).astype(np.uint8)
+    except Exception:
+        try:
+            import cv2  # type: ignore
+            if m.sum() > 0:
+                # Connected components with stats; background is label 0
+                num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+                if num_labels > 2:
+                    # Find largest non-background component by area (stats[:, cv2.CC_STAT_AREA])
+                    areas = stats[1:, cv2.CC_STAT_AREA]
+                    largest_idx = 1 + int(np.argmax(areas))
+                    m = (labels == largest_idx).astype(np.uint8)
+                elif num_labels == 2:
+                    # Only one foreground component
+                    m = (labels == 1).astype(np.uint8)
+                # Fill holes via flood fill on background
+                h, w = m.shape
+                inv = (1 - m) * 255
+                ff = inv.copy()
+                mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+                cv2.floodFill(ff, mask, seedPoint=(0, 0), newVal=128)
+                holes = (ff != 128)  # interior background
+                m = ((1 - inv/255).astype(np.uint8) | holes.astype(np.uint8))
+        except Exception:
+            # If no morphology libs, proceed without preprocessing
+            pass
+    if m.sum() == 0:
+        return None
+    # Prefer SciPy's true Euclidean distance; fallback to OpenCV if SciPy unavailable
+    dist = None
+    try:
+        from scipy import ndimage as ndi  # type: ignore
+        dist = ndi.distance_transform_edt(m)
+    except Exception:
+        try:
+            import cv2  # type: ignore
+            dist = cv2.distanceTransform(m, distanceType=cv2.DIST_L2, maskSize=5)
+        except Exception:
+            # As a last resort, use cityblock (L1) via iterative distance on uint8
+            # This is a coarse fallback and less accurate than EDT.
+            # Here we approximate by growing distance in four-neighborhood.
+            h, w = m.shape
+            dist = np.zeros_like(m, dtype=np.float32)
+            # Forward pass
+            for y in range(h):
+                for x in range(w):
+                    if m[y, x] == 0:
+                        continue
+                    v = dist[y, x]
+                    if y > 0:
+                        v = max(v, dist[y - 1, x] + 1.0)
+                    if x > 0:
+                        v = max(v, dist[y, x - 1] + 1.0)
+                    dist[y, x] = v
+            # Backward pass
+            for y in range(h - 1, -1, -1):
+                for x in range(w - 1, -1, -1):
+                    if m[y, x] == 0:
+                        continue
+                    v = dist[y, x]
+                    if y + 1 < h:
+                        v = max(v, dist[y + 1, x] + 1.0)
+                    if x + 1 < w:
+                        v = max(v, dist[y, x + 1] + 1.0)
+                    dist[y, x] = v
+    # Argmax returns (y, x)
+    y, x = np.unravel_index(np.argmax(dist), dist.shape)
+    return (float(x), float(y))
+
+def largest_diff_component_representative(A, B, connectivity=2, min_area=0, dbg_out_path: Optional[str] = None):
+    # A, B: 2D uint8 arrays, values {0,1} 或 {0,255}
+    A = (A > 0).astype(np.uint8)
+    B = (B > 0).astype(np.uint8)
+    C = A.astype(np.int8) - B.astype(np.int8)  # {-1, 0, +1}
+
+    regions = []
+    # 8 邻域结构元（connectivity=2 表示 8 邻域；=1 表示 4 邻域）
+    st = np.ones((3,3), dtype=np.uint8) if connectivity == 2 else np.array([[0,1,0],[1,1,1],[0,1,0]], dtype=np.uint8)
+
+    for sign, mask in ((1, C > 0), (-1, C < 0)):
+        if not mask.any():
+            continue
+        lab, n = label(mask, structure=st)
+        if n == 0:
+            continue
+        areas = np.bincount(lab.ravel())[1:]  # 忽略背景0
+        if min_area > 0:
+            keep_ids = np.where(areas >= min_area)[0] + 1
+            if keep_ids.size == 0:
+                continue
+            mask2 = np.isin(lab, keep_ids)
+            lab, n = label(mask2, structure=st)
+            if n == 0:
+                continue
+            areas = np.bincount(lab.ravel())[1:]
+
+        k = np.argmax(areas) + 1
+        comp = (lab == k)
+        regions.append((sign, int(areas[k-1]), comp))
+
+    if not regions:
+        return None  # 无非零差异
+
+    # 选面积最大的分量；若需以“最深”优先，可在 key 中加入 max EDT 作为次序
+    sign, area, comp = max(regions, key=lambda t: t[1])
+
+    # centroid = farthest_point_from_boundary(comp)
+    # # centroid = compute_centroid(comp)
+    # if centroid is None:
+    #     return None
+    D = distance_transform_edt(comp)
+    (centroidY, centroidX) = np.unravel_index(np.argmax(D), D.shape)
+
+    # 调试可视化
+    if dbg_out_path:
+        try:
+            h, w = A.shape[:2]
+            # Panel 1: A/B overlay (A=green, B=red)
+            overlay1 = np.zeros((h, w, 3), dtype=np.uint8)
+            overlay1[..., 1] = (A > 0).astype(np.uint8) * 255  # G
+            overlay1[..., 2] = (B > 0).astype(np.uint8) * 255  # R
+            bg = np.zeros_like(overlay1)
+            panel1 = cv2.addWeighted(bg, 1.0, overlay1, 0.6, 0.0)
+
+            # Panel 2: signed diff C (positive green, negative red)
+            C = A.astype(np.int8) - B.astype(np.int8)
+            panel2 = np.zeros((h, w, 3), dtype=np.uint8)
+            pos = (C > 0)
+            neg = (C < 0)
+            panel2[pos, 1] = 255
+            panel2[neg, 2] = 255
+
+            # Panel 3: connected components colored + final X marker
+            panel3 = np.zeros((h, w, 3), dtype=np.uint8)
+            # Color positive comps
+            for sgn, mask in ((1, C > 0), (-1, C < 0)):
+                if not mask.any():
+                    continue
+                lab, n = label(mask, structure=np.ones((3,3), dtype=np.uint8) if connectivity == 2 else np.array([[0,1,0],[1,1,1],[0,1,0]], dtype=np.uint8))
+                if n == 0:
+                    continue
+                # generate distinct vivid colors
+                rng = np.random.default_rng(12345 if sgn > 0 else 54321)
+                colors = (rng.integers(0, 256, size=(n, 3))).astype(np.uint8)
+                colors = np.clip(colors + 100, 0, 255)  # brighten
+                for i in range(1, n + 1):
+                    panel3[lab == i] = colors[i - 1]
+
+            # draw marker at centroid: foreground -> caret '^', background -> 'X'
+            cx, cy = int(round(centroidX)), int(round(centroidY))
+            # outline black then white (match viz script style)
+            def _draw_cross(img, x, y, size=6, color=(255,255,255), thickness=2):
+                cv2.line(img, (x - size, y - size), (x + size, y + size), (0,0,0), thickness + 2, lineType=cv2.LINE_AA)
+                cv2.line(img, (x - size, y + size), (x + size, y - size), (0,0,0), thickness + 2, lineType=cv2.LINE_AA)
+                cv2.line(img, (x - size, y - size), (x + size, y + size), color, thickness, lineType=cv2.LINE_AA)
+                cv2.line(img, (x - size, y + size), (x + size, y - size), color, thickness, lineType=cv2.LINE_AA)
+            def _draw_caret(img, x, y, size=6, color=(255,255,255), thickness=2):
+                p_top = (int(x), int(y - size))
+                p_left = (int(x - size), int(y + size))
+                p_right = (int(x + size), int(y + size))
+                # outline
+                cv2.line(img, p_left, p_top, (0,0,0), thickness + 2, lineType=cv2.LINE_AA)
+                cv2.line(img, p_right, p_top, (0,0,0), thickness + 2, lineType=cv2.LINE_AA)
+                # stroke
+                cv2.line(img, p_left, p_top, color, thickness, lineType=cv2.LINE_AA)
+                cv2.line(img, p_right, p_top, color, thickness, lineType=cv2.LINE_AA)
+
+            if int(sign) > 0:
+                _draw_caret(panel3, cx, cy, size=6, color=(255,255,255), thickness=2)
+            else:
+                _draw_cross(panel3, cx, cy, size=6, color=(255,255,255), thickness=2)
+
+            # Add panel titles for clarity
+            def _add_title(img: np.ndarray, text: str) -> None:
+                band_h = max(20, min(48, img.shape[0] // 20))
+                roi = img[0:band_h, :, :]
+                overlay = roi.copy()
+                cv2.rectangle(overlay, (0, 0), (img.shape[1] - 1, band_h - 1), (0, 0, 0), thickness=-1)
+                cv2.addWeighted(overlay, 0.5, roi, 0.5, 0, dst=roi)
+                # outlined text
+                org = (8, band_h - 6)
+                cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, lineType=cv2.LINE_AA)
+                cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, lineType=cv2.LINE_AA)
+
+            _add_title(panel1, "Overlay A (green) vs B (red)")
+            _add_title(panel2, "Signed diff C: + (green), - (red)")
+            _add_title(panel3, "Components + selected X")
+
+            # concat panels
+            canvas = np.concatenate([panel1, panel2, panel3], axis=1)
+            os.makedirs(os.path.dirname(dbg_out_path) or ".", exist_ok=True)
+            # from PIL import Image as _PIL
+            _PIL.fromarray(canvas[..., ::-1]).save(dbg_out_path)  # BGR->RGB flip
+        except Exception as _:
+            pass
+
+    return dict(sign=sign, area=area, y=int(centroidY), x=int(centroidX), max_radius=float(D[centroidY, centroidX]))
+
+
+def _render_diff_panels_with_point(
+    A: np.ndarray,
+    B: np.ndarray,
+    point_xy: Tuple[float, float],
+    label: int,
+    dbg_out_path: Optional[str],
+    connectivity: int = 2,
+) -> None:
+    """Render 3-panel debug image reusing the visualization style in
+    largest_diff_component_representative, but mark a provided point instead of
+    the recomputed centroid.
+    - Panel 1: A (green) vs B (red) overlay
+    - Panel 2: signed diff C (positive green, negative red)
+    - Panel 3: connected components colored, with marker at point_xy
+    """
+    try:
+        if dbg_out_path is None:
+            return
+        h, w = A.shape[:2]
+        # Panel 1: A/B overlay (A=green, B=red)
+        overlay1 = np.zeros((h, w, 3), dtype=np.uint8)
+        overlay1[..., 1] = (A > 0).astype(np.uint8) * 255  # G
+        overlay1[..., 2] = (B > 0).astype(np.uint8) * 255  # R
+        bg = np.zeros_like(overlay1)
+        panel1 = cv2.addWeighted(bg, 1.0, overlay1, 0.6, 0.0)
+
+        # Panel 2: signed diff C (positive green, negative red)
+        C = A.astype(np.int8) - B.astype(np.int8)
+        panel2 = np.zeros((h, w, 3), dtype=np.uint8)
+        pos = (C > 0)
+        neg = (C < 0)
+        panel2[pos, 1] = 255
+        panel2[neg, 2] = 255
+
+        # Panel 3: connected components colored + provided point marker
+        panel3 = np.zeros((h, w, 3), dtype=np.uint8)
+        st = np.ones((3,3), dtype=np.uint8) if connectivity == 2 else np.array([[0,1,0],[1,1,1],[0,1,0]], dtype=np.uint8)
+        for sgn, mask in ((1, C > 0), (-1, C < 0)):
+            if not mask.any():
+                continue
+            lab, n = label(mask, structure=st)
+            if n == 0:
+                continue
+            rng = np.random.default_rng(12345 if sgn > 0 else 54321)
+            colors = (rng.integers(0, 256, size=(n, 3))).astype(np.uint8)
+            colors = np.clip(colors + 100, 0, 255)
+            for i in range(1, n + 1):
+                panel3[lab == i] = colors[i - 1]
+
+        # draw marker at provided (x,y): foreground -> caret '^', background -> 'X'
+        cx = int(round(float(point_xy[0])))
+        cy = int(round(float(point_xy[1])))
+        def _draw_cross(img, x, y, size=6, color=(255,255,255), thickness=2):
+            cv2.line(img, (x - size, y - size), (x + size, y + size), (0,0,0), thickness + 2, lineType=cv2.LINE_AA)
+            cv2.line(img, (x - size, y + size), (x + size, y - size), (0,0,0), thickness + 2, lineType=cv2.LINE_AA)
+            cv2.line(img, (x - size, y - size), (x + size, y + size), color, thickness, lineType=cv2.LINE_AA)
+            cv2.line(img, (x - size, y + size), (x + size, y - size), color, thickness, lineType=cv2.LINE_AA)
+        def _draw_caret(img, x, y, size=6, color=(255,255,255), thickness=2):
+            p_top = (int(x), int(y - size))
+            p_left = (int(x - size), int(y + size))
+            p_right = (int(x + size), int(y + size))
+            cv2.line(img, p_left, p_top, (0,0,0), thickness + 2, lineType=cv2.LINE_AA)
+            cv2.line(img, p_right, p_top, (0,0,0), thickness + 2, lineType=cv2.LINE_AA)
+            cv2.line(img, p_left, p_top, color, thickness, lineType=cv2.LINE_AA)
+            cv2.line(img, p_right, p_top, color, thickness, lineType=cv2.LINE_AA)
+        if int(label) > 0:
+            _draw_caret(panel3, cx, cy, size=6, color=(255,255,255), thickness=2)
+        else:
+            _draw_cross(panel3, cx, cy, size=6, color=(255,255,255), thickness=2)
+
+        # Titles
+        def _add_title(img: np.ndarray, text: str) -> None:
+            band_h = max(20, min(48, img.shape[0] // 20))
+            roi = img[0:band_h, :, :]
+            overlay = roi.copy()
+            cv2.rectangle(overlay, (0, 0), (img.shape[1] - 1, band_h - 1), (0, 0, 0), thickness=-1)
+            cv2.addWeighted(overlay, 0.5, roi, 0.5, 0, dst=roi)
+            org = (8, band_h - 6)
+            cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, lineType=cv2.LINE_AA)
+            cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, lineType=cv2.LINE_AA)
+        _add_title(panel1, "Overlay A (green) vs B (red)")
+        _add_title(panel2, "Signed diff C: + (green), - (red)")
+        _add_title(panel3, "Components + selected point")
+
+        canvas = np.concatenate([panel1, panel2, panel3], axis=1)
+        os.makedirs(os.path.dirname(dbg_out_path) or ".", exist_ok=True)
+        _PIL.fromarray(canvas[..., ::-1]).save(dbg_out_path)
+    except Exception:
+        pass
+
+def find_corresponding_image(
+    images_dir: str,
+    sample_stem: str,
+    allowed_exts: Tuple[str, ...],
+) -> Optional[str]:
+    images_dir_abs = to_abs(images_dir)
+    for ext in allowed_exts:
+        candidate = os.path.join(images_dir_abs, sample_stem + ext)
+        if os.path.isfile(candidate):
+            return candidate
+    # Fallback: scan directory and match by stem (handles mixed-case extensions or uncommon extensions)
+    for name in os.listdir(images_dir_abs):
+        if stem(name).lower() == sample_stem.lower():
+            return os.path.join(images_dir_abs, name)
+    return None
+
+def calculate_next_point(gt_mask_path, sam_masks_dir, current_points_len, dbg_out_dir: Optional[str] = None):
+    # 读取gt与pred
+    try:
+        gt_u8 = np.array(_PIL.open(to_abs(gt_mask_path)), dtype=np.uint8)
+        if current_points_len > 0:
+            last_mask_path = _find_latest_mask_path(sam_masks_dir, stem(gt_mask_path), current_points_len)
+            if not last_mask_path or not os.path.isfile(last_mask_path):
+                print(f"[WARN] Skip: last mask not found under {sam_masks_dir}")
+                return None, None, None
+            pred_u8 = np.array(_PIL.open(to_abs(last_mask_path)), dtype=np.uint8)
+        else:
+            pred_u8 = np.zeros_like(gt_u8)
+    except Exception as e:
+        print(f"[WARN] Skip: failed to read masks ({e})")
+        return None, None, None
+
+    # 若形状不同，将pred按最近邻缩放到gt尺寸
+    h_g, w_g = gt_u8.shape[:2]
+    h_p, w_p = pred_u8.shape[:2]
+    if (h_g, w_g) != (h_p, w_p):
+        try:
+            # from PIL import Image as _PIL
+            pred_u8 = np.array(_PIL.fromarray(pred_u8).resize((w_g, h_g), resample=_PIL.NEAREST), dtype=np.uint8)
+        except Exception:
+            pass
+
+    # 计算差异的最大连通分量代表点
+    dbg_path = None
+    if dbg_out_dir:
+        try:
+            subdir = os.path.join(dbg_out_dir, stem(gt_mask_path))
+            os.makedirs(subdir, exist_ok=True)
+            dbg_path = os.path.join(subdir, f"dbg_{max(0, int(current_points_len))}.png")
+        except Exception:
+            dbg_path = None
+    rep = largest_diff_component_representative(gt_u8, pred_u8, connectivity=2, min_area=0, dbg_out_path=dbg_path)
+    if rep is None:
+        print(f"[INFO] no diff component; skip append")
+        return None, None, None
+    x_next = int(rep["x"])  # 列
+    y_next = int(rep["y"])  # 行
+    label_next = 1 if int(rep["sign"]) > 0 else 0
+    return x_next, y_next, label_next
+
+def main() -> None:
+    global _PIL
+    args = parse_args()
+
+    # Debug-only mode: read JSON, generate debug images but do not write JSON
+    if args.debug_json:
+        if not args.debug_output_dir:
+            raise RuntimeError("--debug_output_dir is required when --debug_json is set")
+        json_path = args.debug_json
+        if not os.path.isfile(json_path):
+            raise FileNotFoundError(f"Debug JSON not found: {json_path}")
+        with open(json_path, 'r', encoding='utf-8') as f:
+            content = f.read().strip()
+        try:
+            arr = json.loads(content)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"Debug JSON must be a JSON array: {e}")
+        if not isinstance(arr, list):
+            raise RuntimeError("Debug JSON root must be a JSON array")
+
+        num_generated = 0
+        for rec in arr:
+            if not isinstance(rec, dict):
+                continue
+            image_path = rec.get("image")
+            sam_masks_dir = rec.get("sam_masks_dir")
+            points = rec.get("points", [])
+            labels = rec.get("labels", [])
+            if not (image_path and sam_masks_dir and isinstance(points, list) and isinstance(labels, list)):
+                continue
+            if len(points) != len(labels):
+                continue
+            sample_stem = stem(image_path)
+            # Load gt as all-zero array to preserve panel structure; we visualize differences of predicted masks only
+            for i, (pt, lb) in enumerate(zip(points, labels)):
+                # For step i, compare masks of step i and i-1 (i==0 uses empty prev)
+                try:
+                    cur_path = os.path.join(sam_masks_dir, sample_stem, f"{i}.png")
+                    cur = np.array(_PIL.open(to_abs(cur_path)).convert("L"), dtype=np.uint8) if os.path.isfile(cur_path) else None
+                except Exception:
+                    cur = None
+                if cur is None:
+                    continue
+                if i == 0:
+                    prev = np.zeros_like(cur, dtype=np.uint8)
+                else:
+                    try:
+                        prev_path = os.path.join(sam_masks_dir, sample_stem, f"{i-1}.png")
+                        prev = np.array(_PIL.open(to_abs(prev_path)).convert("L"), dtype=np.uint8) if os.path.isfile(prev_path) else np.zeros_like(cur, dtype=np.uint8)
+                    except Exception:
+                        prev = np.zeros_like(cur, dtype=np.uint8)
+                # Render panels with provided point
+                try:
+                    subdir = os.path.join(args.debug_output_dir, sample_stem)
+                    os.makedirs(subdir, exist_ok=True)
+                    dbg_path = os.path.join(subdir, f"dbg_{i}.png")
+                except Exception:
+                    dbg_path = None
+                _render_diff_panels_with_point(prev, cur, (float(pt[0]), float(pt[1])), int(lb), dbg_path)
+                num_generated += 1
+        print(f"Generated debug images for {num_generated} steps into {args.debug_output_dir}")
+        return
+
+    # 追加模式：读取已有JSON数组，计算下一提示点并写回
+    if args.appendto_jsonl:
+        json_path = args.appendto_jsonl
+        if not os.path.isfile(json_path):
+            raise FileNotFoundError(f"Append target not found: {json_path}")
+        with open(json_path, 'r', encoding='utf-8') as f:
+            content = f.read().strip()
+        try:
+            arr = json.loads(content)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"Append target must be a JSON array: {e}")
+        if not isinstance(arr, list):
+            raise RuntimeError("Append target root must be a JSON array")
+
+        updated = 0
+        for idx, rec in enumerate(arr):
+            if not isinstance(rec, dict):
+                continue
+            image_path = rec.get("image")
+            gt_mask_path = rec.get("gt_mask")
+            sam_masks_dir = rec.get("sam_masks_dir")
+            points_list = rec.get("points", [])
+            labels_list = rec.get("labels", [])
+
+            if not (image_path and gt_mask_path and sam_masks_dir):
+                print(f"[WARN] Skip idx {idx}: missing fields")
+                continue
+
+            x_next, y_next, label_next = calculate_next_point(
+                gt_mask_path,
+                sam_masks_dir,
+                len(points_list),
+                dbg_out_dir=args.debug_output_dir,
+            )
+            if x_next is None or y_next is None or label_next is None:
+                continue
+
+            # 追加points与labels
+            if not isinstance(points_list, list):
+                points_list = []
+            if not isinstance(labels_list, list):
+                labels_list = []
+            points_list.append([x_next, y_next])
+            labels_list.append(int(label_next))
+            rec["points"] = points_list
+            rec["labels"] = labels_list
+            updated += 1
+
+        # 回写同一文件
+        with open(json_path, 'w', encoding='utf-8') as f:
+            json.dump(arr, f, indent=2, ensure_ascii=False)
+        print(f"Appended next prompts to {json_path} (updated {updated} items)")
+        return
+
+    # 否则：首写模式，生成首个提示点（与之前逻辑一致）
+    if not args.images_dir or not args.masks_dir or not args.output_jsonl:
+        raise RuntimeError("images_dir, masks_dir and output_jsonl are required for initial generation mode")
+
+    images_dir = args.images_dir
+    masks_dir = args.masks_dir
+    output_jsonl = args.output_jsonl
+    allowed_image_exts = tuple(e.strip().lower() for e in args.image_exts.split(",") if e.strip())
+
+    os.makedirs(os.path.dirname(output_jsonl) or ".", exist_ok=True)
+    # Visualization output disabled
+    # if args.viz_dir:
+    #     os.makedirs(args.viz_dir, exist_ok=True)
+
+    # Gather masks as the source of truth
+    mask_files = list_files_with_exts(masks_dir, allowed_exts=(".png",))
+    if len(mask_files) == 0:
+        raise RuntimeError(f"No mask PNG files found under {masks_dir}")
+
+    num_written = 0
+    num_skipped_empty = 0
+    num_missing_images = 0
+    num_size_mismatch = 0
+
+    with open(output_jsonl, "w", encoding="utf-8") as out_f:
+        for mask_name in mask_files:
+            sample_stem = stem(mask_name)
+            mask_path = os.path.join(masks_dir, mask_name)
+            
+            # Load mask
+            try:
+                mask_img = _PIL.open(to_abs(mask_path))
+                mask_u8 = np.array(mask_img, dtype=np.uint8)
+            except Exception as e:
+                print(f"[WARN] Skipping unreadable mask: {mask_path} ({e})")
+                continue
+            
+            x_next, y_next, label_next = calculate_next_point(
+                mask_path,
+                None,
+                0,
+                dbg_out_dir=args.debug_output_dir,
+            )
+            if x_next is None or y_next is None or label_next is None:
+                if args.skip_empty:
+                    num_skipped_empty += 1
+                    continue
+                else:
+                    # For empty masks and skip_empty=False, place centroid at image center
+                    h, w = mask_u8.shape[:2]
+                    centroid = (float(w - 1) / 2.0, float(h - 1) / 2.0)
+            centroid = (x_next, y_next)
+
+            # Find corresponding image
+            img_path = find_corresponding_image(images_dir, sample_stem, allowed_image_exts)
+            if img_path is None:
+                num_missing_images += 1
+                print(f"[WARN] Missing image for mask stem '{sample_stem}' in {images_dir}")
+                continue
+           
+            image_field = os.path.abspath(img_path) if args.abs_paths else img_path
+            mask_field = os.path.abspath(mask_path) if args.abs_paths else mask_path
+            record = {"image": image_field, "gt_mask": mask_field, "points": [[float(centroid[0]), float(centroid[1])]], "labels": [1]}
+            out_f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            num_written += 1
+
+            # Visualization
+            if False and args.viz_dir:
+                try:
+                    # Load image RGB
+                    with _PIL.open(to_abs(img_path)) as im_rgb:
+                        im_rgb = im_rgb.convert("RGB")
+                        w_im, h_im = im_rgb.size
+                        
+                        # Ensure mask size matches visualization image
+                        m = mask_u8
+                        if (m.shape[1], m.shape[0]) != (w_im, h_im):
+                            # resize nearest for mask
+                            m_img = Image.fromarray(m)
+                            m_img = m_img.resize((w_im, h_im), resample=Image.NEAREST)
+                            m = np.array(m_img, dtype=np.uint8)
+                        
+                        # Create colored mask overlay
+                        overlay = Image.new("RGBA", (w_im, h_im), (0, 0, 0, 0))
+                        mask_alpha = int(max(0.0, min(1.0, args.viz_alpha)) * 255)
+                        color = (255, 0, 0, mask_alpha)
+                        # Build alpha mask where foreground>0
+                        fg = (m > 0).astype(np.uint8) * mask_alpha
+                        alpha_img = Image.fromarray(fg, mode="L")
+                        color_img = Image.new("RGBA", (w_im, h_im), color)
+                        overlay.paste(color_img, (0, 0), mask=alpha_img)
+                        
+                        # Compose overlay on image
+                        comp = im_rgb.convert("RGBA")
+                        comp = Image.alpha_composite(comp, overlay)
+                        
+                        # Draw the deepest point
+                        draw = ImageDraw.Draw(comp)
+                        px, py = float(centroid[0]), float(centroid[1])
+                        r = max(1, int(args.viz_radius))
+                        draw.ellipse((px - r, py - r, px + r, py + r), outline=(0, 255, 0, 255), width=2)
+                        
+                        # Save
+                        out_name = f"{sample_stem}.png"
+                        comp.convert("RGB").save(os.path.join(args.viz_dir, out_name))
+                except Exception as e:
+                    print(f"[WARN] Visualization failed for {img_path}: {e}")
+
+    print(f"Wrote {num_written} samples to {output_jsonl}")
+    if num_skipped_empty:
+        print(f"Skipped empty masks: {num_skipped_empty}")
+    if num_missing_images:
+        print(f"Masks with missing images: {num_missing_images}")
+    if num_size_mismatch:
+        print(f"Image/Mask size mismatches adjusted: {num_size_mismatch}")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+```
+
+已按你的要求重构并保持可视化风格一致：
+
+- 抽取可视化函数
+  - 新增 `_render_diff_panels_with_point(A,B, point_xy, label, dbg_out_path, connectivity=2)`：
+    - 复用 `largest_diff_component_representative` 的三联面板绘制逻辑（A/B叠加、符号差分C、着色连通域），但不再计算质心，而是用传入的 `point_xy` 标注位置。
+    - 前景用“^”，背景用“X”，配色与描边样式保持一致。
+
+- 调试模式逻辑修改（不再重新计算点）
+  - 读取 `--debug_json`（JSON数组），对每条记录直接使用 `points[i], labels[i]`。
+  - 对第 i 步：读取 `sam_masks_dir/{stem}/{i}.png` 作为当前掩膜；前一帧使用 `i-1` 的掩膜（`i==0` 用全零），然后调用 `_render_diff_panels_with_point(prev, cur, points[i], labels[i], ...)` 生成面板图，输出到 `--debug_output_dir/{stem}/dbg_{i}.png`。
+  - 其它渲染细节（标题、色彩、透明度、连通域着色）保持与原始一致。
+
+- 首次生成/追加模式未变；仅调试模式的点来源切换为 JSON 中已计算好的序列。
+
+---
+
+**User**
+
+既然已有_render_diff_panels_with_point，把largest_diff_component_representative中的输出可视化图像部分代码用该函数取代，以使代码简洁并便于维护。
+
+---
+
+**Cursor**
+
+I'll refactor the visualization inside largest_diff_component_representative to call the existing _render_diff_panels_with_point helper, keeping the same centroid and sign-derived label, for consistency and maintainability. Now applying the edit.
+
+```python
+#!/usr/bin/env python3
+
+"""
+Generate JSONL supervision (image,x,y) by computing a "deep interior" point of
+binary masks using the Euclidean Distance Transform (EDT) maximum.
+
+Each output line is a JSON object like:
+  {"image": "/abs/path/to/image.jpg", "gt_mask": "/abs/path/to/mask.png", "points": [[123.4,456.7]], "labels": [1]}
+
+Coordinates are in pixel space of the original image/mask pair.
+Designed for Seg-R1 heatmap-classification pretraining pipelines.
+
+Example usage:
+  # 1) 首次生成（计算首个最佳提示点）
+  python seg-rl/annotator/gen_point_jsonl_from_masks.py \
+    --images_dir /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/canonical/images \
+    --masks_dir  /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/canonical/masks \
+    --output_jsonl /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour.jsonl
+
+  /opt/anaconda3/envs/seg-r1/bin/python seg-rl/annotator/gen_point_jsonl_from_masks.py \
+    --images_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/images \
+    --masks_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/masks \
+    --output_jsonl datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour-251002.jsonl
+
+  # 2) 追加模式（为每条记录计算后续的第2个及以后提示点）
+  python seg-rl/annotator/gen_point_jsonl_from_masks.py \
+    --appendto_jsonl /root/autodl-tmp/datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour.jsonl
+
+  /opt/anaconda3/envs/seg-r1/bin/python seg-rl/annotator/gen_point_jsonl_from_masks.py \
+    --appendto_jsonl datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour-251003.jsonl
+
+  # 3) 调试模式（生成调试图像）
+  /opt/anaconda3/envs/seg-r1/bin/python seg-rl/annotator/gen_point_jsonl_from_masks.py \
+    --debug_json datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour-1.jsonl \
+    --debug_output_dir output/braintumour/dbg_gen_point
+
+Notes:
+- Foreground is defined as any non-zero pixel in the mask.
+- Target point is the pixel farthest from the background (EDT argmax), which
+  is guaranteed to lie inside the foreground, robust to holes and thin parts.
+- Samples with empty masks are skipped by default (override with --skip_empty false).
+"""
+
+import argparse
+import json
+import os
+from typing import Dict, Iterable, List, Optional, Tuple
+
+import numpy as np
+# from PIL import Image, ImageDraw
+from PIL import Image as _PIL
+from scipy.ndimage import label, distance_transform_edt
+import cv2  # type: ignore
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Create/Append deepest-point prompts from masks using EDT")
+    # 互斥：首写输出 vs 追加到已存在的JSON数组
+    group = p.add_mutually_exclusive_group(required=True)
+    group.add_argument("--output_jsonl", type=str, help="Path to write JSONL lines for first prompts")
+    group.add_argument("--appendto_jsonl", type=str, help="Path to existing JSON array to append next prompts")
+    group.add_argument("--debug_json", type=str, help="Path to JSON array to read for debug visualization only")
+
+    # 首次生成模式需要的参数（在追加模式下将被忽略）
+    p.add_argument("--images_dir", type=str, default=None, help="Directory containing images (e.g., JPG)")
+    p.add_argument("--masks_dir", type=str, default=None, help="Directory containing PNG masks aligned to images")
+    p.add_argument("--abs_paths", type=lambda s: s.lower() in {"1","true","yes","y"}, default=True,
+                   help="Write absolute image paths (default: True)")
+    p.add_argument("--skip_empty", type=lambda s: s.lower() in {"1","true","yes","y"}, default=True,
+                   help="Skip samples where mask is empty (default: True)")
+    p.add_argument("--image_exts", type=str, default=".jpg,.jpeg,.png",
+                   help="Comma-separated acceptable image extensions (default: .jpg,.jpeg,.png)")
+    p.add_argument("--viz_dir", type=str, default=None, help="Optional directory to save overlay visualizations")
+    p.add_argument("--viz_alpha", type=float, default=0.35, help="Alpha for mask overlay (0-1)")
+    p.add_argument("--viz_radius", type=int, default=4, help="Radius (pixels) for deepest-point circle")
+    p.add_argument("--debug_output_dir", type=str, default=None,
+                   help="If set, write per-sample debug images for diff component selection")
+    return p.parse_args()
+
+
+def list_files_with_exts(directory: str, allowed_exts: Tuple[str, ...]) -> List[str]:
+    directory = to_abs(directory) or directory
+    if not os.path.isdir(directory):
+        raise FileNotFoundError(f"Directory not found: {directory}")
+    out: List[str] = []
+    for name in os.listdir(directory):
+        if os.path.isdir(os.path.join(directory, name)):
+            continue
+        if any(name.lower().endswith(ext) for ext in allowed_exts):
+            out.append(name)
+    return sorted(out)
+
+
+def stem(path: str) -> str:
+    name = os.path.basename(path)
+    # Remove common two-part extensions like .nii.gz by iterative splitext
+    base, ext = os.path.splitext(name)
+    return base
+
+
+def to_abs(path: Optional[str]) -> Optional[str]:
+    if path is None:
+        return None
+    return os.path.abspath(path) if not os.path.isabs(path) else path
+
+
+def _find_latest_mask_path(sam_masks_dir: str, image_stem: str, current_points_len: int) -> Optional[str]:
+    """返回该图像在sam_masks_dir下的最新预测mask路径。
+    优先尝试 sam_masks_dir/<stem>/<current_points_len-1>.png；若不存在，
+    则在该目录下寻找最大数字文件名的png。
+    """
+    candidate_dir = os.path.join(sam_masks_dir, image_stem)
+    if not os.path.isdir(candidate_dir):
+        return None
+    k = max(0, int(current_points_len - 1))
+    preferred = os.path.join(candidate_dir, f"{k}.png")
+    if os.path.isfile(preferred):
+        return preferred
+    # fallback: find max numeric png
+    best_idx = -1
+    best_path = None
+    for name in os.listdir(candidate_dir):
+        if not name.lower().endswith(".png"):
+            continue
+        s = os.path.splitext(name)[0]
+        try:
+            idx = int(s)
+        except Exception:
+            continue
+        if idx > best_idx:
+            best_idx = idx
+            best_path = os.path.join(candidate_dir, name)
+    return best_path
+
+from scipy import ndimage as ndi
+
+def farthest_point_from_boundary(mask: np.ndarray) -> Optional[Tuple[float, float]]:
+    # mask: 二值数组，区域为 True/1，背景为 False/0
+    mask = (mask > 0)
+    dist = ndi.distance_transform_edt(mask)  # 区域内每点到背景的欧氏距离
+    y, x = np.unravel_index(np.argmax(dist), dist.shape)
+    # r = float(dist[y, x])  # 到边界的最大最小距离
+    # return (y, x), r
+    return (float(x), float(y))
+
+def compute_centroid(mask_u8: np.ndarray) -> Optional[Tuple[float, float]]:
+    """
+    Compute a robust interior point (x,y) for the foreground mask as the
+    Euclidean Distance Transform (EDT) maximum (i.e., the pixel farthest from
+    the background). Returns None if the mask has no foreground.
+    """
+    if mask_u8.ndim == 3:
+        # If mask has channels, convert to single channel by any non-zero across channels
+        mask_u8 = (mask_u8.any(axis=2)).astype(np.uint8) * 255
+    m = (mask_u8 > 0).astype(np.uint8)
+    # Preprocess: keep largest connected component and fill holes for robustness
+    try:
+        from scipy import ndimage as ndi  # type: ignore
+        if m.sum() > 0:
+            labels, nlab = ndi.label(m, structure=np.array([[1,1,1],[1,1,1],[1,1,1]], dtype=np.uint8))
+            if nlab > 1:
+                sizes = ndi.sum(m, labels, index=range(1, nlab + 1))
+                largest_idx = int(np.argmax(sizes)) + 1
+                m = (labels == largest_idx).astype(np.uint8)
+            # Fill holes
+            m = ndi.binary_fill_holes(m > 0).astype(np.uint8)
+    except Exception:
+        try:
+            import cv2  # type: ignore
+            if m.sum() > 0:
+                # Connected components with stats; background is label 0
+                num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+                if num_labels > 2:
+                    # Find largest non-background component by area (stats[:, cv2.CC_STAT_AREA])
+                    areas = stats[1:, cv2.CC_STAT_AREA]
+                    largest_idx = 1 + int(np.argmax(areas))
+                    m = (labels == largest_idx).astype(np.uint8)
+                elif num_labels == 2:
+                    # Only one foreground component
+                    m = (labels == 1).astype(np.uint8)
+                # Fill holes via flood fill on background
+                h, w = m.shape
+                inv = (1 - m) * 255
+                ff = inv.copy()
+                mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+                cv2.floodFill(ff, mask, seedPoint=(0, 0), newVal=128)
+                holes = (ff != 128)  # interior background
+                m = ((1 - inv/255).astype(np.uint8) | holes.astype(np.uint8))
+        except Exception:
+            # If no morphology libs, proceed without preprocessing
+            pass
+    if m.sum() == 0:
+        return None
+    # Prefer SciPy's true Euclidean distance; fallback to OpenCV if SciPy unavailable
+    dist = None
+    try:
+        from scipy import ndimage as ndi  # type: ignore
+        dist = ndi.distance_transform_edt(m)
+    except Exception:
+        try:
+            import cv2  # type: ignore
+            dist = cv2.distanceTransform(m, distanceType=cv2.DIST_L2, maskSize=5)
+        except Exception:
+            # As a last resort, use cityblock (L1) via iterative distance on uint8
+            # This is a coarse fallback and less accurate than EDT.
+            # Here we approximate by growing distance in four-neighborhood.
+            h, w = m.shape
+            dist = np.zeros_like(m, dtype=np.float32)
+            # Forward pass
+            for y in range(h):
+                for x in range(w):
+                    if m[y, x] == 0:
+                        continue
+                    v = dist[y, x]
+                    if y > 0:
+                        v = max(v, dist[y - 1, x] + 1.0)
+                    if x > 0:
+                        v = max(v, dist[y, x - 1] + 1.0)
+                    dist[y, x] = v
+            # Backward pass
+            for y in range(h - 1, -1, -1):
+                for x in range(w - 1, -1, -1):
+                    if m[y, x] == 0:
+                        continue
+                    v = dist[y, x]
+                    if y + 1 < h:
+                        v = max(v, dist[y + 1, x] + 1.0)
+                    if x + 1 < w:
+                        v = max(v, dist[y, x + 1] + 1.0)
+                    dist[y, x] = v
+    # Argmax returns (y, x)
+    y, x = np.unravel_index(np.argmax(dist), dist.shape)
+    return (float(x), float(y))
+
+def largest_diff_component_representative(A, B, connectivity=2, min_area=0, dbg_out_path: Optional[str] = None):
+    # A, B: 2D uint8 arrays, values {0,1} 或 {0,255}
+    A = (A > 0).astype(np.uint8)
+    B = (B > 0).astype(np.uint8)
+    C = A.astype(np.int8) - B.astype(np.int8)  # {-1, 0, +1}
+
+    regions = []
+    # 8 邻域结构元（connectivity=2 表示 8 邻域；=1 表示 4 邻域）
+    st = np.ones((3,3), dtype=np.uint8) if connectivity == 2 else np.array([[0,1,0],[1,1,1],[0,1,0]], dtype=np.uint8)
+
+    for sign, mask in ((1, C > 0), (-1, C < 0)):
+        if not mask.any():
+            continue
+        lab, n = label(mask, structure=st)
+        if n == 0:
+            continue
+        areas = np.bincount(lab.ravel())[1:]  # 忽略背景0
+        if min_area > 0:
+            keep_ids = np.where(areas >= min_area)[0] + 1
+            if keep_ids.size == 0:
+                continue
+            mask2 = np.isin(lab, keep_ids)
+            lab, n = label(mask2, structure=st)
+            if n == 0:
+                continue
+            areas = np.bincount(lab.ravel())[1:]
+
+        k = np.argmax(areas) + 1
+        comp = (lab == k)
+        regions.append((sign, int(areas[k-1]), comp))
+
+    if not regions:
+        return None  # 无非零差异
+
+    # 选面积最大的分量；若需以“最深”优先，可在 key 中加入 max EDT 作为次序
+    sign, area, comp = max(regions, key=lambda t: t[1])
+
+    # centroid = farthest_point_from_boundary(comp)
+    # # centroid = compute_centroid(comp)
+    # if centroid is None:
+    #     return None
+    D = distance_transform_edt(comp)
+    (centroidY, centroidX) = np.unravel_index(np.argmax(D), D.shape)
+
+    # 调试可视化（改用统一的渲染函数，保持风格一致）
+    if dbg_out_path:
+        try:
+            _render_diff_panels_with_point(
+                A=(A > 0).astype(np.uint8),
+                B=(B > 0).astype(np.uint8),
+                point_xy=(float(centroidX), float(centroidY)),
+                label=1 if int(sign) > 0 else 0,
+                dbg_out_path=dbg_out_path,
+                connectivity=connectivity,
+            )
+        except Exception:
+            pass
+
+    return dict(sign=sign, area=area, y=int(centroidY), x=int(centroidX), max_radius=float(D[centroidY, centroidX]))
+
+
+def _render_diff_panels_with_point(
+    A: np.ndarray,
+    B: np.ndarray,
+    point_xy: Tuple[float, float],
+    label: int,
+    dbg_out_path: Optional[str],
+    connectivity: int = 2,
+) -> None:
+    """Render 3-panel debug image reusing the visualization style in
+    largest_diff_component_representative, but mark a provided point instead of
+    the recomputed centroid.
+    - Panel 1: A (green) vs B (red) overlay
+    - Panel 2: signed diff C (positive green, negative red)
+    - Panel 3: connected components colored, with marker at point_xy
+    """
+    try:
+        if dbg_out_path is None:
+            return
+        h, w = A.shape[:2]
+        # Panel 1: A/B overlay (A=green, B=red)
+        overlay1 = np.zeros((h, w, 3), dtype=np.uint8)
+        overlay1[..., 1] = (A > 0).astype(np.uint8) * 255  # G
+        overlay1[..., 2] = (B > 0).astype(np.uint8) * 255  # R
+        bg = np.zeros_like(overlay1)
+        panel1 = cv2.addWeighted(bg, 1.0, overlay1, 0.6, 0.0)
+
+        # Panel 2: signed diff C (positive green, negative red)
+        C = A.astype(np.int8) - B.astype(np.int8)
+        panel2 = np.zeros((h, w, 3), dtype=np.uint8)
+        pos = (C > 0)
+        neg = (C < 0)
+        panel2[pos, 1] = 255
+        panel2[neg, 2] = 255
+
+        # Panel 3: connected components colored + provided point marker
+        panel3 = np.zeros((h, w, 3), dtype=np.uint8)
+        st = np.ones((3,3), dtype=np.uint8) if connectivity == 2 else np.array([[0,1,0],[1,1,1],[0,1,0]], dtype=np.uint8)
+        for sgn, mask in ((1, C > 0), (-1, C < 0)):
+            if not mask.any():
+                continue
+            lab, n = label(mask, structure=st)
+            if n == 0:
+                continue
+            rng = np.random.default_rng(12345 if sgn > 0 else 54321)
+            colors = (rng.integers(0, 256, size=(n, 3))).astype(np.uint8)
+            colors = np.clip(colors + 100, 0, 255)
+            for i in range(1, n + 1):
+                panel3[lab == i] = colors[i - 1]
+
+        # draw marker at provided (x,y): foreground -> caret '^', background -> 'X'
+        cx = int(round(float(point_xy[0])))
+        cy = int(round(float(point_xy[1])))
+        def _draw_cross(img, x, y, size=6, color=(255,255,255), thickness=2):
+            cv2.line(img, (x - size, y - size), (x + size, y + size), (0,0,0), thickness + 2, lineType=cv2.LINE_AA)
+            cv2.line(img, (x - size, y + size), (x + size, y - size), (0,0,0), thickness + 2, lineType=cv2.LINE_AA)
+            cv2.line(img, (x - size, y - size), (x + size, y + size), color, thickness, lineType=cv2.LINE_AA)
+            cv2.line(img, (x - size, y + size), (x + size, y - size), color, thickness, lineType=cv2.LINE_AA)
+        def _draw_caret(img, x, y, size=6, color=(255,255,255), thickness=2):
+            p_top = (int(x), int(y - size))
+            p_left = (int(x - size), int(y + size))
+            p_right = (int(x + size), int(y + size))
+            cv2.line(img, p_left, p_top, (0,0,0), thickness + 2, lineType=cv2.LINE_AA)
+            cv2.line(img, p_right, p_top, (0,0,0), thickness + 2, lineType=cv2.LINE_AA)
+            cv2.line(img, p_left, p_top, color, thickness, lineType=cv2.LINE_AA)
+            cv2.line(img, p_right, p_top, color, thickness, lineType=cv2.LINE_AA)
+        if int(label) > 0:
+            _draw_caret(panel3, cx, cy, size=6, color=(255,255,255), thickness=2)
+        else:
+            _draw_cross(panel3, cx, cy, size=6, color=(255,255,255), thickness=2)
+
+        # Titles
+        def _add_title(img: np.ndarray, text: str) -> None:
+            band_h = max(20, min(48, img.shape[0] // 20))
+            roi = img[0:band_h, :, :]
+            overlay = roi.copy()
+            cv2.rectangle(overlay, (0, 0), (img.shape[1] - 1, band_h - 1), (0, 0, 0), thickness=-1)
+            cv2.addWeighted(overlay, 0.5, roi, 0.5, 0, dst=roi)
+            org = (8, band_h - 6)
+            cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, lineType=cv2.LINE_AA)
+            cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, lineType=cv2.LINE_AA)
+        _add_title(panel1, "Overlay A (green) vs B (red)")
+        _add_title(panel2, "Signed diff C: + (green), - (red)")
+        _add_title(panel3, "Components + selected point")
+
+        canvas = np.concatenate([panel1, panel2, panel3], axis=1)
+        os.makedirs(os.path.dirname(dbg_out_path) or ".", exist_ok=True)
+        _PIL.fromarray(canvas[..., ::-1]).save(dbg_out_path)
+    except Exception:
+        pass
+
+def find_corresponding_image(
+    images_dir: str,
+    sample_stem: str,
+    allowed_exts: Tuple[str, ...],
+) -> Optional[str]:
+    images_dir_abs = to_abs(images_dir)
+    for ext in allowed_exts:
+        candidate = os.path.join(images_dir_abs, sample_stem + ext)
+        if os.path.isfile(candidate):
+            return candidate
+    # Fallback: scan directory and match by stem (handles mixed-case extensions or uncommon extensions)
+    for name in os.listdir(images_dir_abs):
+        if stem(name).lower() == sample_stem.lower():
+            return os.path.join(images_dir_abs, name)
+    return None
+
+def calculate_next_point(gt_mask_path, sam_masks_dir, current_points_len, dbg_out_dir: Optional[str] = None):
+    # 读取gt与pred
+    try:
+        gt_u8 = np.array(_PIL.open(to_abs(gt_mask_path)), dtype=np.uint8)
+        if current_points_len > 0:
+            last_mask_path = _find_latest_mask_path(sam_masks_dir, stem(gt_mask_path), current_points_len)
+            if not last_mask_path or not os.path.isfile(last_mask_path):
+                print(f"[WARN] Skip: last mask not found under {sam_masks_dir}")
+                return None, None, None
+            pred_u8 = np.array(_PIL.open(to_abs(last_mask_path)), dtype=np.uint8)
+        else:
+            pred_u8 = np.zeros_like(gt_u8)
+    except Exception as e:
+        print(f"[WARN] Skip: failed to read masks ({e})")
+        return None, None, None
+
+    # 若形状不同，将pred按最近邻缩放到gt尺寸
+    h_g, w_g = gt_u8.shape[:2]
+    h_p, w_p = pred_u8.shape[:2]
+    if (h_g, w_g) != (h_p, w_p):
+        try:
+            # from PIL import Image as _PIL
+            pred_u8 = np.array(_PIL.fromarray(pred_u8).resize((w_g, h_g), resample=_PIL.NEAREST), dtype=np.uint8)
+        except Exception:
+            pass
+
+    # 计算差异的最大连通分量代表点
+    dbg_path = None
+    if dbg_out_dir:
+        try:
+            subdir = os.path.join(dbg_out_dir, stem(gt_mask_path))
+            os.makedirs(subdir, exist_ok=True)
+            dbg_path = os.path.join(subdir, f"dbg_{max(0, int(current_points_len))}.png")
+        except Exception:
+            dbg_path = None
+    rep = largest_diff_component_representative(gt_u8, pred_u8, connectivity=2, min_area=0, dbg_out_path=dbg_path)
+    if rep is None:
+        print(f"[INFO] no diff component; skip append")
+        return None, None, None
+    x_next = int(rep["x"])  # 列
+    y_next = int(rep["y"])  # 行
+    label_next = 1 if int(rep["sign"]) > 0 else 0
+    return x_next, y_next, label_next
+
+def main() -> None:
+    global _PIL
+    args = parse_args()
+
+    # Debug-only mode: read JSON, generate debug images but do not write JSON
+    if args.debug_json:
+        if not args.debug_output_dir:
+            raise RuntimeError("--debug_output_dir is required when --debug_json is set")
+        json_path = args.debug_json
+        if not os.path.isfile(json_path):
+            raise FileNotFoundError(f"Debug JSON not found: {json_path}")
+        with open(json_path, 'r', encoding='utf-8') as f:
+            content = f.read().strip()
+        try:
+            arr = json.loads(content)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"Debug JSON must be a JSON array: {e}")
+        if not isinstance(arr, list):
+            raise RuntimeError("Debug JSON root must be a JSON array")
+
+        num_generated = 0
+        for rec in arr:
+            if not isinstance(rec, dict):
+                continue
+            image_path = rec.get("image")
+            sam_masks_dir = rec.get("sam_masks_dir")
+            points = rec.get("points", [])
+            labels = rec.get("labels", [])
+            if not (image_path and sam_masks_dir and isinstance(points, list) and isinstance(labels, list)):
+                continue
+            if len(points) != len(labels):
+                continue
+            sample_stem = stem(image_path)
+            # Load gt as all-zero array to preserve panel structure; we visualize differences of predicted masks only
+            for i, (pt, lb) in enumerate(zip(points, labels)):
+                # For step i, compare masks of step i and i-1 (i==0 uses empty prev)
+                try:
+                    cur_path = os.path.join(sam_masks_dir, sample_stem, f"{i}.png")
+                    cur = np.array(_PIL.open(to_abs(cur_path)).convert("L"), dtype=np.uint8) if os.path.isfile(cur_path) else None
+                except Exception:
+                    cur = None
+                if cur is None:
+                    continue
+                if i == 0:
+                    prev = np.zeros_like(cur, dtype=np.uint8)
+                else:
+                    try:
+                        prev_path = os.path.join(sam_masks_dir, sample_stem, f"{i-1}.png")
+                        prev = np.array(_PIL.open(to_abs(prev_path)).convert("L"), dtype=np.uint8) if os.path.isfile(prev_path) else np.zeros_like(cur, dtype=np.uint8)
+                    except Exception:
+                        prev = np.zeros_like(cur, dtype=np.uint8)
+                # Render panels with provided point
+                try:
+                    subdir = os.path.join(args.debug_output_dir, sample_stem)
+                    os.makedirs(subdir, exist_ok=True)
+                    dbg_path = os.path.join(subdir, f"dbg_{i}.png")
+                except Exception:
+                    dbg_path = None
+                _render_diff_panels_with_point(prev, cur, (float(pt[0]), float(pt[1])), int(lb), dbg_path)
+                num_generated += 1
+        print(f"Generated debug images for {num_generated} steps into {args.debug_output_dir}")
+        return
+
+    # 追加模式：读取已有JSON数组，计算下一提示点并写回
+    if args.appendto_jsonl:
+        json_path = args.appendto_jsonl
+        if not os.path.isfile(json_path):
+            raise FileNotFoundError(f"Append target not found: {json_path}")
+        with open(json_path, 'r', encoding='utf-8') as f:
+            content = f.read().strip()
+        try:
+            arr = json.loads(content)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"Append target must be a JSON array: {e}")
+        if not isinstance(arr, list):
+            raise RuntimeError("Append target root must be a JSON array")
+
+        updated = 0
+        for idx, rec in enumerate(arr):
+            if not isinstance(rec, dict):
+                continue
+            image_path = rec.get("image")
+            gt_mask_path = rec.get("gt_mask")
+            sam_masks_dir = rec.get("sam_masks_dir")
+            points_list = rec.get("points", [])
+            labels_list = rec.get("labels", [])
+
+            if not (image_path and gt_mask_path and sam_masks_dir):
+                print(f"[WARN] Skip idx {idx}: missing fields")
+                continue
+
+            x_next, y_next, label_next = calculate_next_point(
+                gt_mask_path,
+                sam_masks_dir,
+                len(points_list),
+                dbg_out_dir=args.debug_output_dir,
+            )
+            if x_next is None or y_next is None or label_next is None:
+                continue
+
+            # 追加points与labels
+            if not isinstance(points_list, list):
+                points_list = []
+            if not isinstance(labels_list, list):
+                labels_list = []
+            points_list.append([x_next, y_next])
+            labels_list.append(int(label_next))
+            rec["points"] = points_list
+            rec["labels"] = labels_list
+            updated += 1
+
+        # 回写同一文件
+        with open(json_path, 'w', encoding='utf-8') as f:
+            json.dump(arr, f, indent=2, ensure_ascii=False)
+        print(f"Appended next prompts to {json_path} (updated {updated} items)")
+        return
+
+    # 否则：首写模式，生成首个提示点（与之前逻辑一致）
+    if not args.images_dir or not args.masks_dir or not args.output_jsonl:
+        raise RuntimeError("images_dir, masks_dir and output_jsonl are required for initial generation mode")
+
+    images_dir = args.images_dir
+    masks_dir = args.masks_dir
+    output_jsonl = args.output_jsonl
+    allowed_image_exts = tuple(e.strip().lower() for e in args.image_exts.split(",") if e.strip())
+
+    os.makedirs(os.path.dirname(output_jsonl) or ".", exist_ok=True)
+    # Visualization output disabled
+    # if args.viz_dir:
+    #     os.makedirs(args.viz_dir, exist_ok=True)
+
+    # Gather masks as the source of truth
+    mask_files = list_files_with_exts(masks_dir, allowed_exts=(".png",))
+    if len(mask_files) == 0:
+        raise RuntimeError(f"No mask PNG files found under {masks_dir}")
+
+    num_written = 0
+    num_skipped_empty = 0
+    num_missing_images = 0
+    num_size_mismatch = 0
+
+    with open(output_jsonl, "w", encoding="utf-8") as out_f:
+        for mask_name in mask_files:
+            sample_stem = stem(mask_name)
+            mask_path = os.path.join(masks_dir, mask_name)
+            
+            # Load mask
+            try:
+                mask_img = _PIL.open(to_abs(mask_path))
+                mask_u8 = np.array(mask_img, dtype=np.uint8)
+            except Exception as e:
+                print(f"[WARN] Skipping unreadable mask: {mask_path} ({e})")
+                continue
+            
+            x_next, y_next, label_next = calculate_next_point(
+                mask_path,
+                None,
+                0,
+                dbg_out_dir=args.debug_output_dir,
+            )
+            if x_next is None or y_next is None or label_next is None:
+                if args.skip_empty:
+                    num_skipped_empty += 1
+                    continue
+                else:
+                    # For empty masks and skip_empty=False, place centroid at image center
+                    h, w = mask_u8.shape[:2]
+                    centroid = (float(w - 1) / 2.0, float(h - 1) / 2.0)
+            centroid = (x_next, y_next)
+
+            # Find corresponding image
+            img_path = find_corresponding_image(images_dir, sample_stem, allowed_image_exts)
+            if img_path is None:
+                num_missing_images += 1
+                print(f"[WARN] Missing image for mask stem '{sample_stem}' in {images_dir}")
+                continue
+           
+            image_field = os.path.abspath(img_path) if args.abs_paths else img_path
+            mask_field = os.path.abspath(mask_path) if args.abs_paths else mask_path
+            record = {"image": image_field, "gt_mask": mask_field, "points": [[float(centroid[0]), float(centroid[1])]], "labels": [1]}
+            out_f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            num_written += 1
+
+            # Visualization
+            if False and args.viz_dir:
+                try:
+                    # Load image RGB
+                    with _PIL.open(to_abs(img_path)) as im_rgb:
+                        im_rgb = im_rgb.convert("RGB")
+                        w_im, h_im = im_rgb.size
+                        
+                        # Ensure mask size matches visualization image
+                        m = mask_u8
+                        if (m.shape[1], m.shape[0]) != (w_im, h_im):
+                            # resize nearest for mask
+                            m_img = Image.fromarray(m)
+                            m_img = m_img.resize((w_im, h_im), resample=Image.NEAREST)
+                            m = np.array(m_img, dtype=np.uint8)
+                        
+                        # Create colored mask overlay
+                        overlay = Image.new("RGBA", (w_im, h_im), (0, 0, 0, 0))
+                        mask_alpha = int(max(0.0, min(1.0, args.viz_alpha)) * 255)
+                        color = (255, 0, 0, mask_alpha)
+                        # Build alpha mask where foreground>0
+                        fg = (m > 0).astype(np.uint8) * mask_alpha
+                        alpha_img = Image.fromarray(fg, mode="L")
+                        color_img = Image.new("RGBA", (w_im, h_im), color)
+                        overlay.paste(color_img, (0, 0), mask=alpha_img)
+                        
+                        # Compose overlay on image
+                        comp = im_rgb.convert("RGBA")
+                        comp = Image.alpha_composite(comp, overlay)
+                        
+                        # Draw the deepest point
+                        draw = ImageDraw.Draw(comp)
+                        px, py = float(centroid[0]), float(centroid[1])
+                        r = max(1, int(args.viz_radius))
+                        draw.ellipse((px - r, py - r, px + r, py + r), outline=(0, 255, 0, 255), width=2)
+                        
+                        # Save
+                        out_name = f"{sample_stem}.png"
+                        comp.convert("RGB").save(os.path.join(args.viz_dir, out_name))
+                except Exception as e:
+                    print(f"[WARN] Visualization failed for {img_path}: {e}")
+
+    print(f"Wrote {num_written} samples to {output_jsonl}")
+    if num_skipped_empty:
+        print(f"Skipped empty masks: {num_skipped_empty}")
+    if num_missing_images:
+        print(f"Masks with missing images: {num_missing_images}")
+    if num_size_mismatch:
+        print(f"Image/Mask size mismatches adjusted: {num_size_mismatch}")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+```
+
+已完成重构：
+- 将 `largest_diff_component_representative` 中的面板可视化部分替换为调用已抽取的 `_render_diff_panels_with_point`。
+- 该函数以计算得到的 `(centroidX, centroidY)` 和 `sign` 转换的标签作为入参，生成与原先完全一致风格的三联面板。
+- 这样调试模式与差异计算模式的可视化都复用同一渲染逻辑，代码更简洁易维护。
+
+---
+
+**User**
+
+编写一个新脚本，使用前述有监督学习过程训练出的heatmap预测模型去根据输入图像和当前已有预测mask去预测下一个sam提示点。简单说，就是基于seg-rl/annotator/gen_point_jsonl_from_masks.py， 把其中使用基于EDT的“求 差值图像 最大面积单一连通域 中的 最大-最小边界距离点”函数去计算下一提示点（包括position和label信息）的部分，改成使用该预测模型仅通过image和当前预测mask做推理（而无需真值mask参与运算），去得到下一提示点。而其余部分应最大程度地保留gen_point_jsonl_from_mask.py里的相同逻辑。因此，该脚本在首次和追加模式下应该不需要涉及到真值mask，仅在调试模式时因为需要做结果可视化而涉及到使用JSON中的masks_dir去找到真值mask。需要在开头注释中包含详细的说明和调用示例。脚本放在seg-rl/heatmap/下
+
+---
+
+**Cursor**
+
+```python
+#!/usr/bin/env python3
+
+"""
+Predict next SAM prompt point (position + binary label) using a trained heatmap model.
+
+This script mirrors seg-rl/annotator/gen_point_jsonl_from_masks.py, but replaces the
+EDT-based next-point computation with a model inference that takes only:
+  - the RGB image, and
+  - the current predicted mask (or zero mask at step 0)
+and outputs the next prompt point and its label.
+
+Modes:
+  1) Initial generation (write new JSON array):
+     - For each image under --images_dir, predict the first prompt (i=0) with a zero mask.
+     - Write a JSON array with records like:
+         {"image": "/abs/path.jpg", "sam_masks_dir": "/abs/sam_dir", "points": [[x0,y0]], "labels": [l0]}
+
+  2) Append mode (update existing JSON array):
+     - Read --appendto_json as a JSON array, for each record take current length k=len(points),
+       load the latest predicted mask at {sam_dir}/{stem}/{k-1}.png (k>0; else zero), and predict
+       the next point (xk, yk, lk). Append to arrays and write back in-place.
+
+  3) Debug visualization (no file write except images):
+     - Read --debug_json (JSON array) that already contains points+labels and a sam_masks_dir.
+     - For each step i, load prev and cur predicted masks (i-1 and i; prev is zero for i=0) and
+       call the same 3-panel visualization function used by the annotator to render panels with
+       the provided point, saving to --debug_output_dir/{stem}/dbg_{i}.png.
+     - Ground-truth masks are NOT used anywhere in this script (except indirectly if you supply
+       them in your own JSON for reference; they are not required).
+
+Examples:
+  # Initial generation
+  python -m seg-rl.heatmap.predict_next_point_from_model \
+    --model_path /path/to/ckpt.pt \
+    --images_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/images \
+    --sam_dir datasets/seg_r1_md/Task01_BrainTumour/pretrain_gt_masks-251001 \
+    --output_json datasets/seg_r1_md/Task01_BrainTumour/pred_points-init.json
+
+  # Append mode
+  python -m seg-rl.heatmap.predict_next_point_from_model \
+    --model_path /path/to/ckpt.pt \
+    --appendto_json datasets/seg_r1_md/Task01_BrainTumour/pred_points-init.json \
+    --sam_dir datasets/seg_r1_md/Task01_BrainTumour/pretrain_gt_masks-251001
+
+  # Debug visualization only
+  python -m seg-rl.heatmap.predict_next_point_from_model \
+    --debug_json datasets/seg_r1_md/Task01_BrainTumour/pred_points-init.json \
+    --sam_dir datasets/seg_r1_md/Task01_BrainTumour/pretrain_gt_masks-251001 \
+    --debug_output_dir output/braintumour/dbg_model_pred
+
+Notes:
+  - The model expects 4-channel input (RGB normalized + Gray normalized mask). This script
+    normalizes RGB with ImageNet mean/std and mask with mean=0.5, std=0.5.
+  - Device selection prefers CUDA, then MPS (Apple Silicon), otherwise CPU. AMP is only used on CUDA.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+from PIL import Image
+
+import torch
+import torch.nn.functional as F
+
+try:
+    # package context
+    from .model import ModelConfig, PointHeatmapModel, soft_argmax_from_logits
+except Exception:
+    # script context
+    import sys as _sys
+    import os as _os
+    _pkg_root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    if _pkg_root not in _sys.path:
+        _sys.path.insert(0, _pkg_root)
+    from heatmap.model import ModelConfig, PointHeatmapModel, soft_argmax_from_logits
+
+try:
+    # reuse annotator visualization helper if available
+    from seg_rl.annotator.gen_point_jsonl_from_masks import _render_diff_panels_with_point  # type: ignore
+except Exception:
+    try:
+        from seg-rl.annotator.gen_point_jsonl_from_masks import _render_diff_panels_with_point  # type: ignore
+    except Exception:
+        _render_diff_panels_with_point = None  # type: ignore
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Predict next SAM prompt point via trained heatmap model")
+    group = p.add_mutually_exclusive_group(required=True)
+    group.add_argument("--output_json", type=str, help="Write a new JSON array with first predicted points")
+    group.add_argument("--appendto_json", type=str, help="Append next predicted point to an existing JSON array")
+    group.add_argument("--debug_json", type=str, help="Debug visualization only: read JSON array and render panels")
+
+    p.add_argument("--model_path", type=str, required=False, help="Path to trained model checkpoint (.pt)")
+    p.add_argument("--images_dir", type=str, default=None, help="Directory of input images (initial mode)")
+    p.add_argument("--sam_dir", type=str, required=True, help="Directory of predicted SAM masks per step: {sam_dir}/{stem}/{k}.png")
+    p.add_argument("--height", type=int, default=512)
+    p.add_argument("--width", type=int, default=512)
+    p.add_argument("--tau", type=float, default=1.0, help="Softmax temperature for heatmap -> probability")
+    p.add_argument("--amp", action="store_true")
+    p.add_argument("--progress", action="store_true")
+    p.add_argument("--debug_output_dir", type=str, default=None)
+    return p.parse_args()
+
+
+def _device_and_amp(args: argparse.Namespace) -> Tuple[torch.device, bool, str]:
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+    amp_enabled = args.amp and (device.type == "cuda")
+    autocast_device_type = "cuda" if device.type == "cuda" else "cpu"
+    return device, amp_enabled, autocast_device_type
+
+
+def _load_model(model_path: str, device: torch.device) -> PointHeatmapModel:
+    cfg = ModelConfig(backbone="unet_s", pretrained=False, in_channels=4)
+    model = PointHeatmapModel(cfg).to(device)
+    ckpt = torch.load(model_path, map_location="cpu") if model_path and os.path.isfile(model_path) else None
+    if ckpt is not None:
+        sd = ckpt.get("model", ckpt)
+        model.load_state_dict(sd, strict=False)
+    model.eval()
+    return model
+
+
+def _to_tensor_4ch(image_path: str, gray_mask: Optional[Image.Image], out_hw: Tuple[int, int]) -> torch.Tensor:
+    im = Image.open(image_path).convert("RGB")
+    im = im.resize((out_hw[1], out_hw[0]), resample=Image.BILINEAR)
+    if gray_mask is None:
+        gray = Image.new("L", im.size, 0)
+    else:
+        gray = gray_mask.convert("L").resize((out_hw[1], out_hw[0]), resample=Image.NEAREST)
+    import torchvision.transforms.functional as TF
+    rgb_t = TF.to_tensor(im)
+    rgb_t = TF.normalize(rgb_t, mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
+    g_t = TF.to_tensor(gray)
+    g_t = (g_t - 0.5) / 0.5
+    x4 = torch.cat([rgb_t, g_t], dim=0).unsqueeze(0)  # [1,4,H,W]
+    return x4
+
+
+def _predict_point(model: PointHeatmapModel, x4: torch.Tensor, device: torch.device, tau: float) -> Tuple[float, float, int]:
+    with torch.no_grad():
+        logits, label_logits = model(x4.to(device))
+        xy = soft_argmax_from_logits(logits, temperature=tau)[0]
+        lab = int(label_logits.argmax(dim=1).item())
+    return float(xy[0].item()), float(xy[1].item()), lab
+
+
+def _list_images(images_dir: str) -> List[str]:
+    exts = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+    out: List[str] = []
+    for name in sorted(os.listdir(images_dir)):
+        p = os.path.join(images_dir, name)
+        if os.path.isdir(p):
+            continue
+        if os.path.splitext(name)[1].lower() in exts:
+            out.append(p)
+    return out
+
+
+def _stem(path: str) -> str:
+    name = os.path.basename(path)
+    base, _ = os.path.splitext(name)
+    return base
+
+
+def run_initial(args: argparse.Namespace) -> None:
+    if not args.images_dir or not args.output_json:
+        raise RuntimeError("--images_dir and --output_json are required for initial mode")
+    device, amp_enabled, autocast_device_type = _device_and_amp(args)
+    model = _load_model(args.model_path, device)
+    H, W = int(args.height), int(args.width)
+
+    records: List[Dict] = []
+    images = _list_images(args.images_dir)
+    if args.progress:
+        try:
+            from tqdm import tqdm  # type: ignore
+            images_iter = tqdm(images, desc="Initial predict")
+        except Exception:
+            images_iter = images
+    else:
+        images_iter = images
+
+    for img_path in images_iter:
+        x4 = _to_tensor_4ch(img_path, gray_mask=None, out_hw=(H, W))
+        with torch.amp.autocast(device_type=autocast_device_type, enabled=amp_enabled):
+            x, y, lab = _predict_point(model, x4, device, args.tau)
+        rec = {
+            "image": os.path.abspath(img_path),
+            "sam_masks_dir": os.path.abspath(args.sam_dir),
+            "points": [[float(x), float(y)]],
+            "labels": [int(lab)],
+        }
+        records.append(rec)
+
+    os.makedirs(os.path.dirname(args.output_json) or ".", exist_ok=True)
+    with open(args.output_json, "w", encoding="utf-8") as f:
+        json.dump(records, f, indent=2, ensure_ascii=False)
+    print(f"Wrote {len(records)} records to {args.output_json}")
+
+
+def run_append(args: argparse.Namespace) -> None:
+    if not args.appendto_json:
+        raise RuntimeError("--appendto_json required for append mode")
+    if not os.path.isfile(args.appendto_json):
+        raise FileNotFoundError(args.appendto_json)
+    arr = json.loads(open(args.appendto_json, "r", encoding="utf-8").read().strip())
+    if not isinstance(arr, list):
+        raise RuntimeError("Append target must be a JSON array")
+    device, amp_enabled, autocast_device_type = _device_and_amp(args)
+    model = _load_model(args.model_path, device)
+    H, W = int(args.height), int(args.width)
+
+    updated = 0
+    for rec in arr:
+        if not isinstance(rec, dict):
+            continue
+        img_path = rec.get("image")
+        sam_dir = rec.get("sam_masks_dir") or args.sam_dir
+        pts = rec.get("points", [])
+        labs = rec.get("labels", [])
+        if not img_path:
+            continue
+        k = len(pts)
+        # prev mask
+        if k == 0:
+            gray = None
+        else:
+            stem = _stem(img_path)
+            prev_path = os.path.join(sam_dir, stem, f"{k-1}.png")
+            gray = Image.open(prev_path).convert("L") if os.path.isfile(prev_path) else None
+        x4 = _to_tensor_4ch(img_path, gray_mask=gray, out_hw=(H, W))
+        with torch.amp.autocast(device_type=autocast_device_type, enabled=amp_enabled):
+            x, y, lab = _predict_point(model, x4, device, args.tau)
+        rec["points"] = (pts or []) + [[float(x), float(y)]]
+        rec["labels"] = (labs or []) + [int(lab)]
+        if not rec.get("sam_masks_dir"):
+            rec["sam_masks_dir"] = os.path.abspath(args.sam_dir)
+        updated += 1
+
+    with open(args.appendto_json, "w", encoding="utf-8") as f:
+        json.dump(arr, f, indent=2, ensure_ascii=False)
+    print(f"Appended next points to {args.appendto_json} (updated {updated} items)")
+
+
+def run_debug(args: argparse.Namespace) -> None:
+    if not args.debug_json:
+        raise RuntimeError("--debug_json required for debug mode")
+    if not args.debug_output_dir:
+        raise RuntimeError("--debug_output_dir required for debug mode")
+    arr = json.loads(open(args.debug_json, "r", encoding="utf-8").read().strip())
+    if not isinstance(arr, list):
+        raise RuntimeError("Debug JSON must be a JSON array")
+    os.makedirs(args.debug_output_dir, exist_ok=True)
+
+    num_generated = 0
+    for rec in arr:
+        if not isinstance(rec, dict):
+            continue
+        image_path = rec.get("image")
+        sam_dir = rec.get("sam_masks_dir") or args.sam_dir
+        points = rec.get("points", [])
+        labels = rec.get("labels", [])
+        if not (image_path and isinstance(points, list) and isinstance(labels, list)):
+            continue
+        if len(points) != len(labels):
+            continue
+        stem = _stem(image_path)
+        for i, (pt, lb) in enumerate(zip(points, labels)):
+            cur_path = os.path.join(sam_dir, stem, f"{i}.png")
+            cur = Image.open(cur_path).convert("L") if os.path.isfile(cur_path) else None
+            if cur is None:
+                continue
+            cur_u8 = np.array(cur, dtype=np.uint8)
+            if i == 0:
+                prev_u8 = np.zeros_like(cur_u8, dtype=np.uint8)
+            else:
+                prev_path = os.path.join(sam_dir, stem, f"{i-1}.png")
+                prev_u8 = np.array(Image.open(prev_path).convert("L"), dtype=np.uint8) if os.path.isfile(prev_path) else np.zeros_like(cur_u8, dtype=np.uint8)
+            try:
+                subdir = os.path.join(args.debug_output_dir, stem)
+                os.makedirs(subdir, exist_ok=True)
+                out_path = os.path.join(subdir, f"dbg_{i}.png")
+            except Exception:
+                out_path = None  # type: ignore
+            if _render_diff_panels_with_point is not None and out_path is not None:
+                _render_diff_panels_with_point(prev_u8, cur_u8, (float(pt[0]), float(pt[1])), int(lb), out_path)
+                num_generated += 1
+    print(f"Generated debug images for {num_generated} steps into {args.debug_output_dir}")
+
+
+def main() -> None:
+    args = parse_args()
+    if args.output_json:
+        run_initial(args)
+        return
+    if args.appendto_json:
+        run_append(args)
+        return
+    if args.debug_json:
+        run_debug(args)
+        return
+
+
+if __name__ == "__main__":
+    main()
+
+
+```
+
+- 新增脚本 `seg-rl/heatmap/predict_next_point_from_model.py`
+  - 功能: 用训练好的 heatmap 模型，根据输入图像和当前预测 mask 推理下一个 SAM 提示点（坐标+二分类标签），完全不依赖真值 mask；仅在调试模式下用于可视化时读取预测 mask 序列渲染三联面板。
+  - 兼容三种模式:
+    - 初次生成: 遍历 `--images_dir`，i=0 使用全零灰度图，输出 JSON 数组。
+    - 追加模式: 读取 `--appendto_json` 数组，对每条记录用 `{sam_dir}/{stem}/{k-1}.png`（k=len(points)）作为当前灰度，推理并追加下一点，原地回写。
+    - 调试模式: 读取 `--debug_json` 数组，使用已有 `points[i], labels[i]` 与 `{sam_dir}/{stem}/{i}.png` 渲染三联面板（复用 `_render_diff_panels_with_point`，风格与原可视化保持一致）。
+  - 模型输入: 4通道（RGB经ImageNet均值方差规范化 + 灰度mask经mean=0.5,std=0.5）。
+  - 设备: CUDA优先，其次MPS，最后CPU；AMP仅在CUDA启用。
+  - 输出/写回格式与 `gen_point_jsonl_from_masks.py` 保持一致的字段：`image`、`sam_masks_dir`、`points`、`labels`。
+
+- 使用示例
+  - 初次生成:
+    ```bash
+    python -m seg-rl.heatmap.predict_next_point_from_model \
+      --model_path /path/to/ckpt.pt \
+      --images_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/images \
+      --sam_dir datasets/seg_r1_md/Task01_BrainTumour/pretrain_gt_masks-251001 \
+      --output_json datasets/seg_r1_md/Task01_BrainTumour/pred_points-init.json
+    ```
+  - 追加模式:
+    ```bash
+    python -m seg-rl.heatmap.predict_next_point_from_model \
+      --model_path /path/to/ckpt.pt \
+      --appendto_json datasets/seg_r1_md/Task01_BrainTumour/pred_points-init.json \
+      --sam_dir datasets/seg_r1_md/Task01_BrainTumour/pretrain_gt_masks-251001
+    ```
+  - 调试可视化:
+    ```bash
+    python -m seg-rl.heatmap.predict_next_point_from_model \
+      --debug_json datasets/seg_r1_md/Task01_BrainTumour/pred_points-init.json \
+      --sam_dir datasets/seg_r1_md/Task01_BrainTumour/pretrain_gt_masks-251001 \
+      --debug_output_dir output/braintumour/dbg_model_pred
+    ```
+
+如需把推理的采样策略改为“联合动作”（label+cell+in-cell）并输出log_prob以便后续RL微调，我可以在该脚本中增加对应的采样与导出字段。
+
+```shellscript
+    python -m seg-rl.heatmap.predict_next_point_from_model \
+      --model_path /path/to/ckpt.pt \
+      --images_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/images \
+      --sam_dir datasets/seg_r1_md/Task01_BrainTumour/pretrain_gt_masks-251001 \
+      --output_json datasets/seg_r1_md/Task01_BrainTumour/pred_points-init.json
+    ```
+  - 追加模式:
+    ```bash
+    python -m seg-rl.heatmap.predict_next_point_from_model \
+      --model_path /path/to/ckpt.pt \
+      --appendto_json datasets/seg_r1_md/Task01_BrainTumour/pred_points-init.json \
+      --sam_dir datasets/seg_r1_md/Task01_BrainTumour/pretrain_gt_masks-251001
+    ```
+  - 调试可视化:
+    ```bash
+    python -m seg-rl.heatmap.predict_next_point_from_model \
+      --debug_json datasets/seg_r1_md/Task01_BrainTumour/pred_points-init.json \
+      --sam_dir datasets/seg_r1_md/Task01_BrainTumour/pretrain_gt_masks-251001 \
+      --debug_output_dir output/braintumour/dbg_model_pred
+    ```
+
+如需把推理的采样策略改为“联合动作”（label+cell+in-cell）并输出log_prob以便后续RL微调，我可以在该脚本中增加对应的采样与导出字段。
+```
+
+```shellscript
+    python -m seg-rl.heatmap.predict_next_point_from_model \
+      --model_path /path/to/ckpt.pt \
+      --appendto_json datasets/seg_r1_md/Task01_BrainTumour/pred_points-init.json \
+      --sam_dir datasets/seg_r1_md/Task01_BrainTumour/pretrain_gt_masks-251001
+```
+
+```shellscript
+    python -m seg-rl.heatmap.predict_next_point_from_model \
+      --debug_json datasets/seg_r1_md/Task01_BrainTumour/pred_points-init.json \
+      --sam_dir datasets/seg_r1_md/Task01_BrainTumour/pretrain_gt_masks-251001 \
+      --debug_output_dir output/braintumour/dbg_model_pred
+```
+
+---
+
+**User**
+
+有两处未与gen_point_jsonl_from_masks.py保持一致：1. 在首写模式下虽然无需真值masks参与运算但也需要masks_dir参数从而用于写入'gt_mask'字段，保持与之前约定的一致性；2. 在追加模式下无需sam_dir参数，因为此时的sam_dir可以从稍后seg-rl/sam2_segment_from_points.py所写入的sam_masks_dir字段中获得。
+
+---
+
+**Cursor**
+
+```python
+<<'PATCH'
+*** Begin Patch
+*** Update File: /Users/donchiu/Works/Seg-R1/seg-rl/heatmap/predict_next_point_from_model.py
+@@
+-  python -m seg-rl.heatmap.predict_next_point_from_model \
+-    --model_path /path/to/ckpt.pt \
+-    --images_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/images \
+-    --sam_dir datasets/seg_r1_md/Task01_BrainTumour/pretrain_gt_masks-251001 \
+-    --output_json datasets/seg_r1_md/Task01_BrainTumour/pred_points-init.json
++  python -m seg-rl.heatmap.predict_next_point_from_model \
++    --model_path /path/to/ckpt.pt \
++    --images_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/images \
++    --masks_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/masks \
++    --output_json datasets/seg_r1_md/Task01_BrainTumour/pred_points-init.json
+@@
+-  python -m seg-rl.heatmap.predict_next_point_from_model \
+-    --model_path /path/to/ckpt.pt \
+-    --appendto_json datasets/seg_r1_md/Task01_BrainTumour/pred_points-init.json \
+-    --sam_dir datasets/seg_r1_md/Task01_BrainTumour/pretrain_gt_masks-251001
++  python -m seg-rl.heatmap.predict_next_point_from_model \
++    --model_path /path/to/ckpt.pt \
++    --appendto_json datasets/seg_r1_md/Task01_BrainTumour/pred_points-init.json
+@@
+-    --sam_dir datasets/seg_r1_md/Task01_BrainTumour/pretrain_gt_masks-251001 \
++    --sam_dir datasets/seg_r1_md/Task01_BrainTumour/pretrain_pred_masks-251001 \
+     --debug_output_dir output/braintumour/dbg_model_pred
+*** End Patch
+PATCH
+```
+
+```python
+#!/usr/bin/env python3
+
+"""
+Predict next SAM prompt point (position + binary label) using a trained heatmap model.
+
+This script mirrors seg-rl/annotator/gen_point_jsonl_from_masks.py, but replaces the
+EDT-based next-point computation with a model inference that takes only:
+  - the RGB image, and
+  - the current predicted mask (or zero mask at step 0)
+and outputs the next prompt point and its label.
+
+Modes:
+  1) Initial generation (write new JSON array):
+     - For each image under --images_dir, predict the first prompt (i=0) with a zero mask.
+     - Write a JSON array with records like:
+         {"image": "/abs/path.jpg", "sam_masks_dir": "/abs/sam_dir", "points": [[x0,y0]], "labels": [l0]}
+
+  2) Append mode (update existing JSON array):
+     - Read --appendto_json as a JSON array, for each record take current length k=len(points),
+       load the latest predicted mask at {sam_dir}/{stem}/{k-1}.png (k>0; else zero), and predict
+       the next point (xk, yk, lk). Append to arrays and write back in-place.
+
+  3) Debug visualization (no file write except images):
+     - Read --debug_json (JSON array) that already contains points+labels and a sam_masks_dir.
+     - For each step i, load prev and cur predicted masks (i-1 and i; prev is zero for i=0) and
+       call the same 3-panel visualization function used by the annotator to render panels with
+       the provided point, saving to --debug_output_dir/{stem}/dbg_{i}.png.
+     - Ground-truth masks are NOT used anywhere in this script (except indirectly if you supply
+       them in your own JSON for reference; they are not required).
+
+Examples:
+  # Initial generation
+  python -m seg-rl.heatmap.predict_next_point_from_model \
+    --model_path outputs/braintumour/points_predictor-251001-50epochs.pt \
+    --images_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/images \
+    --sam_dir datasets/seg_r1_md/Task01_BrainTumour/pretrain_pred_masks-251001 \
+    --output_json datasets/seg_r1_md/Task01_BrainTumour/pred_points-251001.json
+
+  # Append mode
+  python -m seg-rl.heatmap.predict_next_point_from_model \
+    --model_path outputs/braintumour/points_predictor-251001-50epochs.pt \
+    --appendto_json datasets/seg_r1_md/Task01_BrainTumour/pred_points-251001.json \
+    --sam_dir datasets/seg_r1_md/Task01_BrainTumour/pretrain_pred_masks-251001
+
+  # Debug visualization only
+  python -m seg-rl.heatmap.predict_next_point_from_model \
+    --debug_json datasets/seg_r1_md/Task01_BrainTumour/pred_points-init.json \
+    --sam_dir datasets/seg_r1_md/Task01_BrainTumour/pretrain_gt_masks-251001 \
+    --debug_output_dir output/braintumour/dbg_model_pred
+
+Notes:
+  - The model expects 4-channel input (RGB normalized + Gray normalized mask). This script
+    normalizes RGB with ImageNet mean/std and mask with mean=0.5, std=0.5.
+  - Device selection prefers CUDA, then MPS (Apple Silicon), otherwise CPU. AMP is only used on CUDA.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+from PIL import Image
+
+import torch
+import torch.nn.functional as F
+
+try:
+    # package context
+    from .model import ModelConfig, PointHeatmapModel, soft_argmax_from_logits
+except Exception:
+    # script context
+    import sys as _sys
+    import os as _os
+    _pkg_root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    if _pkg_root not in _sys.path:
+        _sys.path.insert(0, _pkg_root)
+    from heatmap.model import ModelConfig, PointHeatmapModel, soft_argmax_from_logits
+
+try:
+    # reuse annotator visualization helper if available
+    from seg_rl.annotator.gen_point_jsonl_from_masks import _render_diff_panels_with_point  # type: ignore
+except Exception:
+    try:
+        from seg-rl.annotator.gen_point_jsonl_from_masks import _render_diff_panels_with_point  # type: ignore
+    except Exception:
+        _render_diff_panels_with_point = None  # type: ignore
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Predict next SAM prompt point via trained heatmap model")
+    group = p.add_mutually_exclusive_group(required=True)
+    group.add_argument("--output_json", type=str, help="Write a new JSON array with first predicted points")
+    group.add_argument("--appendto_json", type=str, help="Append next predicted point to an existing JSON array")
+    group.add_argument("--debug_json", type=str, help="Debug visualization only: read JSON array and render panels")
+
+    p.add_argument("--model_path", type=str, required=False, help="Path to trained model checkpoint (.pt)")
+    p.add_argument("--images_dir", type=str, default=None, help="Directory of input images (initial mode)")
+    p.add_argument("--masks_dir", type=str, default=None, help="Ground-truth masks directory (initial mode only, to fill 'gt_mask' field)")
+    p.add_argument("--sam_dir", type=str, default=None, help="Directory of predicted SAM masks per step: {sam_dir}/{stem}/{k}.png (initial/debug mode)")
+    p.add_argument("--height", type=int, default=512)
+    p.add_argument("--width", type=int, default=512)
+    p.add_argument("--tau", type=float, default=1.0, help="Softmax temperature for heatmap -> probability")
+    p.add_argument("--amp", action="store_true")
+    p.add_argument("--progress", action="store_true")
+    p.add_argument("--debug_output_dir", type=str, default=None)
+    return p.parse_args()
+
+
+def _device_and_amp(args: argparse.Namespace) -> Tuple[torch.device, bool, str]:
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+    amp_enabled = args.amp and (device.type == "cuda")
+    autocast_device_type = "cuda" if device.type == "cuda" else "cpu"
+    return device, amp_enabled, autocast_device_type
+
+
+def _load_model(model_path: str, device: torch.device) -> PointHeatmapModel:
+    cfg = ModelConfig(backbone="unet_s", pretrained=False, in_channels=4)
+    model = PointHeatmapModel(cfg).to(device)
+    ckpt = torch.load(model_path, map_location="cpu") if model_path and os.path.isfile(model_path) else None
+    if ckpt is not None:
+        sd = ckpt.get("model", ckpt)
+        model.load_state_dict(sd, strict=False)
+    model.eval()
+    return model
+
+
+def _to_tensor_4ch(image_path: str, gray_mask: Optional[Image.Image], out_hw: Tuple[int, int]) -> torch.Tensor:
+    im = Image.open(image_path).convert("RGB")
+    im = im.resize((out_hw[1], out_hw[0]), resample=Image.BILINEAR)
+    if gray_mask is None:
+        gray = Image.new("L", im.size, 0)
+    else:
+        gray = gray_mask.convert("L").resize((out_hw[1], out_hw[0]), resample=Image.NEAREST)
+    import torchvision.transforms.functional as TF
+    rgb_t = TF.to_tensor(im)
+    rgb_t = TF.normalize(rgb_t, mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
+    g_t = TF.to_tensor(gray)
+    g_t = (g_t - 0.5) / 0.5
+    x4 = torch.cat([rgb_t, g_t], dim=0).unsqueeze(0)  # [1,4,H,W]
+    return x4
+
+
+def _predict_point(model: PointHeatmapModel, x4: torch.Tensor, device: torch.device, tau: float) -> Tuple[float, float, int]:
+    with torch.no_grad():
+        logits, label_logits = model(x4.to(device))
+        xy = soft_argmax_from_logits(logits, temperature=tau)[0]
+        lab = int(label_logits.argmax(dim=1).item())
+    return float(xy[0].item()), float(xy[1].item()), lab
+
+
+def _list_images(images_dir: str) -> List[str]:
+    exts = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+    out: List[str] = []
+    for name in sorted(os.listdir(images_dir)):
+        p = os.path.join(images_dir, name)
+        if os.path.isdir(p):
+            continue
+        if os.path.splitext(name)[1].lower() in exts:
+            out.append(p)
+    return out
+
+
+def _stem(path: str) -> str:
+    name = os.path.basename(path)
+    base, _ = os.path.splitext(name)
+    return base
+
+
+def run_initial(args: argparse.Namespace) -> None:
+    if not args.images_dir or not args.output_json:
+        raise RuntimeError("--images_dir and --output_json are required for initial mode")
+    if not args.masks_dir:
+        raise RuntimeError("--masks_dir is required for initial mode to fill 'gt_mask' field")
+    device, amp_enabled, autocast_device_type = _device_and_amp(args)
+    model = _load_model(args.model_path, device)
+    H, W = int(args.height), int(args.width)
+
+    records: List[Dict] = []
+    images = _list_images(args.images_dir)
+    if args.progress:
+        try:
+            from tqdm import tqdm  # type: ignore
+            images_iter = tqdm(images, desc="Initial predict")
+        except Exception:
+            images_iter = images
+    else:
+        images_iter = images
+
+    for img_path in images_iter:
+        x4 = _to_tensor_4ch(img_path, gray_mask=None, out_hw=(H, W))
+        with torch.amp.autocast(device_type=autocast_device_type, enabled=amp_enabled):
+            x, y, lab = _predict_point(model, x4, device, args.tau)
+        stem = _stem(img_path)
+        gt_mask_path = os.path.join(args.masks_dir, f"{stem}.png")
+        rec = {
+            "image": os.path.abspath(img_path),
+            "gt_mask": os.path.abspath(gt_mask_path),
+            "sam_masks_dir": os.path.abspath(args.sam_dir) if args.sam_dir else None,
+            "points": [[float(x), float(y)]],
+            "labels": [int(lab)],
+        }
+        # keep sam_masks_dir only if provided
+        if rec["sam_masks_dir"] is None:
+            del rec["sam_masks_dir"]
+        records.append(rec)
+
+    os.makedirs(os.path.dirname(args.output_json) or ".", exist_ok=True)
+    with open(args.output_json, "w", encoding="utf-8") as f:
+        json.dump(records, f, indent=2, ensure_ascii=False)
+    print(f"Wrote {len(records)} records to {args.output_json}")
+
+
+def run_append(args: argparse.Namespace) -> None:
+    if not args.appendto_json:
+        raise RuntimeError("--appendto_json required for append mode")
+    if not os.path.isfile(args.appendto_json):
+        raise FileNotFoundError(args.appendto_json)
+    arr = json.loads(open(args.appendto_json, "r", encoding="utf-8").read().strip())
+    if not isinstance(arr, list):
+        raise RuntimeError("Append target must be a JSON array")
+    device, amp_enabled, autocast_device_type = _device_and_amp(args)
+    model = _load_model(args.model_path, device)
+    H, W = int(args.height), int(args.width)
+
+    updated = 0
+    for rec in arr:
+        if not isinstance(rec, dict):
+            continue
+        img_path = rec.get("image")
+        sam_dir = rec.get("sam_masks_dir")
+        pts = rec.get("points", [])
+        labs = rec.get("labels", [])
+        if not img_path:
+            continue
+        k = len(pts)
+        # prev mask
+        if k == 0:
+            gray = None
+        else:
+            stem = _stem(img_path)
+            prev_path = os.path.join(sam_dir, stem, f"{k-1}.png")
+            gray = Image.open(prev_path).convert("L") if os.path.isfile(prev_path) else None
+        x4 = _to_tensor_4ch(img_path, gray_mask=gray, out_hw=(H, W))
+        with torch.amp.autocast(device_type=autocast_device_type, enabled=amp_enabled):
+            x, y, lab = _predict_point(model, x4, device, args.tau)
+        rec["points"] = (pts or []) + [[float(x), float(y)]]
+        rec["labels"] = (labs or []) + [int(lab)]
+        # sam_masks_dir should be set by external segmenter; do not inject here
+        updated += 1
+
+    with open(args.appendto_json, "w", encoding="utf-8") as f:
+        json.dump(arr, f, indent=2, ensure_ascii=False)
+    print(f"Appended next points to {args.appendto_json} (updated {updated} items)")
+
+
+def run_debug(args: argparse.Namespace) -> None:
+    if not args.debug_json:
+        raise RuntimeError("--debug_json required for debug mode")
+    if not args.debug_output_dir:
+        raise RuntimeError("--debug_output_dir required for debug mode")
+    arr = json.loads(open(args.debug_json, "r", encoding="utf-8").read().strip())
+    if not isinstance(arr, list):
+        raise RuntimeError("Debug JSON must be a JSON array")
+    os.makedirs(args.debug_output_dir, exist_ok=True)
+
+    num_generated = 0
+    for rec in arr:
+        if not isinstance(rec, dict):
+            continue
+        image_path = rec.get("image")
+        sam_dir = rec.get("sam_masks_dir") or args.sam_dir
+        points = rec.get("points", [])
+        labels = rec.get("labels", [])
+        if not (image_path and isinstance(points, list) and isinstance(labels, list)):
+            continue
+        if len(points) != len(labels):
+            continue
+        stem = _stem(image_path)
+        for i, (pt, lb) in enumerate(zip(points, labels)):
+            cur_path = os.path.join(sam_dir, stem, f"{i}.png")
+            cur = Image.open(cur_path).convert("L") if os.path.isfile(cur_path) else None
+            if cur is None:
+                continue
+            cur_u8 = np.array(cur, dtype=np.uint8)
+            if i == 0:
+                prev_u8 = np.zeros_like(cur_u8, dtype=np.uint8)
+            else:
+                prev_path = os.path.join(sam_dir, stem, f"{i-1}.png")
+                prev_u8 = np.array(Image.open(prev_path).convert("L"), dtype=np.uint8) if os.path.isfile(prev_path) else np.zeros_like(cur_u8, dtype=np.uint8)
+            try:
+                subdir = os.path.join(args.debug_output_dir, stem)
+                os.makedirs(subdir, exist_ok=True)
+                out_path = os.path.join(subdir, f"dbg_{i}.png")
+            except Exception:
+                out_path = None  # type: ignore
+            if _render_diff_panels_with_point is not None and out_path is not None:
+                _render_diff_panels_with_point(prev_u8, cur_u8, (float(pt[0]), float(pt[1])), int(lb), out_path)
+                num_generated += 1
+    print(f"Generated debug images for {num_generated} steps into {args.debug_output_dir}")
+
+
+def main() -> None:
+    args = parse_args()
+    if args.output_json:
+        run_initial(args)
+        return
+    if args.appendto_json:
+        run_append(args)
+        return
+    if args.debug_json:
+        run_debug(args)
+        return
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+```
+
+- 已调整首写模式
+  - 新增并要求 `--masks_dir`，用于写入记录的 `gt_mask` 字段（路径 `{masks_dir}/{stem}.png`），与原脚本一致。
+  - `--sam_dir` 在首写模式可选，仅作为写入 `sam_masks_dir` 字段（若未提供则不写入该字段）。
+
+- 已调整追加模式
+  - 不再需要 `--sam_dir`。脚本从记录中的 `sam_masks_dir` 读取当前/上一帧预测掩膜。
+  - 不再在记录中注入或覆盖 `sam_masks_dir`，该字段由外部分割流程（如 `seg-rl/sam2_segment_from_points.py`）负责写入。
+
+- 调试模式
+  - 仍使用 `sam_masks_dir`（来自 JSON，若缺失可由命令行 `--sam_dir` 提供）读取 mask 序列进行三联面板可视化。
+
+---
+
+**User**
+
+复用函数失败了，报错信息：
+
+---
+
+**Cursor**
+
+```python
+#!/usr/bin/env python3
+
+"""
+Predict next SAM prompt point (position + binary label) using a trained heatmap model.
+
+This script mirrors seg-rl/annotator/gen_point_jsonl_from_masks.py, but replaces the
+EDT-based next-point computation with a model inference that takes only:
+  - the RGB image, and
+  - the current predicted mask (or zero mask at step 0)
+and outputs the next prompt point and its label.
+
+Modes:
+  1) Initial generation (write new JSON array):
+     - For each image under --images_dir, predict the first prompt (i=0) with a zero mask.
+     - Write a JSON array with records like:
+         {"image": "/abs/path.jpg", "sam_masks_dir": "/abs/sam_dir", "points": [[x0,y0]], "labels": [l0]}
+
+  2) Append mode (update existing JSON array):
+     - Read --appendto_json as a JSON array, for each record take current length k=len(points),
+       load the latest predicted mask at {sam_dir}/{stem}/{k-1}.png (k>0; else zero), and predict
+       the next point (xk, yk, lk). Append to arrays and write back in-place.
+
+  3) Debug visualization (no file write except images):
+     - Read --debug_json (JSON array) that already contains points+labels and a sam_masks_dir.
+     - For each step i, load prev and cur predicted masks (i-1 and i; prev is zero for i=0) and
+       call the same 3-panel visualization function used by the annotator to render panels with
+       the provided point, saving to --debug_output_dir/{stem}/dbg_{i}.png.
+     - Ground-truth masks are NOT used anywhere in this script (except indirectly if you supply
+       them in your own JSON for reference; they are not required).
+
+Examples:
+  # Initial generation
+  /opt/anaconda3/envs/seg-r1/bin/python -m seg-rl.heatmap.predict_next_point_from_model \
+    --model_path outputs/braintumour/points_predictor-251001-50epochs.pt \
+    --images_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/images \
+    --masks_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/masks \
+    --output_json datasets/seg_r1_md/Task01_BrainTumour/pred_points-251001.json
+
+  # Append mode
+  /opt/anaconda3/envs/seg-r1/bin/python -m seg-rl.heatmap.predict_next_point_from_model \
+    --model_path outputs/braintumour/points_predictor-251001-50epochs.pt \
+    --appendto_json datasets/seg_r1_md/Task01_BrainTumour/pred_points-251001.json
+
+  # Debug visualization only
+  /opt/anaconda3/envs/seg-r1/bin/python -m seg-rl.heatmap.predict_next_point_from_model \
+    --debug_json datasets/seg_r1_md/Task01_BrainTumour/pred_points-init.json \
+    --debug_output_dir output/braintumour/dbg_model_pred
+
+Notes:
+  - The model expects 4-channel input (RGB normalized + Gray normalized mask). This script
+    normalizes RGB with ImageNet mean/std and mask with mean=0.5, std=0.5.
+  - Device selection prefers CUDA, then MPS (Apple Silicon), otherwise CPU. AMP is only used on CUDA.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from typing import Dict, List, Optional, Tuple, Callable
+
+import numpy as np
+from PIL import Image
+
+import torch
+import torch.nn.functional as F
+
+try:
+    # package context
+    from .model import ModelConfig, PointHeatmapModel, soft_argmax_from_logits
+except Exception:
+    # script context
+    import sys as _sys
+    import os as _os
+    _pkg_root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    if _pkg_root not in _sys.path:
+        _sys.path.insert(0, _pkg_root)
+    from heatmap.model import ModelConfig, PointHeatmapModel, soft_argmax_from_logits
+
+import importlib.util as _importlib_util
+
+def _import_render_helper() -> Optional[Callable]:
+    """Dynamically import _render_diff_panels_with_point from annotator script by file path.
+
+    This avoids package-name issues due to hyphen in 'seg-rl'.
+    """
+    try:
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # seg-rl
+        target = os.path.join(base_dir, "annotator", "gen_point_jsonl_from_masks.py")
+        if not os.path.isfile(target):
+            return None
+        spec = _importlib_util.spec_from_file_location("gen_point_jsonl_from_masks", target)
+        if spec is None or spec.loader is None:
+            return None
+        module = _importlib_util.module_from_spec(spec)
+        spec.loader.exec_module(module)  # type: ignore[attr-defined]
+        func = getattr(module, "_render_diff_panels_with_point", None)
+        if callable(func):
+            return func  # type: ignore[return-value]
+    except Exception:
+        return None
+    return None
+
+_render_diff_panels_with_point: Optional[Callable] = _import_render_helper()
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Predict next SAM prompt point via trained heatmap model")
+    group = p.add_mutually_exclusive_group(required=True)
+    group.add_argument("--output_json", type=str, help="Write a new JSON array with first predicted points")
+    group.add_argument("--appendto_json", type=str, help="Append next predicted point to an existing JSON array")
+    group.add_argument("--debug_json", type=str, help="Debug visualization only: read JSON array and render panels")
+
+    p.add_argument("--model_path", type=str, required=False, help="Path to trained model checkpoint (.pt)")
+    p.add_argument("--images_dir", type=str, default=None, help="Directory of input images (initial mode)")
+    p.add_argument("--masks_dir", type=str, default=None, help="Ground-truth masks directory (initial mode only, to fill 'gt_mask' field)")
+    p.add_argument("--sam_dir", type=str, default=None, help="Directory of predicted SAM masks per step: {sam_dir}/{stem}/{k}.png (initial/debug mode)")
+    p.add_argument("--height", type=int, default=512)
+    p.add_argument("--width", type=int, default=512)
+    p.add_argument("--tau", type=float, default=1.0, help="Softmax temperature for heatmap -> probability")
+    p.add_argument("--amp", action="store_true")
+    p.add_argument("--progress", action="store_true")
+    p.add_argument("--debug_output_dir", type=str, default=None)
+    return p.parse_args()
+
+
+def _device_and_amp(args: argparse.Namespace) -> Tuple[torch.device, bool, str]:
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+    amp_enabled = args.amp and (device.type == "cuda")
+    autocast_device_type = "cuda" if device.type == "cuda" else "cpu"
+    return device, amp_enabled, autocast_device_type
+
+
+def _load_model(model_path: str, device: torch.device) -> PointHeatmapModel:
+    cfg = ModelConfig(backbone="unet_s", pretrained=False, in_channels=4)
+    model = PointHeatmapModel(cfg).to(device)
+    ckpt = torch.load(model_path, map_location="cpu") if model_path and os.path.isfile(model_path) else None
+    if ckpt is not None:
+        sd = ckpt.get("model", ckpt)
+        model.load_state_dict(sd, strict=False)
+    model.eval()
+    return model
+
+
+def _to_tensor_4ch(image_path: str, gray_mask: Optional[Image.Image], out_hw: Tuple[int, int]) -> torch.Tensor:
+    im = Image.open(image_path).convert("RGB")
+    im = im.resize((out_hw[1], out_hw[0]), resample=Image.BILINEAR)
+    if gray_mask is None:
+        gray = Image.new("L", im.size, 0)
+    else:
+        gray = gray_mask.convert("L").resize((out_hw[1], out_hw[0]), resample=Image.NEAREST)
+    import torchvision.transforms.functional as TF
+    rgb_t = TF.to_tensor(im)
+    rgb_t = TF.normalize(rgb_t, mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
+    g_t = TF.to_tensor(gray)
+    g_t = (g_t - 0.5) / 0.5
+    x4 = torch.cat([rgb_t, g_t], dim=0).unsqueeze(0)  # [1,4,H,W]
+    return x4
+
+
+def _predict_point(model: PointHeatmapModel, x4: torch.Tensor, device: torch.device, tau: float) -> Tuple[float, float, int]:
+    with torch.no_grad():
+        logits, label_logits = model(x4.to(device))
+        xy = soft_argmax_from_logits(logits, temperature=tau)[0]
+        lab = int(label_logits.argmax(dim=1).item())
+    return float(xy[0].item()), float(xy[1].item()), lab
+
+
+def _list_images(images_dir: str) -> List[str]:
+    exts = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+    out: List[str] = []
+    for name in sorted(os.listdir(images_dir)):
+        p = os.path.join(images_dir, name)
+        if os.path.isdir(p):
+            continue
+        if os.path.splitext(name)[1].lower() in exts:
+            out.append(p)
+    return out
+
+
+def _stem(path: str) -> str:
+    name = os.path.basename(path)
+    base, _ = os.path.splitext(name)
+    return base
+
+
+def run_initial(args: argparse.Namespace) -> None:
+    if not args.images_dir or not args.output_json:
+        raise RuntimeError("--images_dir and --output_json are required for initial mode")
+    if not args.masks_dir:
+        raise RuntimeError("--masks_dir is required for initial mode to fill 'gt_mask' field")
+    device, amp_enabled, autocast_device_type = _device_and_amp(args)
+    model = _load_model(args.model_path, device)
+    H, W = int(args.height), int(args.width)
+
+    records: List[Dict] = []
+    images = _list_images(args.images_dir)
+    if args.progress:
+        try:
+            from tqdm import tqdm  # type: ignore
+            images_iter = tqdm(images, desc="Initial predict")
+        except Exception:
+            images_iter = images
+    else:
+        images_iter = images
+
+    for img_path in images_iter:
+        x4 = _to_tensor_4ch(img_path, gray_mask=None, out_hw=(H, W))
+        with torch.amp.autocast(device_type=autocast_device_type, enabled=amp_enabled):
+            x, y, lab = _predict_point(model, x4, device, args.tau)
+        stem = _stem(img_path)
+        gt_mask_path = os.path.join(args.masks_dir, f"{stem}.png")
+        rec = {
+            "image": os.path.abspath(img_path),
+            "gt_mask": os.path.abspath(gt_mask_path),
+            "sam_masks_dir": os.path.abspath(args.sam_dir) if args.sam_dir else None,
+            "points": [[float(x), float(y)]],
+            "labels": [int(lab)],
+        }
+        # keep sam_masks_dir only if provided
+        if rec["sam_masks_dir"] is None:
+            del rec["sam_masks_dir"]
+        records.append(rec)
+
+    os.makedirs(os.path.dirname(args.output_json) or ".", exist_ok=True)
+    with open(args.output_json, "w", encoding="utf-8") as f:
+        json.dump(records, f, indent=2, ensure_ascii=False)
+    print(f"Wrote {len(records)} records to {args.output_json}")
+
+
+def run_append(args: argparse.Namespace) -> None:
+    if not args.appendto_json:
+        raise RuntimeError("--appendto_json required for append mode")
+    if not os.path.isfile(args.appendto_json):
+        raise FileNotFoundError(args.appendto_json)
+    arr = json.loads(open(args.appendto_json, "r", encoding="utf-8").read().strip())
+    if not isinstance(arr, list):
+        raise RuntimeError("Append target must be a JSON array")
+    device, amp_enabled, autocast_device_type = _device_and_amp(args)
+    model = _load_model(args.model_path, device)
+    H, W = int(args.height), int(args.width)
+
+    updated = 0
+    for rec in arr:
+        if not isinstance(rec, dict):
+            continue
+        img_path = rec.get("image")
+        sam_dir = rec.get("sam_masks_dir")
+        pts = rec.get("points", [])
+        labs = rec.get("labels", [])
+        if not img_path:
+            continue
+        k = len(pts)
+        # prev mask
+        if k == 0:
+            gray = None
+        else:
+            stem = _stem(img_path)
+            prev_path = os.path.join(sam_dir, stem, f"{k-1}.png")
+            gray = Image.open(prev_path).convert("L") if os.path.isfile(prev_path) else None
+        x4 = _to_tensor_4ch(img_path, gray_mask=gray, out_hw=(H, W))
+        with torch.amp.autocast(device_type=autocast_device_type, enabled=amp_enabled):
+            x, y, lab = _predict_point(model, x4, device, args.tau)
+        rec["points"] = (pts or []) + [[float(x), float(y)]]
+        rec["labels"] = (labs or []) + [int(lab)]
+        # sam_masks_dir should be set by external segmenter; do not inject here
+        updated += 1
+
+    with open(args.appendto_json, "w", encoding="utf-8") as f:
+        json.dump(arr, f, indent=2, ensure_ascii=False)
+    print(f"Appended next points to {args.appendto_json} (updated {updated} items)")
+
+
+def run_debug(args: argparse.Namespace) -> None:
+    if not args.debug_json:
+        raise RuntimeError("--debug_json required for debug mode")
+    if not args.debug_output_dir:
+        raise RuntimeError("--debug_output_dir required for debug mode")
+    arr = json.loads(open(args.debug_json, "r", encoding="utf-8").read().strip())
+    if not isinstance(arr, list):
+        raise RuntimeError("Debug JSON must be a JSON array")
+    os.makedirs(args.debug_output_dir, exist_ok=True)
+
+    num_generated = 0
+    for rec in arr:
+        if not isinstance(rec, dict):
+            continue
+        image_path = rec.get("image")
+        sam_dir = rec.get("sam_masks_dir") or args.sam_dir
+        points = rec.get("points", [])
+        labels = rec.get("labels", [])
+        if not (image_path and isinstance(points, list) and isinstance(labels, list)):
+            continue
+        if len(points) != len(labels):
+            continue
+        stem = _stem(image_path)
+        for i, (pt, lb) in enumerate(zip(points, labels)):
+            cur_path = os.path.join(sam_dir, stem, f"{i}.png")
+            cur = Image.open(cur_path).convert("L") if os.path.isfile(cur_path) else None
+            if cur is None:
+                continue
+            cur_u8 = np.array(cur, dtype=np.uint8)
+            if i == 0:
+                prev_u8 = np.zeros_like(cur_u8, dtype=np.uint8)
+            else:
+                prev_path = os.path.join(sam_dir, stem, f"{i-1}.png")
+                prev_u8 = np.array(Image.open(prev_path).convert("L"), dtype=np.uint8) if os.path.isfile(prev_path) else np.zeros_like(cur_u8, dtype=np.uint8)
+            try:
+                subdir = os.path.join(args.debug_output_dir, stem)
+                os.makedirs(subdir, exist_ok=True)
+                out_path = os.path.join(subdir, f"dbg_{i}.png")
+            except Exception:
+                out_path = None  # type: ignore
+            if _render_diff_panels_with_point is not None and out_path is not None:
+                _render_diff_panels_with_point(prev_u8, cur_u8, (float(pt[0]), float(pt[1])), int(lb), out_path)
+                num_generated += 1
+    print(f"Generated debug images for {num_generated} steps into {args.debug_output_dir}")
+
+
+def main() -> None:
+    args = parse_args()
+    if args.output_json:
+        run_initial(args)
+        return
+    if args.appendto_json:
+        run_append(args)
+        return
+    if args.debug_json:
+        run_debug(args)
+        return
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+```
+
+我已修复复用函数的导入问题：
+
+- 失败原因
+  - 直接使用 `from seg-rl.annotator...` 的导入语法非法（模块名中含 `-`），导致 SyntaxError。
+
+- 修复方式
+  - 使用动态按路径导入：通过 `importlib.util.spec_from_file_location` 加载 `seg-rl/annotator/gen_point_jsonl_from_masks.py`，提取其中的 `_render_diff_panels_with_point` 函数。
+  - 若导入失败，回退为 `None`，调试可视化时会安全跳过。
+
+当前 `predict_next_point_from_model.py` 可以在你的工程路径结构下稳定复用该可视化函数，避免命名空间冲突。
+
+---
+
+**User**
+
+由于基于预测模型推理的下一提示点选择过程要花费更长时间，请在脚本里加入进度显示
+
+---
+
+**Cursor**
+
+```python
+#!/usr/bin/env python3
+
+"""
+Predict next SAM prompt point (position + binary label) using a trained heatmap model.
+
+This script mirrors seg-rl/annotator/gen_point_jsonl_from_masks.py, but replaces the
+EDT-based next-point computation with a model inference that takes only:
+  - the RGB image, and
+  - the current predicted mask (or zero mask at step 0)
+and outputs the next prompt point and its label.
+
+Modes:
+  1) Initial generation (write new JSON array):
+     - For each image under --images_dir, predict the first prompt (i=0) with a zero mask.
+     - Write a JSON array with records like:
+         {"image": "/abs/path.jpg", "sam_masks_dir": "/abs/sam_dir", "points": [[x0,y0]], "labels": [l0]}
+
+  2) Append mode (update existing JSON array):
+     - Read --appendto_json as a JSON array, for each record take current length k=len(points),
+       load the latest predicted mask at {sam_dir}/{stem}/{k-1}.png (k>0; else zero), and predict
+       the next point (xk, yk, lk). Append to arrays and write back in-place.
+
+  3) Debug visualization (no file write except images):
+     - Read --debug_json (JSON array) that already contains points+labels and a sam_masks_dir.
+     - For each step i, load prev and cur predicted masks (i-1 and i; prev is zero for i=0) and
+       call the same 3-panel visualization function used by the annotator to render panels with
+       the provided point, saving to --debug_output_dir/{stem}/dbg_{i}.png.
+     - Ground-truth masks are NOT used anywhere in this script (except indirectly if you supply
+       them in your own JSON for reference; they are not required).
+
+Examples:
+  # Initial generation
+  /opt/anaconda3/envs/seg-r1/bin/python -m seg-rl.heatmap.predict_next_point_from_model \
+    --model_path outputs/braintumour/points_predictor-251001-50epochs.pt \
+    --images_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/images \
+    --masks_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/masks \
+    --output_json datasets/seg_r1_md/Task01_BrainTumour/pred_points-251001.json
+
+  # Append mode
+  /opt/anaconda3/envs/seg-r1/bin/python -m seg-rl.heatmap.predict_next_point_from_model \
+    --model_path outputs/braintumour/points_predictor-251001-50epochs.pt \
+    --appendto_json datasets/seg_r1_md/Task01_BrainTumour/pred_points-251001.json
+
+  # Debug visualization only
+  /opt/anaconda3/envs/seg-r1/bin/python -m seg-rl.heatmap.predict_next_point_from_model \
+    --debug_json datasets/seg_r1_md/Task01_BrainTumour/pred_points-init.json \
+    --debug_output_dir output/braintumour/dbg_model_pred
+
+Notes:
+  - The model expects 4-channel input (RGB normalized + Gray normalized mask). This script
+    normalizes RGB with ImageNet mean/std and mask with mean=0.5, std=0.5.
+  - Device selection prefers CUDA, then MPS (Apple Silicon), otherwise CPU. AMP is only used on CUDA.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from typing import Dict, List, Optional, Tuple, Callable
+
+import numpy as np
+from PIL import Image
+
+import torch
+import torch.nn.functional as F
+
+try:
+    # package context
+    from .model import ModelConfig, PointHeatmapModel, soft_argmax_from_logits
+except Exception:
+    # script context
+    import sys as _sys
+    import os as _os
+    _pkg_root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    if _pkg_root not in _sys.path:
+        _sys.path.insert(0, _pkg_root)
+    from heatmap.model import ModelConfig, PointHeatmapModel, soft_argmax_from_logits
+
+import importlib.util as _importlib_util
+
+def _import_render_helper() -> Optional[Callable]:
+    """Dynamically import _render_diff_panels_with_point from annotator script by file path.
+
+    This avoids package-name issues due to hyphen in 'seg-rl'.
+    """
+    try:
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # seg-rl
+        target = os.path.join(base_dir, "annotator", "gen_point_jsonl_from_masks.py")
+        if not os.path.isfile(target):
+            return None
+        spec = _importlib_util.spec_from_file_location("gen_point_jsonl_from_masks", target)
+        if spec is None or spec.loader is None:
+            return None
+        module = _importlib_util.module_from_spec(spec)
+        spec.loader.exec_module(module)  # type: ignore[attr-defined]
+        func = getattr(module, "_render_diff_panels_with_point", None)
+        if callable(func):
+            return func  # type: ignore[return-value]
+    except Exception:
+        return None
+    return None
+
+_render_diff_panels_with_point: Optional[Callable] = _import_render_helper()
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Predict next SAM prompt point via trained heatmap model")
+    group = p.add_mutually_exclusive_group(required=True)
+    group.add_argument("--output_json", type=str, help="Write a new JSON array with first predicted points")
+    group.add_argument("--appendto_json", type=str, help="Append next predicted point to an existing JSON array")
+    group.add_argument("--debug_json", type=str, help="Debug visualization only: read JSON array and render panels")
+
+    p.add_argument("--model_path", type=str, required=False, help="Path to trained model checkpoint (.pt)")
+    p.add_argument("--images_dir", type=str, default=None, help="Directory of input images (initial mode)")
+    p.add_argument("--masks_dir", type=str, default=None, help="Ground-truth masks directory (initial mode only, to fill 'gt_mask' field)")
+    p.add_argument("--sam_dir", type=str, default=None, help="Directory of predicted SAM masks per step: {sam_dir}/{stem}/{k}.png (initial/debug mode)")
+    p.add_argument("--height", type=int, default=512)
+    p.add_argument("--width", type=int, default=512)
+    p.add_argument("--tau", type=float, default=1.0, help="Softmax temperature for heatmap -> probability")
+    p.add_argument("--amp", action="store_true")
+    p.add_argument("--progress", action="store_true")
+    p.add_argument("--debug_output_dir", type=str, default=None)
+    return p.parse_args()
+
+
+def _device_and_amp(args: argparse.Namespace) -> Tuple[torch.device, bool, str]:
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+    amp_enabled = args.amp and (device.type == "cuda")
+    autocast_device_type = "cuda" if device.type == "cuda" else "cpu"
+    return device, amp_enabled, autocast_device_type
+
+
+def _load_model(model_path: str, device: torch.device) -> PointHeatmapModel:
+    cfg = ModelConfig(backbone="unet_s", pretrained=False, in_channels=4)
+    model = PointHeatmapModel(cfg).to(device)
+    ckpt = torch.load(model_path, map_location="cpu") if model_path and os.path.isfile(model_path) else None
+    if ckpt is not None:
+        sd = ckpt.get("model", ckpt)
+        model.load_state_dict(sd, strict=False)
+    model.eval()
+    return model
+
+
+def _to_tensor_4ch(image_path: str, gray_mask: Optional[Image.Image], out_hw: Tuple[int, int]) -> torch.Tensor:
+    im = Image.open(image_path).convert("RGB")
+    im = im.resize((out_hw[1], out_hw[0]), resample=Image.BILINEAR)
+    if gray_mask is None:
+        gray = Image.new("L", im.size, 0)
+    else:
+        gray = gray_mask.convert("L").resize((out_hw[1], out_hw[0]), resample=Image.NEAREST)
+    import torchvision.transforms.functional as TF
+    rgb_t = TF.to_tensor(im)
+    rgb_t = TF.normalize(rgb_t, mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
+    g_t = TF.to_tensor(gray)
+    g_t = (g_t - 0.5) / 0.5
+    x4 = torch.cat([rgb_t, g_t], dim=0).unsqueeze(0)  # [1,4,H,W]
+    return x4
+
+
+def _predict_point(model: PointHeatmapModel, x4: torch.Tensor, device: torch.device, tau: float) -> Tuple[float, float, int]:
+    with torch.no_grad():
+        logits, label_logits = model(x4.to(device))
+        xy = soft_argmax_from_logits(logits, temperature=tau)[0]
+        lab = int(label_logits.argmax(dim=1).item())
+    return float(xy[0].item()), float(xy[1].item()), lab
+
+
+def _list_images(images_dir: str) -> List[str]:
+    exts = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+    out: List[str] = []
+    for name in sorted(os.listdir(images_dir)):
+        p = os.path.join(images_dir, name)
+        if os.path.isdir(p):
+            continue
+        if os.path.splitext(name)[1].lower() in exts:
+            out.append(p)
+    return out
+
+
+def _stem(path: str) -> str:
+    name = os.path.basename(path)
+    base, _ = os.path.splitext(name)
+    return base
+
+
+def run_initial(args: argparse.Namespace) -> None:
+    if not args.images_dir or not args.output_json:
+        raise RuntimeError("--images_dir and --output_json are required for initial mode")
+    if not args.masks_dir:
+        raise RuntimeError("--masks_dir is required for initial mode to fill 'gt_mask' field")
+    device, amp_enabled, autocast_device_type = _device_and_amp(args)
+    model = _load_model(args.model_path, device)
+    H, W = int(args.height), int(args.width)
+
+    records: List[Dict] = []
+    images = _list_images(args.images_dir)
+    if args.progress:
+        try:
+            from tqdm import tqdm  # type: ignore
+            images_iter = tqdm(images, desc="Initial predict")
+        except Exception:
+            images_iter = images
+    else:
+        images_iter = images
+
+    for img_path in images_iter:
+        x4 = _to_tensor_4ch(img_path, gray_mask=None, out_hw=(H, W))
+        with torch.amp.autocast(device_type=autocast_device_type, enabled=amp_enabled):
+            x, y, lab = _predict_point(model, x4, device, args.tau)
+        stem = _stem(img_path)
+        gt_mask_path = os.path.join(args.masks_dir, f"{stem}.png")
+        rec = {
+            "image": os.path.abspath(img_path),
+            "gt_mask": os.path.abspath(gt_mask_path),
+            "sam_masks_dir": os.path.abspath(args.sam_dir) if args.sam_dir else None,
+            "points": [[float(x), float(y)]],
+            "labels": [int(lab)],
+        }
+        # keep sam_masks_dir only if provided
+        if rec["sam_masks_dir"] is None:
+            del rec["sam_masks_dir"]
+        records.append(rec)
+
+    os.makedirs(os.path.dirname(args.output_json) or ".", exist_ok=True)
+    with open(args.output_json, "w", encoding="utf-8") as f:
+        json.dump(records, f, indent=2, ensure_ascii=False)
+    print(f"Wrote {len(records)} records to {args.output_json}")
+
+
+def run_append(args: argparse.Namespace) -> None:
+    if not args.appendto_json:
+        raise RuntimeError("--appendto_json required for append mode")
+    if not os.path.isfile(args.appendto_json):
+        raise FileNotFoundError(args.appendto_json)
+    arr = json.loads(open(args.appendto_json, "r", encoding="utf-8").read().strip())
+    if not isinstance(arr, list):
+        raise RuntimeError("Append target must be a JSON array")
+    device, amp_enabled, autocast_device_type = _device_and_amp(args)
+    model = _load_model(args.model_path, device)
+    H, W = int(args.height), int(args.width)
+
+    updated = 0
+    # progress bar
+    rec_iter = arr
+    pbar = None
+    if args.progress:
+        try:
+            from tqdm import tqdm  # type: ignore
+            pbar = tqdm(total=len(arr), desc="Append predict")
+        except Exception:
+            pbar = None
+    for rec in arr:
+        if not isinstance(rec, dict):
+            continue
+        img_path = rec.get("image")
+        sam_dir = rec.get("sam_masks_dir")
+        pts = rec.get("points", [])
+        labs = rec.get("labels", [])
+        if not img_path:
+            continue
+        k = len(pts)
+        # prev mask
+        if k == 0:
+            gray = None
+        else:
+            stem = _stem(img_path)
+            prev_path = os.path.join(sam_dir, stem, f"{k-1}.png")
+            gray = Image.open(prev_path).convert("L") if os.path.isfile(prev_path) else None
+        x4 = _to_tensor_4ch(img_path, gray_mask=gray, out_hw=(H, W))
+        with torch.amp.autocast(device_type=autocast_device_type, enabled=amp_enabled):
+            x, y, lab = _predict_point(model, x4, device, args.tau)
+        rec["points"] = (pts or []) + [[float(x), float(y)]]
+        rec["labels"] = (labs or []) + [int(lab)]
+        # sam_masks_dir should be set by external segmenter; do not inject here
+        updated += 1
+        if pbar is not None:
+            pbar.update(1)
+        elif updated % max(1, len(arr)//10 or 1) == 0:
+            print(f"Processed {updated}/{len(arr)} records")
+
+    if pbar is not None:
+        pbar.close()
+
+    with open(args.appendto_json, "w", encoding="utf-8") as f:
+        json.dump(arr, f, indent=2, ensure_ascii=False)
+    print(f"Appended next points to {args.appendto_json} (updated {updated} items)")
+
+
+def run_debug(args: argparse.Namespace) -> None:
+    if not args.debug_json:
+        raise RuntimeError("--debug_json required for debug mode")
+    if not args.debug_output_dir:
+        raise RuntimeError("--debug_output_dir required for debug mode")
+    arr = json.loads(open(args.debug_json, "r", encoding="utf-8").read().strip())
+    if not isinstance(arr, list):
+        raise RuntimeError("Debug JSON must be a JSON array")
+    os.makedirs(args.debug_output_dir, exist_ok=True)
+
+    num_generated = 0
+    # optional progress over total steps
+    total_steps = 0
+    if args.progress:
+        try:
+            for rec in arr:
+                if isinstance(rec, dict):
+                    pts = rec.get("points", []) if isinstance(rec.get("points", []), list) else []
+                    total_steps += len(pts)
+        except Exception:
+            total_steps = 0
+    pbar = None
+    if args.progress and total_steps > 0:
+        try:
+            from tqdm import tqdm  # type: ignore
+            pbar = tqdm(total=total_steps, desc="Debug render")
+        except Exception:
+            pbar = None
+
+    for rec in arr:
+        if not isinstance(rec, dict):
+            continue
+        image_path = rec.get("image")
+        sam_dir = rec.get("sam_masks_dir") or args.sam_dir
+        points = rec.get("points", [])
+        labels = rec.get("labels", [])
+        if not (image_path and isinstance(points, list) and isinstance(labels, list)):
+            continue
+        if len(points) != len(labels):
+            continue
+        stem = _stem(image_path)
+        for i, (pt, lb) in enumerate(zip(points, labels)):
+            cur_path = os.path.join(sam_dir, stem, f"{i}.png")
+            cur = Image.open(cur_path).convert("L") if os.path.isfile(cur_path) else None
+            if cur is None:
+                continue
+            cur_u8 = np.array(cur, dtype=np.uint8)
+            if i == 0:
+                prev_u8 = np.zeros_like(cur_u8, dtype=np.uint8)
+            else:
+                prev_path = os.path.join(sam_dir, stem, f"{i-1}.png")
+                prev_u8 = np.array(Image.open(prev_path).convert("L"), dtype=np.uint8) if os.path.isfile(prev_path) else np.zeros_like(cur_u8, dtype=np.uint8)
+            try:
+                subdir = os.path.join(args.debug_output_dir, stem)
+                os.makedirs(subdir, exist_ok=True)
+                out_path = os.path.join(subdir, f"dbg_{i}.png")
+            except Exception:
+                out_path = None  # type: ignore
+            if _render_diff_panels_with_point is not None and out_path is not None:
+                _render_diff_panels_with_point(prev_u8, cur_u8, (float(pt[0]), float(pt[1])), int(lb), out_path)
+                num_generated += 1
+            if pbar is not None:
+                pbar.update(1)
+    if pbar is not None:
+        pbar.close()
+    print(f"Generated debug images for {num_generated} steps into {args.debug_output_dir}")
+
+
+def main() -> None:
+    args = parse_args()
+    if args.output_json:
+        run_initial(args)
+        return
+    if args.appendto_json:
+        run_append(args)
+        return
+    if args.debug_json:
+        run_debug(args)
+        return
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+```
+
+已在推理耗时的流程中加入进度显示：
+
+- 追加模式 run_append
+  - 可选 `--progress` 时用 tqdm 显示总条目进度；无 tqdm 时每10%打印一次“Processed i/N”。
+
+- 调试模式 run_debug
+  - 预统计总步骤数（所有样本的 points 数之和）；`--progress` 时展示总步数的 tqdm 进度；无 tqdm 时默认不打印频繁日志。
+
+初次生成 run_initial 之前已支持 `--progress`，继续沿用。
+
+---
+
+**User**
+
+解释训练过程中计算出的loss和pck两个值的具体含义是什么
+
+---
+
+**Cursor**
+
+### 含义说明（基于当前训练脚本实现）
+
+- loss
+  - 指本轮训练中每个批次损失的平均值，包含两部分之和：
+    - 热图损失（按命令行选择其一）
+      - ce: 将每个像素当作类别，真值是目标点所在像素，做像素级交叉熵
+      - kl: 模型的像素概率分布与以真值为中心的高斯软目标分布之间的KL散度
+      - mse: 模型像素概率图与高斯软目标概率图之间的均方误差
+    - 标签损失
+      - 二分类交叉熵，用于预测目标点的前/背景标签
+    - 总损失 = 热图损失 + 0.2 × 标签CE
+
+- pck（PCK@τ）
+  - PCK = Percentage of Correct Keypoints
+  - 评估时先用 soft-argmax 从热图得到连续坐标预测，再计算与真值点的欧氏距离 d；若 d ≤ τ（像素阈值，由 --eval_thresh 指定）判为正确
+  - PCK@τ = 正确样本数 / 总样本数（在验证/测试集上统计）
+  - 直观理解：在“容许误差 τ 像素”内命中的比例，越高越好
+
+---
+
+**User**
+
+我发现你实现的seg-rl/heatmap/model.py似乎仍有问题。回忆我们想要做的任务是什么：“有两张相同尺寸的输入图像，一张为灰度或3通道彩色图像，另一张为灰度图像，目标是预测一个位于输入图像尺寸范围内的一个坐标位置（真值数据从人工标注中获得）...还需要包含一个label信息，只有两种取值1或0，二者互斥...”但是我看你实现的PointHeatmapModel类，其推理函数只包含一个图像，并且你在train.py里也确实是只用到了多通道的那张图像而没有用到灰度（或二值）的mask图，这与我们的任务定义不同啊！请仔细检查你的模型实现，确保它符合基于前述任务定义而设计的模型架构。
+
+---
+
+**Cursor**
+
+I'll quickly re-check `seg-rl/heatmap/model.py` and `seg-rl/heatmap/train.py` to verify how inputs are handled and then adjust the model to explicitly accept two inputs (RGB and Gray) with a dual-branch fusion to align with your task definition.
+
+```python
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Literal, Optional, Tuple
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision.models import resnet18, ResNet18_Weights
+
+
+@dataclass
+class ModelConfig:
+    """模型配置
+    
+    backbone: 选择骨干架构
+        - "unet_s": 轻量UNet，默认推荐，输出高分辨率平滑热力图，适合软分布学习
+        - "resnet18": ResNet18 + 插值上采样，速度快但空间精度略低
+    pretrained: 是否使用预训练权重（仅对resnet18有效）
+    upsample_to_input: resnet18时是否上采样到输入分辨率
+    """
+    backbone: Literal["resnet18", "unet_s"] = "unet_s"
+    pretrained: bool = False
+    upsample_to_input: bool = True
+    # 明确两路输入通道数：主图(灰度或RGB)与条件灰度图
+    main_in_channels: int = 3
+    cond_in_channels: int = 1
+
+
+class HeatmapHead(nn.Module):
+    def __init__(self, in_channels: int, mid_channels: int = 256) -> None:
+        super().__init__()
+        self.head = nn.Sequential(
+            nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(mid_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid_channels, 1, kernel_size=1, bias=True),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.head(x)
+
+
+class LabelHead(nn.Module):
+    def __init__(self, in_channels: int, mid_channels: int = 256, num_classes: int = 2) -> None:
+        super().__init__()
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Conv2d(in_channels, mid_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(mid_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid_channels, num_classes, kernel_size=1, bias=True),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.pool(x)
+        return self.fc(x).flatten(1)
+
+class DoubleConv(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int) -> None:
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.block(x)
+
+
+class UNetSmall(nn.Module):
+    """轻量级U-Net，输出输入分辨率的单通道logits热力图
+    
+    设计用于生成平滑、空间精确的热力图，通过跳连保持细节信息。
+    相比ResNet+上采样，能更好地学习软分布，避免插值带来的空间失真。
+    特别适合配合高斯软目标(KL/MSE)训练距离衰减的热力图。
+    
+    参数:
+        in_channels: 输入通道数，默认3(RGB)
+        base_ch: 基础通道数，控制模型容量，默认64
+    """
+
+    def __init__(self, in_channels: int = 3, base_ch: int = 64) -> None:
+        super().__init__()
+        c1, c2, c3, c4 = base_ch, base_ch * 2, base_ch * 4, base_ch * 8
+        self.out_ch = c1
+        self.enc1 = DoubleConv(in_channels, c1)
+        self.enc2 = DoubleConv(c1, c2)
+        self.enc3 = DoubleConv(c2, c3)
+        self.enc4 = DoubleConv(c3, c4)
+
+        self.pool = nn.MaxPool2d(2)
+
+        self.up3 = nn.ConvTranspose2d(c4, c3, kernel_size=2, stride=2)
+        self.dec3 = DoubleConv(c4, c3)
+        self.up2 = nn.ConvTranspose2d(c3, c2, kernel_size=2, stride=2)
+        self.dec2 = DoubleConv(c3, c2)
+        self.up1 = nn.ConvTranspose2d(c2, c1, kernel_size=2, stride=2)
+        self.dec1 = DoubleConv(c2, c1)
+
+        self.final = nn.Conv2d(c1, 1, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool(e1))
+        e3 = self.enc3(self.pool(e2))
+        e4 = self.enc4(self.pool(e3))
+
+        d3 = self.up3(e4)
+        d3 = torch.cat([d3, e3], dim=1)
+        d3 = self.dec3(d3)
+        d2 = self.up2(d3)
+        d2 = torch.cat([d2, e2], dim=1)
+        d2 = self.dec2(d2)
+        d1 = self.up1(d2)
+        d1 = torch.cat([d1, e1], dim=1)
+        d1 = self.dec1(d1)
+        # expose last decoder feature for classification head
+        self.last_dec = d1
+        return self.final(d1)
+
+
+class PointHeatmapModel(nn.Module):
+    """Backbone + 1-channel heatmap logits head.
+
+    Output: logits of shape [B,1,H',W'] optionally upsampled to input HxW.
+    """
+
+    def __init__(self, cfg: ModelConfig) -> None:
+        super().__init__()
+        self.cfg = cfg
+        total_in = int(cfg.main_in_channels) + int(cfg.cond_in_channels)
+        if cfg.backbone == "resnet18":
+            weights = ResNet18_Weights.DEFAULT if cfg.pretrained else None
+            base = resnet18(weights=weights)
+            # 调整conv1以适配任意输入通道
+            if total_in != 3:
+                old_conv1 = base.conv1
+                new_conv1 = nn.Conv2d(total_in, old_conv1.out_channels, kernel_size=old_conv1.kernel_size,
+                                       stride=old_conv1.stride, padding=old_conv1.padding, bias=False)
+                with torch.no_grad():
+                    if old_conv1.weight.shape[1] == 3:
+                        # 将预训练权重映射到新通道：前3通道拷贝，其余通道取均值
+                        new_conv1.weight[:, :3] = old_conv1.weight
+                        if total_in > 3:
+                            mean_w = old_conv1.weight.mean(dim=1, keepdim=True)
+                            new_conv1.weight[:, 3:total_in] = mean_w.repeat(1, total_in - 3, 1, 1)
+                    else:
+                        nn.init.kaiming_normal_(new_conv1.weight, mode="fan_out", nonlinearity="relu")
+                base.conv1 = new_conv1
+            self.stem = nn.Sequential(base.conv1, base.bn1, base.relu, base.maxpool)
+            self.layer1 = base.layer1
+            self.layer2 = base.layer2  # stride 8 total
+            self.layer3 = base.layer3  # stride 16
+            self.layer4 = base.layer4  # stride 32
+            in_channels = 512
+            self.head = HeatmapHead(in_channels)
+            self.label_head = LabelHead(in_channels)
+            self._is_unet = False
+        elif cfg.backbone == "unet_s":
+            self.unet = UNetSmall(in_channels=total_in, base_ch=64)
+            self.label_head_unet = LabelHead(self.unet.out_ch)
+            self._is_unet = True
+        else:
+            raise ValueError(f"Unsupported backbone: {cfg.backbone}")
+
+    def forward(self, x: torch.Tensor, cond: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        # 接受两路输入；为兼容旧用法，若cond为None则认为x已是拼接后的总通道输入
+        if cond is not None:
+            x = torch.cat([x, cond], dim=1)
+        b, c, h, w = x.shape
+        if getattr(self, "_is_unet", False):
+            logits = self.unet(x)
+            # use last decoder feature for label
+            feat = getattr(self.unet, "last_dec", None)
+            if feat is None:
+                # fallback to using input averaged with logits if feature missing
+                feat = x
+            label_logits = self.label_head_unet(feat)
+            return logits, label_logits
+        x = self.stem(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+        logits_low = self.head(x)  # [B,1,h',w']
+        label_logits = self.label_head(x)  # [B,2]
+        if self.cfg.upsample_to_input:
+            logits = F.interpolate(logits_low, size=(h, w), mode="bilinear", align_corners=False)
+            return logits, label_logits
+        return logits_low, label_logits
+
+
+def argmax_from_logits(logits: torch.Tensor) -> torch.Tensor:
+    """Get integer pixel coordinates from logits [B,1,H,W] -> [B,2] (x,y)."""
+    b, _, h, w = logits.shape
+    idx = logits.view(b, -1).argmax(dim=1)
+    y = (idx // w).float()
+    x = (idx % w).float()
+    return torch.stack([x, y], dim=1)
+
+
+def soft_argmax_from_logits(logits: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
+    """Soft-argmax to get sub-pixel expected coordinates [B,1,H,W] -> [B,2] (x,y)."""
+    b, _, h, w = logits.shape
+    p = F.softmax(logits.view(b, -1) / max(temperature, 1e-6), dim=1).view(b, 1, h, w)
+    xs = torch.linspace(0, w - 1, w, device=logits.device).view(1, 1, 1, w)
+    ys = torch.linspace(0, h - 1, h, device=logits.device).view(1, 1, h, 1)
+    x_exp = (p * xs).sum(dim=(2, 3))
+    y_exp = (p * ys).sum(dim=(2, 3))
+    return torch.cat([x_exp, y_exp], dim=1)
+
+
+# ==========================
+# 层级策略采样与log_prob计算
+# 将像素分布分解为：cell分布 + cell内子像素分布
+# ==========================
+
+def _crop_to_stride(logits: torch.Tensor, stride: int) -> tuple[torch.Tensor, int, int]:
+    B, C, H, W = logits.shape
+    Hc = H // stride
+    Wc = W // stride
+    Ht = Hc * stride
+    Wt = Wc * stride
+    return logits[:, :, :Ht, :Wt], Hc, Wc
+
+
+def _cell_logsumexp(logits: torch.Tensor, stride: int) -> tuple[torch.Tensor, torch.Tensor, int, int]:
+    logits, Hc, Wc = _crop_to_stride(logits, stride)
+    B, _, Ht, Wt = logits.shape
+    s = stride
+    patches = F.unfold(logits, kernel_size=(s, s), stride=(s, s))  # [B, s*s, Hc*Wc]
+    lse = torch.logsumexp(patches, dim=1)  # [B, Hc*Wc]
+    lse_map = lse.view(B, 1, Hc, Wc)
+    return lse_map, patches, Hc, Wc
+
+
+@torch.no_grad()
+def sample_cell_and_offset(
+    logits: torch.Tensor,
+    stride: int,
+    temperature: float = 1.0,
+) -> dict:
+    device = logits.device
+    T = max(temperature, 1e-6)
+    lse_map, patches, Hc, Wc = _cell_logsumexp(logits / T, stride)
+    B = logits.size(0)
+    s = stride
+
+    # p(cell)
+    cell_logits_flat = lse_map.view(B, -1)
+    cell_dist = torch.distributions.Categorical(logits=cell_logits_flat)
+    cell_idx = cell_dist.sample()                       # [B]
+    cell_logp = cell_dist.log_prob(cell_idx)            # [B]
+
+    # p(subpixel | cell)
+    within_logits = patches.gather(2, cell_idx.view(B, 1, 1).expand(B, s*s, 1)).squeeze(-1)
+    sub_dist = torch.distributions.Categorical(logits=within_logits)
+    sub_idx = sub_dist.sample()
+    sub_logp = sub_dist.log_prob(sub_idx)
+
+    # index -> (i,j)
+    ci = (cell_idx // Wc)              # [B]
+    cj = (cell_idx % Wc)               # [B]
+    ui = (sub_idx // s)
+    uj = (sub_idx % s)
+
+    # pixel coordinates within cropped region
+    yi = ci * s + ui
+    xj = cj * s + uj
+
+    # offset in [-0.5, 0.5]
+    off_x = (uj.to(torch.float32) + 0.5) / s - 0.5
+    off_y = (ui.to(torch.float32) + 0.5) / s - 0.5
+
+    total_logp = cell_logp + sub_logp
+
+    return {
+        "cell_idx": cell_idx,
+        "cell_ij": torch.stack([cj, ci], dim=1),
+        "sub_idx": sub_idx,
+        "sub_ij": torch.stack([uj, ui], dim=1),
+        "pixel_xy": torch.stack([xj, yi], dim=1),
+        "offset": torch.stack([off_x, off_y], dim=1).to(device),
+        "log_prob": total_logp,
+        "grid_hw": torch.tensor([Hc, Wc], device=device),
+        "stride": torch.tensor(s, device=device),
+    }
+
+
+def action_to_continuous_xy(sample_out: dict) -> torch.Tensor:
+    s = int(sample_out["stride"].item())
+    x = sample_out["pixel_xy"][:, 0].to(torch.float32) + 0.5
+    y = sample_out["pixel_xy"][:, 1].to(torch.float32) + 0.5
+    return torch.stack([x, y], dim=1)
+
+
+def log_prob_of_action(
+    logits: torch.Tensor,
+    stride: int,
+    cell_idx: torch.Tensor,
+    sub_idx: torch.Tensor,
+    temperature: float = 1.0,
+) -> torch.Tensor:
+    T = max(temperature, 1e-6)
+    lse_map, patches, Hc, Wc = _cell_logsumexp(logits / T, stride)
+    B = logits.size(0)
+    s = stride
+
+    cell_logits_flat = lse_map.view(B, -1)
+    cell_logp = torch.log_softmax(cell_logits_flat, dim=1).gather(1, cell_idx.view(B, 1)).squeeze(1)
+
+    within_logits = patches.gather(2, cell_idx.view(B, 1, 1).expand(B, s*s, 1)).squeeze(-1)
+    sub_logp = torch.log_softmax(within_logits, dim=1).gather(1, sub_idx.view(B, 1)).squeeze(1)
+
+    return cell_logp + sub_logp
+
+
+# ==========================
+# 联合策略：标签 + cell + cell内子像素
+# 提供采样与log_prob计算，便于GRPO等算法直接使用
+# ==========================
+
+@torch.no_grad()
+def sample_joint_label_cell_offset(
+    logits: torch.Tensor,
+    label_logits: torch.Tensor,
+    stride: int,
+    temperature_pixel: float = 1.0,
+    temperature_label: float = 1.0,
+) -> dict:
+    """Sample a joint action (label, cell, subpixel) and return combined log_prob.
+
+    Args:
+        logits: [B,1,H,W] heatmap logits over pixels
+        label_logits: [B,2] binary label logits
+        stride: cell stride size (pixels)
+        temperature_pixel: temperature for pixel distribution
+        temperature_label: temperature for label distribution
+    Returns:
+        dict with keys:
+          - label_idx: [B]
+          - cell_idx, cell_ij, sub_idx, sub_ij, pixel_xy, offset (same as sample_cell_and_offset)
+          - log_prob_label: [B]
+          - log_prob_pixel: [B]  (cell + sub)
+          - log_prob: [B]        (sum)
+          - grid_hw, stride
+    """
+    T_label = max(temperature_label, 1e-6)
+    label_dist = torch.distributions.Categorical(logits=label_logits / T_label)
+    label_idx = label_dist.sample()
+    logp_label = label_dist.log_prob(label_idx)
+
+    pixel = sample_cell_and_offset(logits, stride=stride, temperature=temperature_pixel)
+    logp_pixel = pixel["log_prob"]
+
+    out = dict(pixel)
+    out["label_idx"] = label_idx
+    out["log_prob_label"] = logp_label
+    out["log_prob_pixel"] = logp_pixel
+    out["log_prob"] = logp_label + logp_pixel
+    return out
+
+
+def log_prob_of_joint_action(
+    logits: torch.Tensor,
+    label_logits: torch.Tensor,
+    stride: int,
+    label_idx: torch.Tensor,
+    cell_idx: torch.Tensor,
+    sub_idx: torch.Tensor,
+    temperature_pixel: float = 1.0,
+    temperature_label: float = 1.0,
+) -> torch.Tensor:
+    """Compute log_prob(label) + log_prob(cell) + log_prob(sub|cell) for a given action."""
+    # label term
+    T_label = max(temperature_label, 1e-6)
+    ll = torch.log_softmax(label_logits / T_label, dim=1)
+    logp_label = ll.gather(1, label_idx.view(-1, 1)).squeeze(1)
+
+    # pixel terms
+    logp_pixel = log_prob_of_action(
+        logits=logits,
+        stride=stride,
+        cell_idx=cell_idx,
+        sub_idx=sub_idx,
+        temperature=temperature_pixel,
+    )
+    return logp_label + logp_pixel
+
+
+```
+
+```python
+<<'PATCH'
+*** Begin Patch
+*** Update File: /Users/donchiu/Works/Seg-R1/seg-rl/heatmap/train.py
+@@
+-    cfg = ModelConfig(backbone=args.arch, pretrained=args.pretrained, in_channels=4)
++    cfg = ModelConfig(backbone=args.arch, pretrained=args.pretrained, main_in_channels=3, cond_in_channels=1)
+     model = PointHeatmapModel(cfg).to(device)
+@@
+-                logits, label_logits = model(img)
++                # dataset now provides image (RGB+Gray stacked). For clarity split back: first 3 as main, last 1 as cond
++                main_img = img[:, :3]
++                cond_img = img[:, 3:4]
++                logits, label_logits = model(main_img, cond=cond_img)
+@@
+-                img = batch["image"].to(device, non_blocking=True)
++                img = batch["image"].to(device, non_blocking=True)
+                 tgt = batch["target_xy"].to(device, non_blocking=True)
+-                logits, label_logits = model(img)
++                main_img = img[:, :3]
++                cond_img = img[:, 3:4]
++                logits, label_logits = model(main_img, cond=cond_img)
+*** End Patch
+```
+
+```python
+from __future__ import annotations
+
+import argparse
+import os
+from typing import Tuple, List
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, Subset
+from PIL import Image
+
+try:
+    from .datasets import JsonlPointDataset, SamSequencePointDataset, ImageSize, collate_fn
+    from .model import ModelConfig, PointHeatmapModel, argmax_from_logits, soft_argmax_from_logits
+    from .losses import ce_over_pixels, kl_to_gaussian_targets, mse_to_gaussian_targets
+    from .utils import save_checkpoint
+    from .utils import draw_cross, draw_triangle, draw_diagonal_cross, overlay_heatmap, make_grid
+except ImportError:  # allow running as a script without package context
+    import sys as _sys
+    import os as _os
+    _pkg_root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    if _pkg_root not in _sys.path:
+        _sys.path.insert(0, _pkg_root)
+    from heatmap.datasets import JsonlPointDataset, SamSequencePointDataset, ImageSize, collate_fn
+    from heatmap.model import ModelConfig, PointHeatmapModel, argmax_from_logits, soft_argmax_from_logits
+    from heatmap.losses import ce_over_pixels, kl_to_gaussian_targets, mse_to_gaussian_targets
+    from heatmap.utils import save_checkpoint
+    from heatmap.utils import draw_cross, draw_triangle, draw_diagonal_cross, overlay_heatmap, make_grid
+
+"""
+训练热力图分类点定位模型，支持软高斯目标分布
+
+数据准备 - 从mask生成训练数据:
+python seg-rl/annotator/gen_point_jsonl_from_masks.py \\
+  --images_dir /path/to/images \\
+  --masks_dir /path/to/masks \\
+  --output_jsonl /path/to/training_data.jsonl
+
+支持的JSONL格式:
+  新格式: {"image": "/path/img.jpg", "points": [[x,y]], "labels": [1]}
+  旧格式: {"image": "/path/img.jpg", "x": x, "y": y}
+
+推荐用法（UNet + KL软目标，更适合生成平滑的距离衰减热力图）:
+python -m seg-rl.heatmap.train \
+  --data_jsonl /root/autodl-tmp/works/Seg-R0/datasets/seg_r1_md/Task01_BrainTumour/mask_salient_points-0.jsonl \
+  --height 512 --width 512 \
+  --arch unet_s \
+  --loss kl --sigma 6.0 --tau 1.0 \
+  --batch_size 16 --epochs 40 --amp \
+  --val_ratio 0.1 --test_ratio 0.1 --seed 42 \
+  --eval_thresh 5.0 --save_every 5 \
+  --out_dir /root/autodl-tmp/works/Seg-R0/outputs/seg_r1_md/Task01_BrainTumour/heatmap_train-0 \
+  --vis_mode sample --vis_count 16
+
+/opt/anaconda3/envs/seg-r1/bin/python -m seg-rl.heatmap.train \
+  --jsonl datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour-251001.jsonl \
+  --sam_dir datasets/seg_r1_md/Task01_BrainTumour/pretrain_gt_masks-251001 \
+  --height 512 --width 512 --arch unet_s \
+  --loss kl --sigma 6.0 --tau 1.0 \
+  --batch_size 16 --epochs 40 --amp \
+  --val_ratio 0.1 --test_ratio 0.1 --seed 42 \
+  --save_every 1 --save_steps 500 --progress --auto_resume \
+  --out_dir output/seg_r1_md/Task01_BrainTumour/heatmap_train-251001
+
+高分辨率场景（增大sigma获得更软的分布）:
+python -m seg-rl.heatmap.train \
+  --data_jsonl /root/autodl-tmp/works/Seg-R0/datasets/seg_r1_md/Task01_BrainTumour/mask_salient_points-0.jsonl \
+  --height 1024 --width 1024 \
+  --arch unet_s \
+  --loss kl --sigma 10.0 --tau 1.2 \
+  --batch_size 8 --epochs 50 --amp \
+  --lr 1e-4 --weight_decay 1e-4 \
+  --out_dir /root/autodl-tmp/works/Seg-R0/outputs/seg_r1_md/Task01_BrainTumour/heatmap_train-0 \
+  --vis_mode sample --vis_count 16
+
+MSE损失选项（更稳定的形状匹配）:
+python -m seg-rl.heatmap.train \
+  --data_jsonl /path/to/your/data.jsonl \
+  --arch unet_s --loss mse --sigma 8.0 \
+  --epochs 30 --amp
+"""
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Train heatmap model with self-supervised sequence dataset (RGB + Gray)")
+    p.add_argument("--jsonl", type=str, required=True, help="Path to JSONL (points+labels per image)")
+    p.add_argument("--sam_dir", type=str, required=True, help="Directory of SAM masks per step: {sam_dir}/{stem}/{k}.png")
+    p.add_argument("--height", type=int, default=512)
+    p.add_argument("--width", type=int, default=512)
+    p.add_argument("--batch_size", type=int, default=16)
+    p.add_argument("--epochs", type=int, default=20)
+    p.add_argument("--save_every", type=int, default=1, help="Save checkpoint every N epochs")
+    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--weight_decay", type=float, default=1e-4)
+    p.add_argument("--arch", type=str, choices=["unet_s", "resnet18"], default="unet_s")
+    p.add_argument("--loss", type=str, choices=["ce", "kl", "mse"], default="kl")
+    p.add_argument("--sigma", type=float, default=3.0, help="Gaussian sigma for KL/MSE targets")
+    p.add_argument("--tau", type=float, default=1.0, help="Temperature for KL/model softmax")
+    p.add_argument("--amp", action="store_true")
+    p.add_argument("--workers", type=int, default=8)
+    p.add_argument("--out_dir", type=str, default="./outputs/seg_rl")
+    p.add_argument("--plots_dir", type=str, default=None, help="Directory to save loss/PCK plots; default under out_dir/plots")
+    p.add_argument("--pretrained", action="store_true")
+    p.add_argument("--resume", type=str, default=None)
+    p.add_argument("--eval_thresh", type=float, default=5.0, help="PCK threshold in pixels")
+    p.add_argument("--val_ratio", type=float, default=0.1, help="Validation split ratio from the full dataset")
+    p.add_argument("--test_ratio", type=float, default=0.0, help="Test split ratio from the full dataset")
+    p.add_argument("--seed", type=int, default=42, help="Random seed for splitting")
+    p.add_argument("--vis_mode", type=str, choices=["none", "sample", "all"], default="none", help="Visualization mode")
+    p.add_argument("--vis_count", type=int, default=16, help="When vis_mode=sample, number of samples to visualize")
+    p.add_argument("--vis_dir", type=str, default=None, help="Directory to save visualization images; default under out_dir/vis")
+    p.add_argument("--save_steps", type=int, default=0, help="Save checkpoint every N steps (0 to disable)")
+    p.add_argument("--progress", action="store_true", help="Show tqdm progress bar during training")
+    p.add_argument("--auto_resume", action="store_true", help="If set and --resume not provided, try <out_dir>/last.pt")
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    # Prefer CUDA, then Apple Metal (MPS), else CPU
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+    # AMP only on CUDA for stability
+    amp_enabled = args.amp and (device.type == "cuda")
+    autocast_device_type = "cuda" if device.type == "cuda" else "cpu"
+
+    os.makedirs(args.out_dir, exist_ok=True)
+    plots_dir = args.plots_dir or os.path.join(args.out_dir, "plots")
+    os.makedirs(plots_dir, exist_ok=True)
+    vis_dir = args.vis_dir or os.path.join(args.out_dir, "vis")
+    os.makedirs(vis_dir, exist_ok=True)
+
+    image_size = ImageSize(height=args.height, width=args.width)
+    # Load once to get length for splitting
+    full_ds_for_len = SamSequencePointDataset(args.jsonl, sam_dir=args.sam_dir, image_size=image_size, training=True)
+    n = len(full_ds_for_len)
+    assert 0.0 <= args.val_ratio < 1.0 and 0.0 <= args.test_ratio < 1.0 and args.val_ratio + args.test_ratio < 1.0, "Invalid split ratios"
+    n_test = int(round(n * args.test_ratio))
+    n_val = int(round(n * args.val_ratio))
+    n_train = n - n_val - n_test
+    g = torch.Generator()
+    g.manual_seed(args.seed)
+    perm = torch.randperm(n, generator=g).tolist()
+    idx_train = perm[:n_train]
+    idx_val = perm[n_train:n_train + n_val]
+    idx_test = perm[n_train + n_val:]
+
+    # Build datasets per split to control augmentation flag
+    train_base = SamSequencePointDataset(args.jsonl, sam_dir=args.sam_dir, image_size=image_size, training=True)
+    val_base = SamSequencePointDataset(args.jsonl, sam_dir=args.sam_dir, image_size=image_size, training=False) if n_val > 0 else None
+    test_base = SamSequencePointDataset(args.jsonl, sam_dir=args.sam_dir, image_size=image_size, training=False) if n_test > 0 else None
+
+    train_ds = Subset(train_base, idx_train)
+    val_ds = Subset(val_base, idx_val) if val_base is not None else None
+    test_ds = Subset(test_base, idx_test) if test_base is not None else None
+
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.workers, pin_memory=True, collate_fn=collate_fn)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True, collate_fn=collate_fn) if val_ds is not None else None
+    test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True, collate_fn=collate_fn) if test_ds is not None else None
+
+    cfg = ModelConfig(backbone=args.arch, pretrained=args.pretrained, main_in_channels=3, cond_in_channels=1)
+    model = PointHeatmapModel(cfg).to(device)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scaler = torch.amp.GradScaler(enabled=amp_enabled)
+
+    start_epoch = 0
+    global_step = 0
+    tried_auto = False
+    if args.resume and os.path.isfile(args.resume):
+        from .utils import load_checkpoint
+        ckpt = load_checkpoint(args.resume, model, optimizer, scaler)
+        start_epoch = ckpt.epoch
+        global_step = ckpt.step
+        print(f"[Resume] Loaded checkpoint from {args.resume} (epoch={start_epoch}, step={global_step})")
+    elif args.auto_resume:
+        auto_path = os.path.join(args.out_dir, "last.pt")
+        if os.path.isfile(auto_path):
+            tried_auto = True
+            from .utils import load_checkpoint
+            ckpt = load_checkpoint(auto_path, model, optimizer, scaler)
+            start_epoch = ckpt.epoch
+            global_step = ckpt.step
+            print(f"[Auto-Resume] Loaded checkpoint from {auto_path} (epoch={start_epoch}, step={global_step})")
+
+    history = {"train_loss": [], "val_pck": [], "test_pck": []}
+
+    def evaluate(loader: DataLoader | None, split_name: str) -> float:
+        if loader is None:
+            return float("nan")
+        model.eval()
+        total = 0
+        correct = 0
+        with torch.no_grad():
+            for batch in loader:
+                img = batch["image"].to(device, non_blocking=True)
+                tgt = batch["target_xy"].to(device, non_blocking=True)
+                main_img = img[:, :3]
+                cond_img = img[:, 3:4]
+                logits, label_logits = model(main_img, cond=cond_img)
+                pred_xy = soft_argmax_from_logits(logits)
+                d = torch.linalg.norm(pred_xy - tgt, dim=1)
+                correct += (d <= args.eval_thresh).sum().item()
+                total += d.numel()
+        pck = correct / max(1, total)
+        print(f"{split_name} PCK@{args.eval_thresh}: {pck:.4f}")
+        return pck
+
+    def plot_curves():
+        try:
+            import matplotlib.pyplot as plt
+            import numpy as np
+            epochs_axis = np.arange(1, len(history["train_loss"]) + 1)
+            # Loss
+            plt.figure()
+            plt.plot(epochs_axis, history["train_loss"], label="train_loss")
+            plt.xlabel("Epoch")
+            plt.ylabel("Loss")
+            plt.legend()
+            plt.grid(True, ls=":", alpha=0.4)
+            plt.tight_layout()
+            plt.savefig(os.path.join(plots_dir, "loss.png"))
+            plt.close()
+            # PCK
+            plt.figure()
+            if any(not np.isnan(v) for v in history["val_pck"]):
+                plt.plot(epochs_axis, history["val_pck"], label="val_pck")
+            if any(not np.isnan(v) for v in history["test_pck"]):
+                plt.plot(epochs_axis, history["test_pck"], label="test_pck")
+            plt.xlabel("Epoch")
+            plt.ylabel(f"PCK@{args.eval_thresh}")
+            plt.legend()
+            plt.grid(True, ls=":", alpha=0.4)
+            plt.tight_layout()
+            plt.savefig(os.path.join(plots_dir, "pck.png"))
+            plt.close()
+        except Exception as e:
+            print(f"Plotting failed: {e}")
+
+    def visualize_dataset(loader: DataLoader | None, split_name: str):
+        if loader is None or args.vis_mode == "none":
+            return
+        model.eval()
+        import torchvision.transforms.functional as TF
+        import numpy as np
+        saved_images: List[Image.Image] = []
+        count = 0
+        max_count = args.vis_count if args.vis_mode == "sample" else float("inf")
+        with torch.no_grad():
+            for batch in loader:
+                img_t = batch["image_rgb"]  # [B,3,H,W] use RGB for visualization
+                tgt = batch["target_xy"]  # [B,2]
+                # Build 4ch input for the model: RGB + Gray
+                img4 = torch.cat([img_t.to(device), batch["image_gray"].to(device)], dim=1)
+                logits, label_logits = model(img4)
+                # ensure logits match image resolution for precise overlay
+                _, _, H_img, W_img = img_t.shape
+                if logits.shape[-2] != H_img or logits.shape[-1] != W_img:
+                    logits = torch.nn.functional.interpolate(logits, size=(H_img, W_img), mode="bilinear", align_corners=False)
+                # probability heatmap for stable visualization
+                bsz, _, H, W = logits.shape
+                probs = torch.softmax(logits.view(bsz, -1), dim=1).view(bsz, 1, H, W)
+                # compute soft-argmax pred on CPU for simplicity
+                pred_xy = soft_argmax_from_logits(logits).cpu()
+                for i in range(img_t.size(0)):
+                    if count >= max_count:
+                        break
+                    # unnormalize to [0,1] for visualization (ImageNet stats)
+                    mean = np.array([0.485, 0.456, 0.406]).reshape(3, 1, 1)
+                    std = np.array([0.229, 0.224, 0.225]).reshape(3, 1, 1)
+                    arr = img_t[i].cpu().float().numpy()
+                    arr = (arr * std + mean).clip(0.0, 1.0)
+                    pil_img = TF.to_pil_image(torch.from_numpy(arr))
+                    # overlay probability heatmap instead of raw logits
+                    hm = probs[i, 0].detach().cpu().float().numpy()
+                    # show base image in grayscale while keeping heatmap colored
+                    over = overlay_heatmap(pil_img.convert("L"), hm, alpha=0.5)
+                    # clamp coords to image bounds to ensure visibility
+                    h, w = img_t.size(-2), img_t.size(-1)
+                    gx = float(max(0.0, min(w - 1.0, float(tgt[i, 0]))))
+                    gy = float(max(0.0, min(h - 1.0, float(tgt[i, 1]))))
+                    px = float(max(0.0, min(w - 1.0, float(pred_xy[i, 0]))))
+                    py = float(max(0.0, min(h - 1.0, float(pred_xy[i, 1]))))
+                    # draw GT and Pred (GT + Pred both crosses; Pred is 45-degree red cross)
+                    over = draw_cross(over, (gx, gy), color=(0, 255, 0))
+                    over = draw_diagonal_cross(over, (px, py), color=(255, 0, 0), size=10)
+                    saved_images.append(over)
+                    count += 1
+                if count >= max_count:
+                    break
+        # save grid or per-sample
+        if args.vis_mode == "sample":
+            grid = make_grid(saved_images, cols=4)
+            grid.save(os.path.join(vis_dir, f"{split_name}_vis.png"))
+        else:  # all
+            split_dir = os.path.join(vis_dir, split_name)
+            os.makedirs(split_dir, exist_ok=True)
+            for i, img in enumerate(saved_images):
+                img.save(os.path.join(split_dir, f"{i:05d}.png"))
+
+    for epoch in range(start_epoch, args.epochs):
+        model.train()
+        running_loss = 0.0
+        # Progress bar setup
+        _iter = train_loader
+        _tqdm = None
+        if args.progress:
+            try:
+                from tqdm import tqdm  # type: ignore
+                _tqdm = tqdm(total=len(train_loader), desc=f"Epoch {epoch+1}/{args.epochs}")
+            except Exception:
+                _tqdm = None
+        for bi, batch in enumerate(train_loader, 1):
+            img = batch["image"].to(device, non_blocking=True)
+            tgt = batch["target_xy"].to(device, non_blocking=True)
+
+            optimizer.zero_grad(set_to_none=True)
+            with torch.amp.autocast(device_type=autocast_device_type, enabled=amp_enabled):
+                main_img = img[:, :3]
+                cond_img = img[:, 3:4]
+                logits, label_logits = model(main_img, cond=cond_img)
+                if args.loss == "ce":
+                    loss_hm = ce_over_pixels(logits, tgt)
+                elif args.loss == "kl":
+                    loss_hm = kl_to_gaussian_targets(logits, tgt, sigma=args.sigma, tau=args.tau)
+                else:
+                    loss_hm = mse_to_gaussian_targets(logits, tgt, sigma=args.sigma)
+                loss_label = nn.CrossEntropyLoss()(label_logits, batch["target_label"].to(device))
+                loss = loss_hm + 0.2 * loss_label
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            running_loss += loss.item()
+            global_step += 1
+
+            # Periodic checkpoint
+            if args.save_steps > 0 and (global_step % args.save_steps == 0):
+                save_path = os.path.join(args.out_dir, f"step_{global_step}.pt")
+                save_checkpoint(save_path, model, optimizer, scaler, epoch=epoch + 1, step=global_step)
+                # also update last.pt symlink-like copy
+                last_path = os.path.join(args.out_dir, "last.pt")
+                save_checkpoint(last_path, model, optimizer, scaler, epoch=epoch + 1, step=global_step)
+
+            # Progress output
+            if _tqdm is not None:
+                _tqdm.set_postfix({"loss": f"{loss.item():.4f}", "lr": f"{optimizer.param_groups[0]['lr']:.2e}"})
+                _tqdm.update(1)
+            elif (bi % max(1, len(train_loader)//10)) == 0:
+                print(f"Epoch {epoch+1}/{args.epochs} [{bi}/{len(train_loader)}] loss={loss.item():.4f} lr={optimizer.param_groups[0]['lr']:.2e}")
+
+        if _tqdm is not None:
+            _tqdm.close()
+
+        avg_loss = running_loss / max(1, len(train_loader))
+        history["train_loss"].append(avg_loss)
+        print(f"Epoch {epoch+1}/{args.epochs} - train loss: {avg_loss:.4f}")
+
+        # Validation
+        val_pck = evaluate(val_loader, "val") if val_loader is not None else float("nan")
+        history["val_pck"].append(val_pck)
+        test_pck = evaluate(test_loader, "test") if test_loader is not None else float("nan")
+        history["test_pck"].append(test_pck)
+
+        # plots
+        plot_curves()
+
+        # visualizations
+        if args.vis_mode != "none":
+            visualize_dataset(val_loader or train_loader, split_name="val_or_train")
+
+        # Save epoch checkpoint and update last.pt
+        if ((epoch + 1) % max(1, args.save_every)) == 0:
+            save_path = os.path.join(args.out_dir, f"model_epoch_{epoch+1}.pt")
+            save_checkpoint(save_path, model, optimizer, scaler, epoch=epoch+1, step=global_step)
+        last_path = os.path.join(args.out_dir, "last.pt")
+        save_checkpoint(last_path, model, optimizer, scaler, epoch=epoch+1, step=global_step)
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+```
+
+- 我已把模型与训练流程改为“显式双输入”的形式，符合你的任务定义：
+  - `PointHeatmapModel.forward(main, cond=None)`：现在接受两路输入，`main` 为灰度或RGB主图，`cond` 为单通道灰度图（当前预测mask）；内部在第一层前将两路在通道维拼接再编码。
+  - `ModelConfig` 改为 `main_in_channels` 和 `cond_in_channels`，默认 3+1。
+  - ResNet 与 UNet 两条分支均按总通道数适配第一层卷积权重。
+  - 仍输出两头：热图 logits（用于位置概率）和 `label_logits`（二分类标签）。
+
+- 训练脚本对应修改：
+  - 构造 `ModelConfig(main_in_channels=3, cond_in_channels=1)`。
+  - 从批数据的 4 通道张量中拆分：`main_img = img[:, :3]`，`cond_img = img[:, 3:4]`，调用 `model(main_img, cond=cond_img)`。
+  - 评估与可视化也按相同方式拆分再前向。
+
+- 这样，模型的前向确实用到了“图像+灰度mask”两路输入进行融合，输出位置与标签预测，满足你的需求。
+
+---
+
+**User**
+
+这一行·loss = loss_hm + 0.2 * loss_label·里的loss_label权重设为0.2有什么依据吗？最好把它作为一个可选设置的带有建议值作为默认值的超参数。
+
+---
+
+**Cursor**
+
+I'll add a --label_loss_weight hyperparameter (default 0.2) to seg-rl/heatmap/train.py and use it when computing the total loss. Then I'll run a lint check.
+
+```python
+from __future__ import annotations
+
+import argparse
+import os
+from typing import Tuple, List
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, Subset
+from PIL import Image
+
+try:
+    from .datasets import JsonlPointDataset, SamSequencePointDataset, ImageSize, collate_fn
+    from .model import ModelConfig, PointHeatmapModel, argmax_from_logits, soft_argmax_from_logits
+    from .losses import ce_over_pixels, kl_to_gaussian_targets, mse_to_gaussian_targets
+    from .utils import save_checkpoint
+    from .utils import draw_cross, draw_triangle, draw_diagonal_cross, overlay_heatmap, make_grid
+except ImportError:  # allow running as a script without package context
+    import sys as _sys
+    import os as _os
+    _pkg_root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    if _pkg_root not in _sys.path:
+        _sys.path.insert(0, _pkg_root)
+    from heatmap.datasets import JsonlPointDataset, SamSequencePointDataset, ImageSize, collate_fn
+    from heatmap.model import ModelConfig, PointHeatmapModel, argmax_from_logits, soft_argmax_from_logits
+    from heatmap.losses import ce_over_pixels, kl_to_gaussian_targets, mse_to_gaussian_targets
+    from heatmap.utils import save_checkpoint
+    from heatmap.utils import draw_cross, draw_triangle, draw_diagonal_cross, overlay_heatmap, make_grid
+
+"""
+训练热力图分类点定位模型，支持软高斯目标分布
+
+数据准备 - 从mask生成训练数据:
+python seg-rl/annotator/gen_point_jsonl_from_masks.py \\
+  --images_dir /path/to/images \\
+  --masks_dir /path/to/masks \\
+  --output_jsonl /path/to/training_data.jsonl
+
+支持的JSONL格式:
+  新格式: {"image": "/path/img.jpg", "points": [[x,y]], "labels": [1]}
+  旧格式: {"image": "/path/img.jpg", "x": x, "y": y}
+
+推荐用法（UNet + KL软目标，更适合生成平滑的距离衰减热力图）:
+python -m seg-rl.heatmap.train \
+  --data_jsonl /root/autodl-tmp/works/Seg-R0/datasets/seg_r1_md/Task01_BrainTumour/mask_salient_points-0.jsonl \
+  --height 512 --width 512 \
+  --arch unet_s \
+  --loss kl --sigma 6.0 --tau 1.0 \
+  --batch_size 16 --epochs 40 --amp \
+  --val_ratio 0.1 --test_ratio 0.1 --seed 42 \
+  --eval_thresh 5.0 --save_every 5 \
+  --out_dir /root/autodl-tmp/works/Seg-R0/outputs/seg_r1_md/Task01_BrainTumour/heatmap_train-0 \
+  --vis_mode sample --vis_count 16
+
+/opt/anaconda3/envs/seg-r1/bin/python -m seg-rl.heatmap.train \
+  --jsonl datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour-251001.jsonl \
+  --sam_dir datasets/seg_r1_md/Task01_BrainTumour/pretrain_gt_masks-251001 \
+  --height 512 --width 512 --arch unet_s \
+  --loss kl --sigma 6.0 --tau 1.0 \
+  --batch_size 16 --epochs 40 --amp \
+  --val_ratio 0.1 --test_ratio 0.1 --seed 42 \
+  --save_every 1 --save_steps 500 --progress --auto_resume \
+  --out_dir output/seg_r1_md/Task01_BrainTumour/heatmap_train-251001
+
+高分辨率场景（增大sigma获得更软的分布）:
+python -m seg-rl.heatmap.train \
+  --data_jsonl /root/autodl-tmp/works/Seg-R0/datasets/seg_r1_md/Task01_BrainTumour/mask_salient_points-0.jsonl \
+  --height 1024 --width 1024 \
+  --arch unet_s \
+  --loss kl --sigma 10.0 --tau 1.2 \
+  --batch_size 8 --epochs 50 --amp \
+  --lr 1e-4 --weight_decay 1e-4 \
+  --out_dir /root/autodl-tmp/works/Seg-R0/outputs/seg_r1_md/Task01_BrainTumour/heatmap_train-0 \
+  --vis_mode sample --vis_count 16
+
+MSE损失选项（更稳定的形状匹配）:
+python -m seg-rl.heatmap.train \
+  --data_jsonl /path/to/your/data.jsonl \
+  --arch unet_s --loss mse --sigma 8.0 \
+  --epochs 30 --amp
+"""
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Train heatmap model with self-supervised sequence dataset (RGB + Gray)")
+    p.add_argument("--jsonl", type=str, required=True, help="Path to JSONL (points+labels per image)")
+    p.add_argument("--sam_dir", type=str, required=True, help="Directory of SAM masks per step: {sam_dir}/{stem}/{k}.png")
+    p.add_argument("--height", type=int, default=512)
+    p.add_argument("--width", type=int, default=512)
+    p.add_argument("--batch_size", type=int, default=16)
+    p.add_argument("--epochs", type=int, default=20)
+    p.add_argument("--save_every", type=int, default=1, help="Save checkpoint every N epochs")
+    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--weight_decay", type=float, default=1e-4)
+    p.add_argument("--arch", type=str, choices=["unet_s", "resnet18"], default="unet_s")
+    p.add_argument("--loss", type=str, choices=["ce", "kl", "mse"], default="kl")
+    p.add_argument("--sigma", type=float, default=3.0, help="Gaussian sigma for KL/MSE targets")
+    p.add_argument("--tau", type=float, default=1.0, help="Temperature for KL/model softmax")
+    p.add_argument("--label_loss_weight", type=float, default=0.2, help="Weight for label CE in total loss (recommended: 0.1~0.3)")
+    p.add_argument("--amp", action="store_true")
+    p.add_argument("--workers", type=int, default=8)
+    p.add_argument("--out_dir", type=str, default="./outputs/seg_rl")
+    p.add_argument("--plots_dir", type=str, default=None, help="Directory to save loss/PCK plots; default under out_dir/plots")
+    p.add_argument("--pretrained", action="store_true")
+    p.add_argument("--resume", type=str, default=None)
+    p.add_argument("--eval_thresh", type=float, default=5.0, help="PCK threshold in pixels")
+    p.add_argument("--val_ratio", type=float, default=0.1, help="Validation split ratio from the full dataset")
+    p.add_argument("--test_ratio", type=float, default=0.0, help="Test split ratio from the full dataset")
+    p.add_argument("--seed", type=int, default=42, help="Random seed for splitting")
+    p.add_argument("--vis_mode", type=str, choices=["none", "sample", "all"], default="none", help="Visualization mode")
+    p.add_argument("--vis_count", type=int, default=16, help="When vis_mode=sample, number of samples to visualize")
+    p.add_argument("--vis_dir", type=str, default=None, help="Directory to save visualization images; default under out_dir/vis")
+    p.add_argument("--save_steps", type=int, default=0, help="Save checkpoint every N steps (0 to disable)")
+    p.add_argument("--progress", action="store_true", help="Show tqdm progress bar during training")
+    p.add_argument("--auto_resume", action="store_true", help="If set and --resume not provided, try <out_dir>/last.pt")
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    # Prefer CUDA, then Apple Metal (MPS), else CPU
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+    # AMP only on CUDA for stability
+    amp_enabled = args.amp and (device.type == "cuda")
+    autocast_device_type = "cuda" if device.type == "cuda" else "cpu"
+
+    os.makedirs(args.out_dir, exist_ok=True)
+    plots_dir = args.plots_dir or os.path.join(args.out_dir, "plots")
+    os.makedirs(plots_dir, exist_ok=True)
+    vis_dir = args.vis_dir or os.path.join(args.out_dir, "vis")
+    os.makedirs(vis_dir, exist_ok=True)
+
+    image_size = ImageSize(height=args.height, width=args.width)
+    # Load once to get length for splitting
+    full_ds_for_len = SamSequencePointDataset(args.jsonl, sam_dir=args.sam_dir, image_size=image_size, training=True)
+    n = len(full_ds_for_len)
+    assert 0.0 <= args.val_ratio < 1.0 and 0.0 <= args.test_ratio < 1.0 and args.val_ratio + args.test_ratio < 1.0, "Invalid split ratios"
+    n_test = int(round(n * args.test_ratio))
+    n_val = int(round(n * args.val_ratio))
+    n_train = n - n_val - n_test
+    g = torch.Generator()
+    g.manual_seed(args.seed)
+    perm = torch.randperm(n, generator=g).tolist()
+    idx_train = perm[:n_train]
+    idx_val = perm[n_train:n_train + n_val]
+    idx_test = perm[n_train + n_val:]
+
+    # Build datasets per split to control augmentation flag
+    train_base = SamSequencePointDataset(args.jsonl, sam_dir=args.sam_dir, image_size=image_size, training=True)
+    val_base = SamSequencePointDataset(args.jsonl, sam_dir=args.sam_dir, image_size=image_size, training=False) if n_val > 0 else None
+    test_base = SamSequencePointDataset(args.jsonl, sam_dir=args.sam_dir, image_size=image_size, training=False) if n_test > 0 else None
+
+    train_ds = Subset(train_base, idx_train)
+    val_ds = Subset(val_base, idx_val) if val_base is not None else None
+    test_ds = Subset(test_base, idx_test) if test_base is not None else None
+
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.workers, pin_memory=True, collate_fn=collate_fn)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True, collate_fn=collate_fn) if val_ds is not None else None
+    test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True, collate_fn=collate_fn) if test_ds is not None else None
+
+    cfg = ModelConfig(backbone=args.arch, pretrained=args.pretrained, main_in_channels=3, cond_in_channels=1)
+    model = PointHeatmapModel(cfg).to(device)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scaler = torch.amp.GradScaler(enabled=amp_enabled)
+
+    start_epoch = 0
+    global_step = 0
+    tried_auto = False
+    if args.resume and os.path.isfile(args.resume):
+        from .utils import load_checkpoint
+        ckpt = load_checkpoint(args.resume, model, optimizer, scaler)
+        start_epoch = ckpt.epoch
+        global_step = ckpt.step
+        print(f"[Resume] Loaded checkpoint from {args.resume} (epoch={start_epoch}, step={global_step})")
+    elif args.auto_resume:
+        auto_path = os.path.join(args.out_dir, "last.pt")
+        if os.path.isfile(auto_path):
+            tried_auto = True
+            from .utils import load_checkpoint
+            ckpt = load_checkpoint(auto_path, model, optimizer, scaler)
+            start_epoch = ckpt.epoch
+            global_step = ckpt.step
+            print(f"[Auto-Resume] Loaded checkpoint from {auto_path} (epoch={start_epoch}, step={global_step})")
+
+    history = {"train_loss": [], "val_pck": [], "test_pck": []}
+
+    def evaluate(loader: DataLoader | None, split_name: str) -> float:
+        if loader is None:
+            return float("nan")
+        model.eval()
+        total = 0
+        correct = 0
+        with torch.no_grad():
+            for batch in loader:
+                img = batch["image"].to(device, non_blocking=True)
+                tgt = batch["target_xy"].to(device, non_blocking=True)
+                main_img = img[:, :3]
+                cond_img = img[:, 3:4]
+                logits, label_logits = model(main_img, cond=cond_img)
+                pred_xy = soft_argmax_from_logits(logits)
+                d = torch.linalg.norm(pred_xy - tgt, dim=1)
+                correct += (d <= args.eval_thresh).sum().item()
+                total += d.numel()
+        pck = correct / max(1, total)
+        print(f"{split_name} PCK@{args.eval_thresh}: {pck:.4f}")
+        return pck
+
+    def plot_curves():
+        try:
+            import matplotlib.pyplot as plt
+            import numpy as np
+            epochs_axis = np.arange(1, len(history["train_loss"]) + 1)
+            # Loss
+            plt.figure()
+            plt.plot(epochs_axis, history["train_loss"], label="train_loss")
+            plt.xlabel("Epoch")
+            plt.ylabel("Loss")
+            plt.legend()
+            plt.grid(True, ls=":", alpha=0.4)
+            plt.tight_layout()
+            plt.savefig(os.path.join(plots_dir, "loss.png"))
+            plt.close()
+            # PCK
+            plt.figure()
+            if any(not np.isnan(v) for v in history["val_pck"]):
+                plt.plot(epochs_axis, history["val_pck"], label="val_pck")
+            if any(not np.isnan(v) for v in history["test_pck"]):
+                plt.plot(epochs_axis, history["test_pck"], label="test_pck")
+            plt.xlabel("Epoch")
+            plt.ylabel(f"PCK@{args.eval_thresh}")
+            plt.legend()
+            plt.grid(True, ls=":", alpha=0.4)
+            plt.tight_layout()
+            plt.savefig(os.path.join(plots_dir, "pck.png"))
+            plt.close()
+        except Exception as e:
+            print(f"Plotting failed: {e}")
+
+    def visualize_dataset(loader: DataLoader | None, split_name: str):
+        if loader is None or args.vis_mode == "none":
+            return
+        model.eval()
+        import torchvision.transforms.functional as TF
+        import numpy as np
+        saved_images: List[Image.Image] = []
+        count = 0
+        max_count = args.vis_count if args.vis_mode == "sample" else float("inf")
+        with torch.no_grad():
+            for batch in loader:
+                img_t = batch["image_rgb"]  # [B,3,H,W] use RGB for visualization
+                tgt = batch["target_xy"]  # [B,2]
+                # Build 4ch input for the model: RGB + Gray
+                img4 = torch.cat([img_t.to(device), batch["image_gray"].to(device)], dim=1)
+                logits, label_logits = model(img4)
+                # ensure logits match image resolution for precise overlay
+                _, _, H_img, W_img = img_t.shape
+                if logits.shape[-2] != H_img or logits.shape[-1] != W_img:
+                    logits = torch.nn.functional.interpolate(logits, size=(H_img, W_img), mode="bilinear", align_corners=False)
+                # probability heatmap for stable visualization
+                bsz, _, H, W = logits.shape
+                probs = torch.softmax(logits.view(bsz, -1), dim=1).view(bsz, 1, H, W)
+                # compute soft-argmax pred on CPU for simplicity
+                pred_xy = soft_argmax_from_logits(logits).cpu()
+                for i in range(img_t.size(0)):
+                    if count >= max_count:
+                        break
+                    # unnormalize to [0,1] for visualization (ImageNet stats)
+                    mean = np.array([0.485, 0.456, 0.406]).reshape(3, 1, 1)
+                    std = np.array([0.229, 0.224, 0.225]).reshape(3, 1, 1)
+                    arr = img_t[i].cpu().float().numpy()
+                    arr = (arr * std + mean).clip(0.0, 1.0)
+                    pil_img = TF.to_pil_image(torch.from_numpy(arr))
+                    # overlay probability heatmap instead of raw logits
+                    hm = probs[i, 0].detach().cpu().float().numpy()
+                    # show base image in grayscale while keeping heatmap colored
+                    over = overlay_heatmap(pil_img.convert("L"), hm, alpha=0.5)
+                    # clamp coords to image bounds to ensure visibility
+                    h, w = img_t.size(-2), img_t.size(-1)
+                    gx = float(max(0.0, min(w - 1.0, float(tgt[i, 0]))))
+                    gy = float(max(0.0, min(h - 1.0, float(tgt[i, 1]))))
+                    px = float(max(0.0, min(w - 1.0, float(pred_xy[i, 0]))))
+                    py = float(max(0.0, min(h - 1.0, float(pred_xy[i, 1]))))
+                    # draw GT and Pred (GT + Pred both crosses; Pred is 45-degree red cross)
+                    over = draw_cross(over, (gx, gy), color=(0, 255, 0))
+                    over = draw_diagonal_cross(over, (px, py), color=(255, 0, 0), size=10)
+                    saved_images.append(over)
+                    count += 1
+                if count >= max_count:
+                    break
+        # save grid or per-sample
+        if args.vis_mode == "sample":
+            grid = make_grid(saved_images, cols=4)
+            grid.save(os.path.join(vis_dir, f"{split_name}_vis.png"))
+        else:  # all
+            split_dir = os.path.join(vis_dir, split_name)
+            os.makedirs(split_dir, exist_ok=True)
+            for i, img in enumerate(saved_images):
+                img.save(os.path.join(split_dir, f"{i:05d}.png"))
+
+    for epoch in range(start_epoch, args.epochs):
+        model.train()
+        running_loss = 0.0
+        # Progress bar setup
+        _iter = train_loader
+        _tqdm = None
+        if args.progress:
+            try:
+                from tqdm import tqdm  # type: ignore
+                _tqdm = tqdm(total=len(train_loader), desc=f"Epoch {epoch+1}/{args.epochs}")
+            except Exception:
+                _tqdm = None
+        for bi, batch in enumerate(train_loader, 1):
+            img = batch["image"].to(device, non_blocking=True)
+            tgt = batch["target_xy"].to(device, non_blocking=True)
+
+            optimizer.zero_grad(set_to_none=True)
+            with torch.amp.autocast(device_type=autocast_device_type, enabled=amp_enabled):
+                main_img = img[:, :3]
+                cond_img = img[:, 3:4]
+                logits, label_logits = model(main_img, cond=cond_img)
+                if args.loss == "ce":
+                    loss_hm = ce_over_pixels(logits, tgt)
+                elif args.loss == "kl":
+                    loss_hm = kl_to_gaussian_targets(logits, tgt, sigma=args.sigma, tau=args.tau)
+                else:
+                    loss_hm = mse_to_gaussian_targets(logits, tgt, sigma=args.sigma)
+                loss_label = nn.CrossEntropyLoss()(label_logits, batch["target_label"].to(device))
+                loss = loss_hm + 0.2 * loss_label
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            running_loss += loss.item()
+            global_step += 1
+
+            # Periodic checkpoint
+            if args.save_steps > 0 and (global_step % args.save_steps == 0):
+                save_path = os.path.join(args.out_dir, f"step_{global_step}.pt")
+                save_checkpoint(save_path, model, optimizer, scaler, epoch=epoch + 1, step=global_step)
+                # also update last.pt symlink-like copy
+                last_path = os.path.join(args.out_dir, "last.pt")
+                save_checkpoint(last_path, model, optimizer, scaler, epoch=epoch + 1, step=global_step)
+
+            # Progress output
+            if _tqdm is not None:
+                _tqdm.set_postfix({"loss": f"{loss.item():.4f}", "lr": f"{optimizer.param_groups[0]['lr']:.2e}"})
+                _tqdm.update(1)
+            elif (bi % max(1, len(train_loader)//10)) == 0:
+                print(f"Epoch {epoch+1}/{args.epochs} [{bi}/{len(train_loader)}] loss={loss.item():.4f} lr={optimizer.param_groups[0]['lr']:.2e}")
+
+        if _tqdm is not None:
+            _tqdm.close()
+
+        avg_loss = running_loss / max(1, len(train_loader))
+        history["train_loss"].append(avg_loss)
+        print(f"Epoch {epoch+1}/{args.epochs} - train loss: {avg_loss:.4f}")
+
+        # Validation
+        val_pck = evaluate(val_loader, "val") if val_loader is not None else float("nan")
+        history["val_pck"].append(val_pck)
+        test_pck = evaluate(test_loader, "test") if test_loader is not None else float("nan")
+        history["test_pck"].append(test_pck)
+
+        # plots
+        plot_curves()
+
+        # visualizations
+        if args.vis_mode != "none":
+            visualize_dataset(val_loader or train_loader, split_name="val_or_train")
+
+        # Save epoch checkpoint and update last.pt
+        if ((epoch + 1) % max(1, args.save_every)) == 0:
+            save_path = os.path.join(args.out_dir, f"model_epoch_{epoch+1}.pt")
+            save_checkpoint(save_path, model, optimizer, scaler, epoch=epoch+1, step=global_step)
+        last_path = os.path.join(args.out_dir, "last.pt")
+        save_checkpoint(last_path, model, optimizer, scaler, epoch=epoch+1, step=global_step)
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+```
+
+```python
+from __future__ import annotations
+
+import argparse
+import os
+from typing import Tuple, List
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, Subset
+from PIL import Image
+
+try:
+    from .datasets import JsonlPointDataset, SamSequencePointDataset, ImageSize, collate_fn
+    from .model import ModelConfig, PointHeatmapModel, argmax_from_logits, soft_argmax_from_logits
+    from .losses import ce_over_pixels, kl_to_gaussian_targets, mse_to_gaussian_targets
+    from .utils import save_checkpoint
+    from .utils import draw_cross, draw_triangle, draw_diagonal_cross, overlay_heatmap, make_grid
+except ImportError:  # allow running as a script without package context
+    import sys as _sys
+    import os as _os
+    _pkg_root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    if _pkg_root not in _sys.path:
+        _sys.path.insert(0, _pkg_root)
+    from heatmap.datasets import JsonlPointDataset, SamSequencePointDataset, ImageSize, collate_fn
+    from heatmap.model import ModelConfig, PointHeatmapModel, argmax_from_logits, soft_argmax_from_logits
+    from heatmap.losses import ce_over_pixels, kl_to_gaussian_targets, mse_to_gaussian_targets
+    from heatmap.utils import save_checkpoint
+    from heatmap.utils import draw_cross, draw_triangle, draw_diagonal_cross, overlay_heatmap, make_grid
+
+"""
+训练热力图分类点定位模型，支持软高斯目标分布
+
+数据准备 - 从mask生成训练数据:
+python seg-rl/annotator/gen_point_jsonl_from_masks.py \\
+  --images_dir /path/to/images \\
+  --masks_dir /path/to/masks \\
+  --output_jsonl /path/to/training_data.jsonl
+
+支持的JSONL格式:
+  新格式: {"image": "/path/img.jpg", "points": [[x,y]], "labels": [1]}
+  旧格式: {"image": "/path/img.jpg", "x": x, "y": y}
+
+推荐用法（UNet + KL软目标，更适合生成平滑的距离衰减热力图）:
+python -m seg-rl.heatmap.train \
+  --data_jsonl /root/autodl-tmp/works/Seg-R0/datasets/seg_r1_md/Task01_BrainTumour/mask_salient_points-0.jsonl \
+  --height 512 --width 512 \
+  --arch unet_s \
+  --loss kl --sigma 6.0 --tau 1.0 \
+  --batch_size 16 --epochs 40 --amp \
+  --val_ratio 0.1 --test_ratio 0.1 --seed 42 \
+  --eval_thresh 5.0 --save_every 5 \
+  --out_dir /root/autodl-tmp/works/Seg-R0/outputs/seg_r1_md/Task01_BrainTumour/heatmap_train-0 \
+  --vis_mode sample --vis_count 16
+
+/opt/anaconda3/envs/seg-r1/bin/python -m seg-rl.heatmap.train \
+  --jsonl datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour-251001.jsonl \
+  --sam_dir datasets/seg_r1_md/Task01_BrainTumour/pretrain_gt_masks-251001 \
+  --height 512 --width 512 --arch unet_s \
+  --loss kl --sigma 6.0 --tau 1.0 \
+  --batch_size 16 --epochs 40 --amp \
+  --val_ratio 0.1 --test_ratio 0.1 --seed 42 \
+  --save_every 1 --save_steps 500 --progress --auto_resume \
+  --out_dir output/seg_r1_md/Task01_BrainTumour/heatmap_train-251001
+
+高分辨率场景（增大sigma获得更软的分布）:
+python -m seg-rl.heatmap.train \
+  --data_jsonl /root/autodl-tmp/works/Seg-R0/datasets/seg_r1_md/Task01_BrainTumour/mask_salient_points-0.jsonl \
+  --height 1024 --width 1024 \
+  --arch unet_s \
+  --loss kl --sigma 10.0 --tau 1.2 \
+  --batch_size 8 --epochs 50 --amp \
+  --lr 1e-4 --weight_decay 1e-4 \
+  --out_dir /root/autodl-tmp/works/Seg-R0/outputs/seg_r1_md/Task01_BrainTumour/heatmap_train-0 \
+  --vis_mode sample --vis_count 16
+
+MSE损失选项（更稳定的形状匹配）:
+python -m seg-rl.heatmap.train \
+  --data_jsonl /path/to/your/data.jsonl \
+  --arch unet_s --loss mse --sigma 8.0 \
+  --epochs 30 --amp
+"""
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Train heatmap model with self-supervised sequence dataset (RGB + Gray)")
+    p.add_argument("--jsonl", type=str, required=True, help="Path to JSONL (points+labels per image)")
+    p.add_argument("--sam_dir", type=str, required=True, help="Directory of SAM masks per step: {sam_dir}/{stem}/{k}.png")
+    p.add_argument("--height", type=int, default=512)
+    p.add_argument("--width", type=int, default=512)
+    p.add_argument("--batch_size", type=int, default=16)
+    p.add_argument("--epochs", type=int, default=20)
+    p.add_argument("--save_every", type=int, default=1, help="Save checkpoint every N epochs")
+    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--weight_decay", type=float, default=1e-4)
+    p.add_argument("--arch", type=str, choices=["unet_s", "resnet18"], default="unet_s")
+    p.add_argument("--loss", type=str, choices=["ce", "kl", "mse"], default="kl")
+    p.add_argument("--sigma", type=float, default=3.0, help="Gaussian sigma for KL/MSE targets")
+    p.add_argument("--tau", type=float, default=1.0, help="Temperature for KL/model softmax")
+    p.add_argument("--label_loss_weight", type=float, default=0.2, help="Weight for label CE in total loss (recommended: 0.1~0.3)")
+    p.add_argument("--amp", action="store_true")
+    p.add_argument("--workers", type=int, default=8)
+    p.add_argument("--out_dir", type=str, default="./outputs/seg_rl")
+    p.add_argument("--plots_dir", type=str, default=None, help="Directory to save loss/PCK plots; default under out_dir/plots")
+    p.add_argument("--pretrained", action="store_true")
+    p.add_argument("--resume", type=str, default=None)
+    p.add_argument("--eval_thresh", type=float, default=5.0, help="PCK threshold in pixels")
+    p.add_argument("--val_ratio", type=float, default=0.1, help="Validation split ratio from the full dataset")
+    p.add_argument("--test_ratio", type=float, default=0.0, help="Test split ratio from the full dataset")
+    p.add_argument("--seed", type=int, default=42, help="Random seed for splitting")
+    p.add_argument("--vis_mode", type=str, choices=["none", "sample", "all"], default="none", help="Visualization mode")
+    p.add_argument("--vis_count", type=int, default=16, help="When vis_mode=sample, number of samples to visualize")
+    p.add_argument("--vis_dir", type=str, default=None, help="Directory to save visualization images; default under out_dir/vis")
+    p.add_argument("--save_steps", type=int, default=0, help="Save checkpoint every N steps (0 to disable)")
+    p.add_argument("--progress", action="store_true", help="Show tqdm progress bar during training")
+    p.add_argument("--auto_resume", action="store_true", help="If set and --resume not provided, try <out_dir>/last.pt")
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    # Prefer CUDA, then Apple Metal (MPS), else CPU
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+    # AMP only on CUDA for stability
+    amp_enabled = args.amp and (device.type == "cuda")
+    autocast_device_type = "cuda" if device.type == "cuda" else "cpu"
+
+    os.makedirs(args.out_dir, exist_ok=True)
+    plots_dir = args.plots_dir or os.path.join(args.out_dir, "plots")
+    os.makedirs(plots_dir, exist_ok=True)
+    vis_dir = args.vis_dir or os.path.join(args.out_dir, "vis")
+    os.makedirs(vis_dir, exist_ok=True)
+
+    image_size = ImageSize(height=args.height, width=args.width)
+    # Load once to get length for splitting
+    full_ds_for_len = SamSequencePointDataset(args.jsonl, sam_dir=args.sam_dir, image_size=image_size, training=True)
+    n = len(full_ds_for_len)
+    assert 0.0 <= args.val_ratio < 1.0 and 0.0 <= args.test_ratio < 1.0 and args.val_ratio + args.test_ratio < 1.0, "Invalid split ratios"
+    n_test = int(round(n * args.test_ratio))
+    n_val = int(round(n * args.val_ratio))
+    n_train = n - n_val - n_test
+    g = torch.Generator()
+    g.manual_seed(args.seed)
+    perm = torch.randperm(n, generator=g).tolist()
+    idx_train = perm[:n_train]
+    idx_val = perm[n_train:n_train + n_val]
+    idx_test = perm[n_train + n_val:]
+
+    # Build datasets per split to control augmentation flag
+    train_base = SamSequencePointDataset(args.jsonl, sam_dir=args.sam_dir, image_size=image_size, training=True)
+    val_base = SamSequencePointDataset(args.jsonl, sam_dir=args.sam_dir, image_size=image_size, training=False) if n_val > 0 else None
+    test_base = SamSequencePointDataset(args.jsonl, sam_dir=args.sam_dir, image_size=image_size, training=False) if n_test > 0 else None
+
+    train_ds = Subset(train_base, idx_train)
+    val_ds = Subset(val_base, idx_val) if val_base is not None else None
+    test_ds = Subset(test_base, idx_test) if test_base is not None else None
+
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.workers, pin_memory=True, collate_fn=collate_fn)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True, collate_fn=collate_fn) if val_ds is not None else None
+    test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True, collate_fn=collate_fn) if test_ds is not None else None
+
+    cfg = ModelConfig(backbone=args.arch, pretrained=args.pretrained, main_in_channels=3, cond_in_channels=1)
+    model = PointHeatmapModel(cfg).to(device)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scaler = torch.amp.GradScaler(enabled=amp_enabled)
+
+    start_epoch = 0
+    global_step = 0
+    tried_auto = False
+    if args.resume and os.path.isfile(args.resume):
+        from .utils import load_checkpoint
+        ckpt = load_checkpoint(args.resume, model, optimizer, scaler)
+        start_epoch = ckpt.epoch
+        global_step = ckpt.step
+        print(f"[Resume] Loaded checkpoint from {args.resume} (epoch={start_epoch}, step={global_step})")
+    elif args.auto_resume:
+        auto_path = os.path.join(args.out_dir, "last.pt")
+        if os.path.isfile(auto_path):
+            tried_auto = True
+            from .utils import load_checkpoint
+            ckpt = load_checkpoint(auto_path, model, optimizer, scaler)
+            start_epoch = ckpt.epoch
+            global_step = ckpt.step
+            print(f"[Auto-Resume] Loaded checkpoint from {auto_path} (epoch={start_epoch}, step={global_step})")
+
+    history = {"train_loss": [], "val_pck": [], "test_pck": []}
+
+    def evaluate(loader: DataLoader | None, split_name: str) -> float:
+        if loader is None:
+            return float("nan")
+        model.eval()
+        total = 0
+        correct = 0
+        with torch.no_grad():
+            for batch in loader:
+                img = batch["image"].to(device, non_blocking=True)
+                tgt = batch["target_xy"].to(device, non_blocking=True)
+                main_img = img[:, :3]
+                cond_img = img[:, 3:4]
+                logits, label_logits = model(main_img, cond=cond_img)
+                pred_xy = soft_argmax_from_logits(logits)
+                d = torch.linalg.norm(pred_xy - tgt, dim=1)
+                correct += (d <= args.eval_thresh).sum().item()
+                total += d.numel()
+        pck = correct / max(1, total)
+        print(f"{split_name} PCK@{args.eval_thresh}: {pck:.4f}")
+        return pck
+
+    def plot_curves():
+        try:
+            import matplotlib.pyplot as plt
+            import numpy as np
+            epochs_axis = np.arange(1, len(history["train_loss"]) + 1)
+            # Loss
+            plt.figure()
+            plt.plot(epochs_axis, history["train_loss"], label="train_loss")
+            plt.xlabel("Epoch")
+            plt.ylabel("Loss")
+            plt.legend()
+            plt.grid(True, ls=":", alpha=0.4)
+            plt.tight_layout()
+            plt.savefig(os.path.join(plots_dir, "loss.png"))
+            plt.close()
+            # PCK
+            plt.figure()
+            if any(not np.isnan(v) for v in history["val_pck"]):
+                plt.plot(epochs_axis, history["val_pck"], label="val_pck")
+            if any(not np.isnan(v) for v in history["test_pck"]):
+                plt.plot(epochs_axis, history["test_pck"], label="test_pck")
+            plt.xlabel("Epoch")
+            plt.ylabel(f"PCK@{args.eval_thresh}")
+            plt.legend()
+            plt.grid(True, ls=":", alpha=0.4)
+            plt.tight_layout()
+            plt.savefig(os.path.join(plots_dir, "pck.png"))
+            plt.close()
+        except Exception as e:
+            print(f"Plotting failed: {e}")
+
+    def visualize_dataset(loader: DataLoader | None, split_name: str):
+        if loader is None or args.vis_mode == "none":
+            return
+        model.eval()
+        import torchvision.transforms.functional as TF
+        import numpy as np
+        saved_images: List[Image.Image] = []
+        count = 0
+        max_count = args.vis_count if args.vis_mode == "sample" else float("inf")
+        with torch.no_grad():
+            for batch in loader:
+                img_t = batch["image_rgb"]  # [B,3,H,W] use RGB for visualization
+                tgt = batch["target_xy"]  # [B,2]
+                # Build 4ch input for the model: RGB + Gray
+                img4 = torch.cat([img_t.to(device), batch["image_gray"].to(device)], dim=1)
+                logits, label_logits = model(img4)
+                # ensure logits match image resolution for precise overlay
+                _, _, H_img, W_img = img_t.shape
+                if logits.shape[-2] != H_img or logits.shape[-1] != W_img:
+                    logits = torch.nn.functional.interpolate(logits, size=(H_img, W_img), mode="bilinear", align_corners=False)
+                # probability heatmap for stable visualization
+                bsz, _, H, W = logits.shape
+                probs = torch.softmax(logits.view(bsz, -1), dim=1).view(bsz, 1, H, W)
+                # compute soft-argmax pred on CPU for simplicity
+                pred_xy = soft_argmax_from_logits(logits).cpu()
+                for i in range(img_t.size(0)):
+                    if count >= max_count:
+                        break
+                    # unnormalize to [0,1] for visualization (ImageNet stats)
+                    mean = np.array([0.485, 0.456, 0.406]).reshape(3, 1, 1)
+                    std = np.array([0.229, 0.224, 0.225]).reshape(3, 1, 1)
+                    arr = img_t[i].cpu().float().numpy()
+                    arr = (arr * std + mean).clip(0.0, 1.0)
+                    pil_img = TF.to_pil_image(torch.from_numpy(arr))
+                    # overlay probability heatmap instead of raw logits
+                    hm = probs[i, 0].detach().cpu().float().numpy()
+                    # show base image in grayscale while keeping heatmap colored
+                    over = overlay_heatmap(pil_img.convert("L"), hm, alpha=0.5)
+                    # clamp coords to image bounds to ensure visibility
+                    h, w = img_t.size(-2), img_t.size(-1)
+                    gx = float(max(0.0, min(w - 1.0, float(tgt[i, 0]))))
+                    gy = float(max(0.0, min(h - 1.0, float(tgt[i, 1]))))
+                    px = float(max(0.0, min(w - 1.0, float(pred_xy[i, 0]))))
+                    py = float(max(0.0, min(h - 1.0, float(pred_xy[i, 1]))))
+                    # draw GT and Pred (GT + Pred both crosses; Pred is 45-degree red cross)
+                    over = draw_cross(over, (gx, gy), color=(0, 255, 0))
+                    over = draw_diagonal_cross(over, (px, py), color=(255, 0, 0), size=10)
+                    saved_images.append(over)
+                    count += 1
+                if count >= max_count:
+                    break
+        # save grid or per-sample
+        if args.vis_mode == "sample":
+            grid = make_grid(saved_images, cols=4)
+            grid.save(os.path.join(vis_dir, f"{split_name}_vis.png"))
+        else:  # all
+            split_dir = os.path.join(vis_dir, split_name)
+            os.makedirs(split_dir, exist_ok=True)
+            for i, img in enumerate(saved_images):
+                img.save(os.path.join(split_dir, f"{i:05d}.png"))
+
+    for epoch in range(start_epoch, args.epochs):
+        model.train()
+        running_loss = 0.0
+        # Progress bar setup
+        _iter = train_loader
+        _tqdm = None
+        if args.progress:
+            try:
+                from tqdm import tqdm  # type: ignore
+                _tqdm = tqdm(total=len(train_loader), desc=f"Epoch {epoch+1}/{args.epochs}")
+            except Exception:
+                _tqdm = None
+        for bi, batch in enumerate(train_loader, 1):
+            img = batch["image"].to(device, non_blocking=True)
+            tgt = batch["target_xy"].to(device, non_blocking=True)
+
+            optimizer.zero_grad(set_to_none=True)
+            with torch.amp.autocast(device_type=autocast_device_type, enabled=amp_enabled):
+                main_img = img[:, :3]
+                cond_img = img[:, 3:4]
+                logits, label_logits = model(main_img, cond=cond_img)
+                if args.loss == "ce":
+                    loss_hm = ce_over_pixels(logits, tgt)
+                elif args.loss == "kl":
+                    loss_hm = kl_to_gaussian_targets(logits, tgt, sigma=args.sigma, tau=args.tau)
+                else:
+                    loss_hm = mse_to_gaussian_targets(logits, tgt, sigma=args.sigma)
+                loss_label = nn.CrossEntropyLoss()(label_logits, batch["target_label"].to(device))
+                loss = loss_hm + float(args.label_loss_weight) * loss_label
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            running_loss += loss.item()
+            global_step += 1
+
+            # Periodic checkpoint
+            if args.save_steps > 0 and (global_step % args.save_steps == 0):
+                save_path = os.path.join(args.out_dir, f"step_{global_step}.pt")
+                save_checkpoint(save_path, model, optimizer, scaler, epoch=epoch + 1, step=global_step)
+                # also update last.pt symlink-like copy
+                last_path = os.path.join(args.out_dir, "last.pt")
+                save_checkpoint(last_path, model, optimizer, scaler, epoch=epoch + 1, step=global_step)
+
+            # Progress output
+            if _tqdm is not None:
+                _tqdm.set_postfix({"loss": f"{loss.item():.4f}", "lr": f"{optimizer.param_groups[0]['lr']:.2e}"})
+                _tqdm.update(1)
+            elif (bi % max(1, len(train_loader)//10)) == 0:
+                print(f"Epoch {epoch+1}/{args.epochs} [{bi}/{len(train_loader)}] loss={loss.item():.4f} lr={optimizer.param_groups[0]['lr']:.2e}")
+
+        if _tqdm is not None:
+            _tqdm.close()
+
+        avg_loss = running_loss / max(1, len(train_loader))
+        history["train_loss"].append(avg_loss)
+        print(f"Epoch {epoch+1}/{args.epochs} - train loss: {avg_loss:.4f}")
+
+        # Validation
+        val_pck = evaluate(val_loader, "val") if val_loader is not None else float("nan")
+        history["val_pck"].append(val_pck)
+        test_pck = evaluate(test_loader, "test") if test_loader is not None else float("nan")
+        history["test_pck"].append(test_pck)
+
+        # plots
+        plot_curves()
+
+        # visualizations
+        if args.vis_mode != "none":
+            visualize_dataset(val_loader or train_loader, split_name="val_or_train")
+
+        # Save epoch checkpoint and update last.pt
+        if ((epoch + 1) % max(1, args.save_every)) == 0:
+            save_path = os.path.join(args.out_dir, f"model_epoch_{epoch+1}.pt")
+            save_checkpoint(save_path, model, optimizer, scaler, epoch=epoch+1, step=global_step)
+        last_path = os.path.join(args.out_dir, "last.pt")
+        save_checkpoint(last_path, model, optimizer, scaler, epoch=epoch+1, step=global_step)
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+```
+
+已将标签损失权重改为可配置超参数：
+- 新增命令行参数: --label_loss_weight（默认 0.2，建议范围 0.1~0.3）
+- 总损失计算改为: loss = loss_hm + label_loss_weight × loss_label
+
+这样你可以按任务数据的标签难度与权重敏感性调整该值。
 

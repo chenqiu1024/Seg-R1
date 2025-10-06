@@ -22,7 +22,9 @@ class ModelConfig:
     backbone: Literal["resnet18", "unet_s"] = "unet_s"
     pretrained: bool = False
     upsample_to_input: bool = True
-    in_channels: int = 3  # 支持RGB(3)+Gray(1)成对输入，默认4通道
+    # 明确两路输入通道数：主图(灰度或RGB)与条件灰度图
+    main_in_channels: int = 3
+    cond_in_channels: int = 1
 
 
 class HeatmapHead(nn.Module):
@@ -131,21 +133,22 @@ class PointHeatmapModel(nn.Module):
     def __init__(self, cfg: ModelConfig) -> None:
         super().__init__()
         self.cfg = cfg
+        total_in = int(cfg.main_in_channels) + int(cfg.cond_in_channels)
         if cfg.backbone == "resnet18":
             weights = ResNet18_Weights.DEFAULT if cfg.pretrained else None
             base = resnet18(weights=weights)
             # 调整conv1以适配任意输入通道
-            if cfg.in_channels != 3:
+            if total_in != 3:
                 old_conv1 = base.conv1
-                new_conv1 = nn.Conv2d(cfg.in_channels, old_conv1.out_channels, kernel_size=old_conv1.kernel_size,
+                new_conv1 = nn.Conv2d(total_in, old_conv1.out_channels, kernel_size=old_conv1.kernel_size,
                                        stride=old_conv1.stride, padding=old_conv1.padding, bias=False)
                 with torch.no_grad():
                     if old_conv1.weight.shape[1] == 3:
                         # 将预训练权重映射到新通道：前3通道拷贝，其余通道取均值
                         new_conv1.weight[:, :3] = old_conv1.weight
-                        if cfg.in_channels > 3:
+                        if total_in > 3:
                             mean_w = old_conv1.weight.mean(dim=1, keepdim=True)
-                            new_conv1.weight[:, 3:cfg.in_channels] = mean_w.repeat(1, cfg.in_channels - 3, 1, 1)
+                            new_conv1.weight[:, 3:total_in] = mean_w.repeat(1, total_in - 3, 1, 1)
                     else:
                         nn.init.kaiming_normal_(new_conv1.weight, mode="fan_out", nonlinearity="relu")
                 base.conv1 = new_conv1
@@ -159,13 +162,16 @@ class PointHeatmapModel(nn.Module):
             self.label_head = LabelHead(in_channels)
             self._is_unet = False
         elif cfg.backbone == "unet_s":
-            self.unet = UNetSmall(in_channels=cfg.in_channels, base_ch=64)
+            self.unet = UNetSmall(in_channels=total_in, base_ch=64)
             self.label_head_unet = LabelHead(self.unet.out_ch)
             self._is_unet = True
         else:
             raise ValueError(f"Unsupported backbone: {cfg.backbone}")
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor, cond: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        # 接受两路输入；为兼容旧用法，若cond为None则认为x已是拼接后的总通道输入
+        if cond is not None:
+            x = torch.cat([x, cond], dim=1)
         b, c, h, w = x.shape
         if getattr(self, "_is_unet", False):
             logits = self.unet(x)
