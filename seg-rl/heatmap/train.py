@@ -57,10 +57,10 @@ python -m seg-rl.heatmap.train \
   --sam_dir datasets/seg_r1_md/Task01_BrainTumour/pretrain_gt_masks-251001 \
   --height 512 --width 512 --arch unet_s \
   --loss kl --sigma 6.0 --tau 1.0 \
-  --batch_size 16 --epochs 40 --amp \
+  --batch_size 16 --epochs 50 --amp \
   --val_ratio 0.1 --test_ratio 0.1 --seed 42 \
   --save_every 1 --save_steps 500 --progress --auto_resume \
-  --out_dir output/seg_r1_md/Task01_BrainTumour/heatmap_train-251001
+  --out_dir outputs/braintumour/heatmap_train-251001
 
 高分辨率场景（增大sigma获得更软的分布）:
 python -m seg-rl.heatmap.train \

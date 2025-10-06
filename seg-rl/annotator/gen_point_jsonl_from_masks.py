@@ -32,7 +32,7 @@ Example usage:
   # 3) 调试模式（生成调试图像）
   /opt/anaconda3/envs/seg-r1/bin/python seg-rl/annotator/gen_point_jsonl_from_masks.py \
     --debug_json datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour-1.jsonl \
-    --debug_output_dir output/braintumour/dbg_gen_point
+    --debug_output_dir outputs/braintumour/dbg_gen_point
 
 Notes:
 - Foreground is defined as any non-zero pixel in the mask.
