@@ -30,27 +30,27 @@ except ImportError:  # allow running as a script without package context
 """
 训练热力图分类点定位模型，支持软高斯目标分布
 
-数据准备 - 从mask生成训练数据:
-python seg-rl/annotator/gen_point_jsonl_from_masks.py \\
-  --images_dir /path/to/images \\
-  --masks_dir /path/to/masks \\
-  --output_jsonl /path/to/training_data.jsonl
+# 数据准备 - 从mask生成训练数据:
+# python seg-rl/annotator/gen_point_jsonl_from_masks.py \\
+#   --images_dir /path/to/images \\
+#   --masks_dir /path/to/masks \\
+#   --output_jsonl /path/to/training_data.jsonl
 
-支持的JSONL格式:
-  新格式: {"image": "/path/img.jpg", "points": [[x,y]], "labels": [1]}
-  旧格式: {"image": "/path/img.jpg", "x": x, "y": y}
+# 支持的JSONL格式:
+#   新格式: {"image": "/path/img.jpg", "points": [[x,y]], "labels": [1]}
+#   旧格式: {"image": "/path/img.jpg", "x": x, "y": y}
 
-推荐用法（UNet + KL软目标，更适合生成平滑的距离衰减热力图）:
-python -m seg-rl.heatmap.train \
-  --data_jsonl /root/autodl-tmp/works/Seg-R0/datasets/seg_r1_md/Task01_BrainTumour/mask_salient_points-0.jsonl \
-  --height 512 --width 512 \
-  --arch unet_s \
-  --loss kl --sigma 6.0 --tau 1.0 \
-  --batch_size 16 --epochs 40 --amp \
-  --val_ratio 0.1 --test_ratio 0.1 --seed 42 \
-  --eval_thresh 5.0 --save_every 5 \
-  --out_dir /root/autodl-tmp/works/Seg-R0/outputs/seg_r1_md/Task01_BrainTumour/heatmap_train-0 \
-  --vis_mode sample --vis_count 16
+# 推荐用法（UNet + KL软目标，更适合生成平滑的距离衰减热力图）:
+# python -m seg-rl.heatmap.train \
+#   --data_jsonl /root/autodl-tmp/works/Seg-R0/datasets/seg_r1_md/Task01_BrainTumour/mask_salient_points-0.jsonl \
+#   --height 512 --width 512 \
+#   --arch unet_s \
+#   --loss kl --sigma 6.0 --tau 1.0 \
+#   --batch_size 16 --epochs 40 --amp \
+#   --val_ratio 0.1 --test_ratio 0.1 --seed 42 \
+#   --eval_thresh 5.0 --save_every 5 \
+#   --out_dir /root/autodl-tmp/works/Seg-R0/outputs/seg_r1_md/Task01_BrainTumour/heatmap_train-0 \
+#   --vis_mode sample --vis_count 16
 
 /opt/anaconda3/envs/seg-r1/bin/python -m seg-rl.heatmap.train \
   --jsonl datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour-251001.jsonl \
