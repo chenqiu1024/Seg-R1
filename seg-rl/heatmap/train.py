@@ -52,28 +52,36 @@ python -m seg-rl.heatmap.train \
   --out_dir /root/autodl-tmp/works/Seg-R0/outputs/seg_r1_md/Task01_BrainTumour/heatmap_train-0 \
   --vis_mode sample --vis_count 16
 
+推荐用法（240x240图像，优化参数）:
+/opt/anaconda3/envs/seg-r1/bin/python -m seg-rl.heatmap.train \
+  --jsonl datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour-251001.jsonl \
+  --sam_dir datasets/seg_r1_md/Task01_BrainTumour/pretrain_gt_masks-251001 \
+  --height 240 --width 240 --arch unet_s \
+  --loss kl --sigma 8.0 --tau 1.0 \
+  --eval_thresh 12.0 \
+  --label_loss_weight 0.1 \
+  --batch_size 16 --epochs 100 --amp \
+  --lr 1e-4 --weight_decay 1e-4 --grad_clip 1.0 \
+  --lr_scheduler warmup_cosine --warmup_epochs 3 \
+  --val_ratio 0.1 --test_ratio 0.1 --seed 42 \
+  --save_every 5 --save_steps 500 --progress --auto_resume \
+  --vis_mode sample --vis_count 16 --save_heatmaps \
+  --out_dir outputs/braintumour/heatmap_train-251001-optimized
+
+高分辨率场景（增大sigma获得更软的分布）:
 /opt/anaconda3/envs/seg-r1/bin/python -m seg-rl.heatmap.train \
   --jsonl datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour-251001.jsonl \
   --sam_dir datasets/seg_r1_md/Task01_BrainTumour/pretrain_gt_masks-251001 \
   --height 512 --width 512 --arch unet_s \
-  --loss kl --sigma 6.0 --tau 1.0 \
-  --eval_thresh 10.0 \
-  --label_loss_weight 0.3 \
-  --batch_size 16 --epochs 40 --amp \
-  --val_ratio 0.1 --test_ratio 0.1 --seed 42 \
-  --save_every 1 --save_steps 500 --progress --auto_resume \
-  --out_dir output/seg_r1_md/Task01_BrainTumour/heatmap_train-251001
-
-高分辨率场景（增大sigma获得更软的分布）:
-python -m seg-rl.heatmap.train \
-  --data_jsonl /root/autodl-tmp/works/Seg-R0/datasets/seg_r1_md/Task01_BrainTumour/mask_salient_points-0.jsonl \
-  --height 1024 --width 1024 \
-  --arch unet_s \
   --loss kl --sigma 10.0 --tau 1.2 \
-  --batch_size 8 --epochs 50 --amp \
-  --lr 1e-4 --weight_decay 1e-4 \
-  --out_dir /root/autodl-tmp/works/Seg-R0/outputs/seg_r1_md/Task01_BrainTumour/heatmap_train-0 \
-  --vis_mode sample --vis_count 16
+  --eval_thresh 15.0 \
+  --label_loss_weight 0.2 \
+  --batch_size 8 --epochs 80 --amp \
+  --lr 1e-4 --weight_decay 1e-4 --grad_clip 1.0 \
+  --lr_scheduler cosine \
+  --val_ratio 0.1 --test_ratio 0.1 --seed 42 \
+  --save_every 5 --save_steps 500 --progress --auto_resume \
+  --out_dir outputs/braintumour/heatmap_train-251001-hires
 
 MSE损失选项（更稳定的形状匹配）:
 python -m seg-rl.heatmap.train \
@@ -91,25 +99,27 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--save_every", type=int, default=1, help="Save checkpoint every N epochs")
     p.add_argument("--lr", type=float, default=3e-4)
-    p.add_argument("--weight_decay", type=float, default=1e-4)
+    p.add_argument("--lr_scheduler", type=str, choices=["none", "cosine", "multistep", "warmup_cosine"], default="none", help="Learning rate scheduler")
+    p.add_argument("--warmup_epochs", type=int, default=3, help="Warmup epochs for warmup_cosine scheduler")
     p.add_argument("--arch", type=str, choices=["unet_s", "resnet18"], default="unet_s")
     p.add_argument("--loss", type=str, choices=["ce", "kl", "mse"], default="kl")
     p.add_argument("--sigma", type=float, default=3.0, help="Gaussian sigma for KL/MSE targets")
     p.add_argument("--tau", type=float, default=1.0, help="Temperature for KL/model softmax")
-    p.add_argument("--label_loss_weight", type=float, default=0.2, help="Weight for label CE in total loss (recommended: 0.1~0.3)")
+    p.add_argument("--label_loss_weight", type=float, default=0.1, help="Weight for label CE in total loss (recommended: 0.1~0.3)")
     p.add_argument("--amp", action="store_true")
     p.add_argument("--workers", type=int, default=8)
     p.add_argument("--out_dir", type=str, default="./outputs/seg_rl")
     p.add_argument("--plots_dir", type=str, default=None, help="Directory to save loss/PCK plots; default under out_dir/plots")
     p.add_argument("--pretrained", action="store_true")
     p.add_argument("--resume", type=str, default=None)
-    p.add_argument("--eval_thresh", type=float, default=5.0, help="PCK threshold in pixels")
+    p.add_argument("--eval_thresholds", type=str, default="5,10,15,20", help="Comma-separated PCK thresholds for evaluation curves")
     p.add_argument("--val_ratio", type=float, default=0.1, help="Validation split ratio from the full dataset")
     p.add_argument("--test_ratio", type=float, default=0.0, help="Test split ratio from the full dataset")
     p.add_argument("--seed", type=int, default=42, help="Random seed for splitting")
     p.add_argument("--vis_mode", type=str, choices=["none", "sample", "all"], default="none", help="Visualization mode")
     p.add_argument("--vis_count", type=int, default=16, help="When vis_mode=sample, number of samples to visualize")
     p.add_argument("--vis_dir", type=str, default=None, help="Directory to save visualization images; default under out_dir/vis")
+    p.add_argument("--save_heatmaps", action="store_true", help="Save raw heatmaps for diagnosis")
     p.add_argument("--save_steps", type=int, default=0, help="Save checkpoint every N steps (0 to disable)")
     p.add_argument("--progress", action="store_true", help="Show tqdm progress bar during training")
     p.add_argument("--auto_resume", action="store_true", help="If set and --resume not provided, try <out_dir>/last.pt")
@@ -168,6 +178,20 @@ def main() -> None:
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scaler = torch.amp.GradScaler(enabled=amp_enabled)
+    
+    # Learning rate scheduler
+    scheduler = None
+    if args.lr_scheduler == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    elif args.lr_scheduler == "multistep":
+        scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[args.epochs//3, 2*args.epochs//3], gamma=0.1)
+    elif args.lr_scheduler == "warmup_cosine":
+        def lr_lambda(epoch):
+            if epoch < args.warmup_epochs:
+                return epoch / args.warmup_epochs
+            else:
+                return 0.5 * (1 + torch.cos(torch.tensor((epoch - args.warmup_epochs) * torch.pi / (args.epochs - args.warmup_epochs))))
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     start_epoch = 0
     global_step = 0
@@ -190,26 +214,51 @@ def main() -> None:
 
     history = {"train_loss": [], "val_pck": [], "test_pck": []}
 
-    def evaluate(loader: DataLoader | None, split_name: str) -> float:
+    def evaluate(loader: DataLoader | None, split_name: str, sigma, tau) -> dict:
         if loader is None:
-            return float("nan")
+            return {"pck": float("nan"), "thresholds": {}}
+        
+        # Parse evaluation thresholds
+        thresholds = [float(x.strip()) for x in args.eval_thresholds.split(",")]
+        
         model.eval()
         total = 0
-        correct = 0
+        correct_by_thresh = {t: 0 for t in thresholds}
+        
         with torch.no_grad():
             for batch in loader:
                 img = batch["image"].to(device, non_blocking=True)
-                tgt = batch["target_xy"].to(device, non_blocking=True)
+                tgt_xy = batch["target_xy"].to(device, non_blocking=True)
+                tgt_label = batch.get("target_label")
+                if tgt_label is None:
+                    tgt_label = torch.ones((img.size(0),), dtype=torch.long, device=device)  # default all-foreground
+                else:
+                    tgt_label = tgt_label.to(device, non_blocking=True)
                 main_img = img[:, :3]
                 cond_img = img[:, 3:4]
                 logits, label_logits = model(main_img, cond=cond_img)
-                pred_xy = soft_argmax_from_logits(logits)
-                d = torch.linalg.norm(pred_xy - tgt, dim=1)
-                correct += (d <= args.eval_thresh).sum().item()
-                total += d.numel()
-        pck = correct / max(1, total)
-        print(f"{split_name} PCK@{args.eval_thresh}: {pck:.4f}")
-        return pck
+                pred_xy = soft_argmax_from_logits(logits, temperature=tau)
+                pred_label = label_logits.argmax(dim=1)
+                d = torch.linalg.norm(pred_xy - tgt_xy, dim=1)
+                ok_label = (pred_label == tgt_label)
+                
+                for thresh in thresholds:
+                    ok_xy = (d <= thresh)
+                    ok = (ok_xy & ok_label)
+                    correct_by_thresh[thresh] += ok.sum().item()
+                
+                total += ok_label.numel()
+        
+        # Calculate PCK for each threshold
+        pck_by_thresh = {t: correct_by_thresh[t] / max(1, total) for t in thresholds}
+        primary_thresh = thresholds[0]  # Use first threshold as primary
+        primary_pck = pck_by_thresh[primary_thresh]
+        
+        print(f"{split_name} PCK@{primary_thresh}: {primary_pck:.4f}")
+        for t in thresholds[1:]:
+            print(f"  PCK@{t}: {pck_by_thresh[t]:.4f}")
+        
+        return {"pck": primary_pck, "thresholds": pck_by_thresh}
 
     def plot_curves():
         try:
@@ -278,6 +327,20 @@ def main() -> None:
                     pil_img = TF.to_pil_image(torch.from_numpy(arr))
                     # overlay probability heatmap instead of raw logits
                     hm = probs[i, 0].detach().cpu().float().numpy()
+                    
+                    # Save raw heatmap for diagnosis if requested
+                    if args.save_heatmaps and count < 5:  # Save first 5 heatmaps
+                        import matplotlib.pyplot as plt
+                        plt.figure(figsize=(6, 6))
+                        plt.imshow(hm, cmap='hot', interpolation='nearest')
+                        plt.colorbar()
+                        plt.title(f"Heatmap {count} - Max: {hm.max():.3f}, Min: {hm.min():.3f}")
+                        plt.axis('off')
+                        heatmap_dir = os.path.join(vis_dir, "heatmaps")
+                        os.makedirs(heatmap_dir, exist_ok=True)
+                        plt.savefig(os.path.join(heatmap_dir, f"heatmap_{count:03d}.png"), dpi=150, bbox_inches='tight')
+                        plt.close()
+                    
                     # show base image in grayscale while keeping heatmap colored
                     over = overlay_heatmap(pil_img.convert("L"), hm, alpha=0.5)
                     # clamp coords to image bounds to ensure visibility
@@ -333,6 +396,9 @@ def main() -> None:
                 loss_label = nn.CrossEntropyLoss()(label_logits, batch["target_label"].to(device))
                 loss = loss_hm + float(args.label_loss_weight) * loss_label
             scaler.scale(loss).backward()
+            if args.grad_clip > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             scaler.step(optimizer)
             scaler.update()
 
@@ -362,9 +428,11 @@ def main() -> None:
         print(f"Epoch {epoch+1}/{args.epochs} - train loss: {avg_loss:.4f}")
 
         # Validation
-        val_pck = evaluate(val_loader, "val") if val_loader is not None else float("nan")
+        val_result = evaluate(val_loader, "val", sigma=args.sigma, tau=args.tau) if val_loader is not None else {"pck": float("nan"), "thresholds": {}}
+        val_pck = val_result["pck"]
         history["val_pck"].append(val_pck)
-        test_pck = evaluate(test_loader, "test") if test_loader is not None else float("nan")
+        test_result = evaluate(test_loader, "test", sigma=args.sigma, tau=args.tau) if test_loader is not None else {"pck": float("nan"), "thresholds": {}}
+        test_pck = test_result["pck"]
         history["test_pck"].append(test_pck)
 
         # plots
@@ -374,6 +442,10 @@ def main() -> None:
         if args.vis_mode != "none":
             visualize_dataset(val_loader or train_loader, split_name="val_or_train")
 
+        # Learning rate scheduling
+        if scheduler is not None:
+            scheduler.step()
+            
         # Save epoch checkpoint and update last.pt
         if ((epoch + 1) % max(1, args.save_every)) == 0:
             save_path = os.path.join(args.out_dir, f"model_epoch_{epoch+1}.pt")

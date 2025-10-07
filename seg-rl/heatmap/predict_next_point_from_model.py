@@ -137,7 +137,7 @@ def _device_and_amp(args: argparse.Namespace) -> Tuple[torch.device, bool, str]:
 
 
 def _load_model(model_path: str, device: torch.device) -> PointHeatmapModel:
-    cfg = ModelConfig(backbone="unet_s", pretrained=False, in_channels=4)
+    cfg = ModelConfig(backbone="unet_s", pretrained=False, main_in_channels=3, cond_in_channels=1)
     model = PointHeatmapModel(cfg).to(device)
     ckpt = torch.load(model_path, map_location="cpu") if model_path and os.path.isfile(model_path) else None
     if ckpt is not None:
@@ -147,7 +147,8 @@ def _load_model(model_path: str, device: torch.device) -> PointHeatmapModel:
     return model
 
 
-def _to_tensor_4ch(image_path: str, gray_mask: Optional[Image.Image], out_hw: Tuple[int, int]) -> torch.Tensor:
+def _to_tensor_separate(image_path: str, gray_mask: Optional[Image.Image], out_hw: Tuple[int, int]) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Prepare separate RGB and grayscale tensors for the model"""
     im = Image.open(image_path).convert("RGB")
     im = im.resize((out_hw[1], out_hw[0]), resample=Image.BILINEAR)
     if gray_mask is None:
@@ -159,13 +160,12 @@ def _to_tensor_4ch(image_path: str, gray_mask: Optional[Image.Image], out_hw: Tu
     rgb_t = TF.normalize(rgb_t, mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
     g_t = TF.to_tensor(gray)
     g_t = (g_t - 0.5) / 0.5
-    x4 = torch.cat([rgb_t, g_t], dim=0).unsqueeze(0)  # [1,4,H,W]
-    return x4
+    return rgb_t.unsqueeze(0), g_t.unsqueeze(0)  # [1,3,H,W], [1,1,H,W]
 
 
-def _predict_point(model: PointHeatmapModel, x4: torch.Tensor, device: torch.device, tau: float) -> Tuple[float, float, int]:
+def _predict_point(model: PointHeatmapModel, rgb_tensor: torch.Tensor, gray_tensor: torch.Tensor, device: torch.device, tau: float) -> Tuple[float, float, int]:
     with torch.no_grad():
-        logits, label_logits = model(x4.to(device))
+        logits, label_logits = model(rgb_tensor.to(device), gray_tensor.to(device))
         xy = soft_argmax_from_logits(logits, temperature=tau)[0]
         lab = int(label_logits.argmax(dim=1).item())
     return float(xy[0].item()), float(xy[1].item()), lab
@@ -210,9 +210,9 @@ def run_initial(args: argparse.Namespace) -> None:
         images_iter = images
 
     for img_path in images_iter:
-        x4 = _to_tensor_4ch(img_path, gray_mask=None, out_hw=(H, W))
+        rgb_tensor, gray_tensor = _to_tensor_separate(img_path, gray_mask=None, out_hw=(H, W))
         with torch.amp.autocast(device_type=autocast_device_type, enabled=amp_enabled):
-            x, y, lab = _predict_point(model, x4, device, args.tau)
+            x, y, lab = _predict_point(model, rgb_tensor, gray_tensor, device, args.tau)
         stem = _stem(img_path)
         gt_mask_path = os.path.join(args.masks_dir, f"{stem}.png")
         rec = {
@@ -272,9 +272,9 @@ def run_append(args: argparse.Namespace) -> None:
             stem = _stem(img_path)
             prev_path = os.path.join(sam_dir, stem, f"{k-1}.png")
             gray = Image.open(prev_path).convert("L") if os.path.isfile(prev_path) else None
-        x4 = _to_tensor_4ch(img_path, gray_mask=gray, out_hw=(H, W))
+        rgb_tensor, gray_tensor = _to_tensor_separate(img_path, gray_mask=gray, out_hw=(H, W))
         with torch.amp.autocast(device_type=autocast_device_type, enabled=amp_enabled):
-            x, y, lab = _predict_point(model, x4, device, args.tau)
+            x, y, lab = _predict_point(model, rgb_tensor, gray_tensor, device, args.tau)
         rec["points"] = (pts or []) + [[float(x), float(y)]]
         rec["labels"] = (labs or []) + [int(lab)]
         # sam_masks_dir should be set by external segmenter; do not inject here
