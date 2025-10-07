@@ -304,11 +304,17 @@ def main() -> None:
         max_count = args.vis_count if args.vis_mode == "sample" else float("inf")
         with torch.no_grad():
             for batch in loader:
-                img_t = batch["image_rgb"]  # [B,3,H,W] use RGB for visualization
+                # Robustly fetch RGB and Gray for visualization; fall back to splitting `image`
+                if "image_rgb" in batch and "image_gray" in batch:
+                    img_t = batch["image_rgb"]  # [B,3,H,W]
+                    gray_t = batch["image_gray"]  # [B,1,H,W]
+                else:
+                    img = batch["image"]  # [B,4,H,W] expected
+                    img_t = img[:, :3]
+                    gray_t = img[:, 3:4]
                 tgt = batch["target_xy"]  # [B,2]
-                # Build 4ch input for the model: RGB + Gray
-                img4 = torch.cat([img_t.to(device), batch["image_gray"].to(device)], dim=1)
-                logits, label_logits = model(img4)
+                # Forward with two inputs (main_img, cond_img)
+                logits, label_logits = model(img_t.to(device), cond=gray_t.to(device))
                 # ensure logits match image resolution for precise overlay
                 _, _, H_img, W_img = img_t.shape
                 if logits.shape[-2] != H_img or logits.shape[-1] != W_img:
