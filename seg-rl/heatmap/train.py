@@ -58,7 +58,7 @@ except ImportError:  # allow running as a script without package context
   --sam_dir datasets/seg_r1_md/Task01_BrainTumour/pretrain_gt_masks-251001 \
   --height 240 --width 240 --arch unet_s \
   --loss kl --sigma 8.0 --tau 1.0 \
-  --eval_thresh 12.0 \
+  --eval_thresholds "8,12,16,20" \
   --label_loss_weight 0.1 \
   --batch_size 16 --epochs 100 --amp \
   --lr 1e-4 --weight_decay 1e-4 --grad_clip 1.0 \
@@ -74,7 +74,7 @@ except ImportError:  # allow running as a script without package context
   --sam_dir datasets/seg_r1_md/Task01_BrainTumour/pretrain_gt_masks-251001 \
   --height 512 --width 512 --arch unet_s \
   --loss kl --sigma 10.0 --tau 1.2 \
-  --eval_thresh 15.0 \
+  --eval_thresholds "10,15,20,25" \
   --label_loss_weight 0.2 \
   --batch_size 8 --epochs 80 --amp \
   --lr 1e-4 --weight_decay 1e-4 --grad_clip 1.0 \
@@ -99,6 +99,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--save_every", type=int, default=1, help="Save checkpoint every N epochs")
     p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--weight_decay", type=float, default=1e-4, help="Weight decay for optimizer")
+    p.add_argument("--grad_clip", type=float, default=0.0, help="Gradient clipping threshold (0 to disable)")
     p.add_argument("--lr_scheduler", type=str, choices=["none", "cosine", "multistep", "warmup_cosine"], default="none", help="Learning rate scheduler")
     p.add_argument("--warmup_epochs", type=int, default=3, help="Warmup epochs for warmup_cosine scheduler")
     p.add_argument("--arch", type=str, choices=["unet_s", "resnet18"], default="unet_s")
@@ -282,7 +284,7 @@ def main() -> None:
             if any(not np.isnan(v) for v in history["test_pck"]):
                 plt.plot(epochs_axis, history["test_pck"], label="test_pck")
             plt.xlabel("Epoch")
-            plt.ylabel(f"PCK@{args.eval_thresh}")
+            plt.ylabel(f"PCK@{args.eval_thresholds.split(',')[0]}")
             plt.legend()
             plt.grid(True, ls=":", alpha=0.4)
             plt.tight_layout()
