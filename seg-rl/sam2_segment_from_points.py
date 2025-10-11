@@ -55,9 +55,9 @@
       --skip_existing
     
     /opt/anaconda3/envs/seg-r1/bin/python seg-rl/sam2_segment_from_points.py \
-      --input_jsonl datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour-251003.jsonl \
-      --json_output datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour-251003.jsonl \
-      --output_dir datasets/seg_r1_md/Task01_BrainTumour/pretrain_gt_masks-251003 \
+      --input_jsonl datasets/seg_r1_md/Task01_BrainTumour/pred_points-251001.jsonl \
+      --json_output datasets/seg_r1_md/Task01_BrainTumour/pred_points-251001.jsonl \
+      --output_dir outputs/braintumour/pretrain_pred_masks-251001 \
       --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
       --device mps \
       --resize 512 512 \
@@ -441,6 +441,11 @@ def main():
             continue
 
         image_path = to_abs(obj["image"]) or obj["image"]
+        ### For Debug Only:
+        # stem = Path(image_path).stem
+        # if not stem == "BRATS_001_z0088":
+        #     continue
+        ### :For Debug Only
 
         # 检查图像文件是否存在
         if not os.path.isfile(image_path):

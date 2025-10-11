@@ -38,13 +38,13 @@ Examples:
 
   # Append mode
   /opt/anaconda3/envs/seg-r1/bin/python -m seg-rl.heatmap.predict_next_point_from_model \
-    --model_path outputs/braintumour/points_predictor-251001-50epochs.pt \
+    --model_path outputs/braintumour/points_predictor-251001-160epochs.pt \
     --appendto_json datasets/seg_r1_md/Task01_BrainTumour/pred_points-251001.jsonl
 
   # Debug visualization only
   /opt/anaconda3/envs/seg-r1/bin/python -m seg-rl.heatmap.predict_next_point_from_model \
     --debug_json datasets/seg_r1_md/Task01_BrainTumour/pred_points-init.jsonl \
-    --debug_output_dir output/braintumour/dbg_model_pred
+    --debug_output_dir outputs/braintumour/dbg_model_pred
 
 Notes:
   - The model expects 4-channel input (RGB normalized + Gray normalized mask). This script
@@ -115,8 +115,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--images_dir", type=str, default=None, help="Directory of input images (initial mode)")
     p.add_argument("--masks_dir", type=str, default=None, help="Ground-truth masks directory (initial mode only, to fill 'gt_mask' field)")
     p.add_argument("--sam_dir", type=str, default=None, help="Directory of predicted SAM masks per step: {sam_dir}/{stem}/{k}.png (initial/debug mode)")
-    p.add_argument("--height", type=int, default=512)
-    p.add_argument("--width", type=int, default=512)
+    # height/width: 0 means use native image size; if >0, will resize for inference
+    p.add_argument("--height", type=int, default=0, help="0 = use native image height")
+    p.add_argument("--width", type=int, default=0, help="0 = use native image width")
     p.add_argument("--tau", type=float, default=1.0, help="Softmax temperature for heatmap -> probability")
     p.add_argument("--amp", action="store_true")
     p.add_argument("--progress", action="store_true")
@@ -147,20 +148,26 @@ def _load_model(model_path: str, device: torch.device) -> PointHeatmapModel:
     return model
 
 
-def _to_tensor_separate(image_path: str, gray_mask: Optional[Image.Image], out_hw: Tuple[int, int]) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Prepare separate RGB and grayscale tensors for the model"""
-    im = Image.open(image_path).convert("RGB")
-    im = im.resize((out_hw[1], out_hw[0]), resample=Image.BILINEAR)
+def _to_tensor_separate(image_path: str, gray_mask: Optional[Image.Image], out_hw: Tuple[int, int]) -> Tuple[torch.Tensor, torch.Tensor, Tuple[int, int]]:
+    """Prepare separate RGB and grayscale tensors for the model; returns (rgb, gray, (orig_h, orig_w))."""
+    im0 = Image.open(image_path).convert("RGB")
+    orig_w, orig_h = im0.size
+    H, W = out_hw
+    # decide resize size
+    if H <= 0 or W <= 0:
+        H, W = orig_h, orig_w
+    im = im0.resize((W, H), resample=Image.BILINEAR) if (W, H) != (orig_w, orig_h) else im0
     if gray_mask is None:
-        gray = Image.new("L", im.size, 0)
+        gray0 = Image.new("L", (orig_w, orig_h), 0)
     else:
-        gray = gray_mask.convert("L").resize((out_hw[1], out_hw[0]), resample=Image.NEAREST)
+        gray0 = gray_mask.convert("L")
+    gray = gray0.resize((W, H), resample=Image.NEAREST) if (W, H) != (orig_w, orig_h) else gray0
     import torchvision.transforms.functional as TF
     rgb_t = TF.to_tensor(im)
     rgb_t = TF.normalize(rgb_t, mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
     g_t = TF.to_tensor(gray)
     g_t = (g_t - 0.5) / 0.5
-    return rgb_t.unsqueeze(0), g_t.unsqueeze(0)  # [1,3,H,W], [1,1,H,W]
+    return rgb_t.unsqueeze(0), g_t.unsqueeze(0), (orig_h, orig_w)  # [1,3,H,W], [1,1,H,W], (orig_h,orig_w)
 
 
 def _predict_point(model: PointHeatmapModel, rgb_tensor: torch.Tensor, gray_tensor: torch.Tensor, device: torch.device, tau: float) -> Tuple[float, float, int]:
@@ -210,9 +217,19 @@ def run_initial(args: argparse.Namespace) -> None:
         images_iter = images
 
     for img_path in images_iter:
-        rgb_tensor, gray_tensor = _to_tensor_separate(img_path, gray_mask=None, out_hw=(H, W))
+        rgb_tensor, gray_tensor, (orig_h, orig_w) = _to_tensor_separate(img_path, gray_mask=None, out_hw=(H, W))
         with torch.amp.autocast(device_type=autocast_device_type, enabled=amp_enabled):
             x, y, lab = _predict_point(model, rgb_tensor, gray_tensor, device, args.tau)
+        # scale back to native size if resized
+        inf_H, inf_W = rgb_tensor.shape[-2], rgb_tensor.shape[-1]
+        if (inf_W, inf_H) != (orig_w, orig_h):
+            scale_x = float(orig_w) / float(inf_W)
+            scale_y = float(orig_h) / float(inf_H)
+            x = x * scale_x
+            y = y * scale_y
+        # clamp to bounds
+        x = float(max(0.0, min(orig_w - 1.0, x)))
+        y = float(max(0.0, min(orig_h - 1.0, y)))
         stem = _stem(img_path)
         gt_mask_path = os.path.join(args.masks_dir, f"{stem}.png")
         rec = {
@@ -272,10 +289,19 @@ def run_append(args: argparse.Namespace) -> None:
             stem = _stem(img_path)
             prev_path = os.path.join(sam_dir, stem, f"{k-1}.png")
             gray = Image.open(prev_path).convert("L") if os.path.isfile(prev_path) else None
-        rgb_tensor, gray_tensor = _to_tensor_separate(img_path, gray_mask=gray, out_hw=(H, W))
+        rgb_tensor, gray_tensor, (orig_h, orig_w) = _to_tensor_separate(img_path, gray_mask=gray, out_hw=(H, W))
         with torch.amp.autocast(device_type=autocast_device_type, enabled=amp_enabled):
             x, y, lab = _predict_point(model, rgb_tensor, gray_tensor, device, args.tau)
-        rec["points"] = (pts or []) + [[float(x), float(y)]]
+        # scale back and clamp
+        inf_H, inf_W = rgb_tensor.shape[-2], rgb_tensor.shape[-1]
+        if (inf_W, inf_H) != (orig_w, orig_h):
+            scale_x = float(orig_w) / float(inf_W)
+            scale_y = float(orig_h) / float(inf_H)
+            x = x * scale_x
+            y = y * scale_y
+        x = float(max(0.0, min(orig_w - 1.0, x)))
+        y = float(max(0.0, min(orig_h - 1.0, y)))
+        rec["points"] = (pts or []) + [[x, y]]
         rec["labels"] = (labs or []) + [int(lab)]
         # sam_masks_dir should be set by external segmenter; do not inject here
         updated += 1
