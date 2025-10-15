@@ -300,6 +300,7 @@ def _render_diff_panels_with_point(
     label: int,
     dbg_out_path: Optional[str],
     connectivity: int = 2,
+    base_image_bgr: Optional[np.ndarray] = None,
 ) -> None:
     """Render 3-panel debug image reusing the visualization style in
     largest_diff_component_representative, but mark a provided point instead of
@@ -313,12 +314,20 @@ def _render_diff_panels_with_point(
         if dbg_out_path is None:
             return
         h, w = A.shape[:2]
-        # Panel 1: A/B overlay (A=green, B=red)
+        # Panel 1: A/B overlay (A=green, B=red), optionally blended on base image
         overlay1 = np.zeros((h, w, 3), dtype=np.uint8)
         overlay1[..., 1] = (A > 0).astype(np.uint8) * 255  # G
         overlay1[..., 2] = (B > 0).astype(np.uint8) * 255  # R
-        bg = np.zeros_like(overlay1)
-        panel1 = cv2.addWeighted(bg, 1.0, overlay1, 0.6, 0.0)
+        if base_image_bgr is not None:
+            base = base_image_bgr
+            if base.ndim == 2:
+                base = cv2.cvtColor(base, cv2.COLOR_GRAY2BGR)
+            if base.shape[:2] != (h, w):
+                base = cv2.resize(base, (w, h), interpolation=cv2.INTER_LINEAR)
+            panel1 = cv2.addWeighted(base, 1.0, overlay1, 0.6, 0.0)
+        else:
+            bg = np.zeros_like(overlay1)
+            panel1 = cv2.addWeighted(bg, 1.0, overlay1, 0.6, 0.0)
 
         # Panel 2: signed diff C (positive green, negative red)
         C = A.astype(np.int16) - B.astype(np.int16)
@@ -358,6 +367,121 @@ def _render_diff_panels_with_point(
             _draw_caret(panel3, cx, cy, size=6, color=(255,255,255), thickness=2)
         else:
             _draw_cross(panel3, cx, cy, size=6, color=(255,255,255), thickness=2)
+
+        # Compute and draw metrics comparing B (pred) vs A (gt) on panel1
+        def _compute_metrics(gt_u8: np.ndarray, pr_u8: np.ndarray) -> dict:
+            gt = (gt_u8 > 0)
+            pr = (pr_u8 > 0)
+            tp = int(np.logical_and(gt, pr).sum())
+            fp = int(np.logical_and(~gt, pr).sum())
+            fn = int(np.logical_and(gt, ~pr).sum())
+            denom_dice = 2 * tp + fp + fn
+            dice = (2 * tp / denom_dice) if denom_dice > 0 else 1.0
+            denom_iou = tp + fp + fn
+            iou = (tp / denom_iou) if denom_iou > 0 else 1.0
+            precision = (tp / (tp + fp)) if (tp + fp) > 0 else 1.0
+            recall = (tp / (tp + fn)) if (tp + fn) > 0 else 1.0
+            f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+
+            # Lightweight S-measure implementation adapted for binary masks
+            def _s_measure_binary(pred: np.ndarray, gt: np.ndarray) -> float:
+                pred_f = pred.astype(np.float64)
+                gt_f = gt.astype(np.float64)
+                y_mean = gt_f.mean()
+                if y_mean == 0:
+                    return float(1.0 - pred_f.mean())
+                if y_mean == 1:
+                    return float(pred_f.mean())
+
+                def s_object(p: np.ndarray, g: np.ndarray) -> float:
+                    vals = p[g == 1]
+                    if vals.size == 0:
+                        return 0.0
+                    mx = float(vals.mean())
+                    sx = float(vals.std(ddof=1)) if vals.size > 1 else 0.0
+                    return float(2 * mx / (mx * mx + 1 + sx + np.spacing(1)))
+
+                def ssim(a: np.ndarray, b: np.ndarray) -> float:
+                    h_, w_ = a.shape
+                    N = h_ * w_
+                    if N <= 1:
+                        return 1.0
+                    mx = float(a.mean()); my = float(b.mean())
+                    sx = float(((a - mx) ** 2).sum() / (N - 1))
+                    sy = float(((b - my) ** 2).sum() / (N - 1))
+                    sxy = float(((a - mx) * (b - my)).sum() / (N - 1))
+                    alpha = 4 * mx * my * sxy
+                    beta = (mx * mx + my * my) * (sx + sy)
+                    if alpha != 0:
+                        return float(alpha / (beta + np.spacing(1)))
+                    if alpha == 0 and beta == 0:
+                        return 1.0
+                    return 0.0
+
+                coords = np.argwhere(gt_f == 1)
+                h_, w_ = gt_f.shape
+                if coords.size == 0:
+                    cx, cy = int(round(w_ / 2)), int(round(h_ / 2))
+                else:
+                    cy, cx = coords.mean(axis=0).round().astype(int).tolist()
+                cx = int(cx) + 1; cy = int(cy) + 1
+                gt_LT = gt_f[0:cy, 0:cx]; gt_RT = gt_f[0:cy, cx:w_]
+                gt_LB = gt_f[cy:h_, 0:cx]; gt_RB = gt_f[cy:h_, cx:w_]
+                pr_LT = pred_f[0:cy, 0:cx]; pr_RT = pred_f[0:cy, cx:w_]
+                pr_LB = pred_f[cy:h_, 0:cx]; pr_RB = pred_f[cy:h_, cx:w_]
+                area = float(h_ * w_)
+                w1 = (cx * cy) / area
+                w2 = (cy * (w_ - cx)) / area
+                w3 = ((h_ - cy) * cx) / area
+                w4 = 1.0 - w1 - w2 - w3
+                region_score = (
+                    w1 * ssim(pr_LT, gt_LT) +
+                    w2 * ssim(pr_RT, gt_RT) +
+                    w3 * ssim(pr_LB, gt_LB) +
+                    w4 * ssim(pr_RB, gt_RB)
+                )
+                alpha = 0.5
+                return float(max(0.0, alpha * s_object(pred_f, gt_f) + (1 - alpha) * region_score))
+
+            s_measure = _s_measure_binary(pr, gt)
+            return {
+                "DICE": dice,
+                "IOU": iou,
+                "PRECISION": precision,
+                "RECALL": recall,
+                "S_MEASURE": s_measure,
+                "F1_SCORE": f1,
+            }
+
+        def _draw_metrics_footer(img: np.ndarray, metrics: dict, keys: List[str]) -> None:
+            parts: List[str] = []
+            for k in keys:
+                if k in metrics:
+                    parts.append(f"{k}: {metrics[k]:.3f}")
+            if not parts:
+                return
+            text = "  ".join(parts)
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            scale = 0.5
+            thickness = 1
+            max_width = img.shape[1] - 16
+            (tw, th), _ = cv2.getTextSize(text, font, scale, thickness)
+            if tw > max_width and tw > 0:
+                scale = max(0.3, scale * (max_width / tw))
+                (tw, th), _ = cv2.getTextSize(text, font, scale, thickness)
+            x = 8
+            y = img.shape[0] - 6
+            # stroke for readability
+            cv2.putText(img, text, (x, y), font, scale, (0, 0, 0), 3, lineType=cv2.LINE_AA)
+            cv2.putText(img, text, (x, y), font, scale, (255, 255, 255), 1, lineType=cv2.LINE_AA)
+
+        try:
+            m = _compute_metrics(A, B)
+            _draw_metrics_footer(panel1, m, ["DICE", "IOU"])
+            _draw_metrics_footer(panel2, m, ["PRECISION", "RECALL"])
+            _draw_metrics_footer(panel3, m, ["S_MEASURE", "F1_SCORE"])
+        except Exception:
+            pass
 
         # Titles
         def _add_title(img: np.ndarray, text: str) -> None:
@@ -490,8 +614,8 @@ def main() -> None:
                 continue
             sample_stem = stem(image_path)
             ### For Debug Only:
-            if not sample_stem == "BRATS_001_z0088":
-                continue
+            # if not sample_stem == "BRATS_001_z0088":
+            #     continue
             ### :For Debug Only
             try:
                 subdir = os.path.join(args.debug_output_dir, sample_stem)
@@ -507,6 +631,13 @@ def main() -> None:
                 continue
 
             gt_mask_u8 = np.array(_PIL.open(to_abs(gt_mask_path)), dtype=np.uint8)
+            # Load base image if exists
+            base_img_bgr = None
+            try:
+                img_arr = np.array(_PIL.open(to_abs(image_path)).convert("RGB"))
+                base_img_bgr = img_arr[:, :, ::-1]
+            except Exception:
+                base_img_bgr = None
             # Load gt as all-zero array to preserve panel structure; we visualize differences of predicted masks only
             for i, (pt, lb) in enumerate(zip(points, labels)):
                 # For step i, compare masks of ground truth and step i-1 (i==0 uses empty prev)
@@ -520,7 +651,14 @@ def main() -> None:
                         prev = np.zeros_like(gt_mask_u8, dtype=np.uint8)
                 # Render panels with provided point
                 dbg_path = os.path.join(subdir, f"dbg_{i}.png")
-                _render_diff_panels_with_point(gt_mask_u8, prev, (float(pt[0]), float(pt[1])), int(lb), dbg_path)
+                _render_diff_panels_with_point(
+                    gt_mask_u8,
+                    prev,
+                    (float(pt[0]), float(pt[1])),
+                    int(lb),
+                    dbg_path,
+                    base_image_bgr=base_img_bgr,
+                )
                 num_generated += 1
         print(f"Generated debug images for {num_generated} steps into {args.debug_output_dir}")
         return

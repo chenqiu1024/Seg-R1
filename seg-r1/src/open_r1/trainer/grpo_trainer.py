@@ -374,7 +374,9 @@ class Qwen2VLGRPOTrainer(Trainer):
             Tensor of per-token log probabilities aligned to input_ids[... , 1:]. Shape (B, L-1).
         """
         logits = model(input_ids, attention_mask=attention_mask, pixel_values=pixel_values, image_grid_thw=image_grid_thw).logits  # (B, L, V) ###???
+        ## - 教师强迫对齐：用位置 t 的 logits 去预测位置 t+1 的目标，所以丢弃最后一列，得到 (B, L-1, V)。
         logits = logits[:, :-1, :]  # (B, L-1, V), shift to align each logit with the token actually chosen at t ###???
+        ## - 同步右移标签，将目标改为 x_{2..L}，与上一步的 (L-1) 时间步一一对应。
         input_ids = input_ids[:, 1:]  # (B, L-1), drop first token (no preceding logit for it)
         # Compute the log probabilities for the input tokens. Use a loop to reduce memory peak.
         per_token_logps = []
@@ -436,6 +438,7 @@ class Qwen2VLGRPOTrainer(Trainer):
 ## Sample G actions in ActionSpace:
         # Paper alignment: sample G completions per prompt to construct groups for GRPO.
         with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
+            ### Don: Generate a complete sequence of actions
             prompt_completion_ids = unwrapped_model.generate(**prompt_inputs, generation_config=self.generation_config)  # (B*G, P+C) ###??? How to guarantee the sampling distribution?
 ## P: max length of Prompt ; C : max length of Completion
             prompt_length = prompt_ids.size(1)  # number of prompt tokens per sample  # scalar P
