@@ -22,6 +22,35 @@ Notes
 - Input resolution H×W is configurable; actions are mapped back to original image size
   before calling SAM2. Masks from SAM2 are resized to original size for metric eval.
 - For efficiency, we keep a single SAM2 predictor per process and reuse it across steps.
+
+Examples (调用示例)
+  1) 基本训练（使用已监督预训练权重作为初始化与参考网络）：
+     /opt/anaconda3/envs/seg-r1/bin/python -m seg-rl.heatmap.train_grpo_points \
+       --train_json datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour-251003.jsonl \
+       --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
+       --out_dir outputs/braintumour/grpo-251015 \
+       --init_policy outputs/braintumour/points_predictor-251001-160epochs.pt \
+       --device mps \
+       --height 512 --width 512 --stride 8 --max_points 16 \
+       --epochs 5 --batch_size 2 --group_size 4 --tb
+
+  2) 在Apple Silicon上使用MPS并调整探索温度与KL权重：
+     python -m seg-rl.heatmap.train_grpo_points \
+       --train_json datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour-251003.jsonl \
+       --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
+       --out_dir outputs/braintumour/grpo-mps \
+       --device mps --height 512 --width 512 --stride 8 \
+       --pixel_temp_start 1.8 --pixel_temp_end 0.8 \
+       --label_temp_start 1.2 --label_temp_end 0.8 \
+       --beta_kl 0.02 --beta_kl_label 0.3 --beta_kl_pixel 0.7 \
+       --epochs 3 --batch_size 2 --group_size 4 --tb
+
+  3) 从断点恢复训练：
+     python -m seg-rl.heatmap.train_grpo_points \
+       --train_json datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour-251003.jsonl \
+       --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
+       --out_dir outputs/braintumour/grpo-251015 \
+       --resume outputs/braintumour/grpo-251015/ckpt_step1000.pt --tb
 """
 
 from __future__ import annotations
@@ -477,8 +506,10 @@ def train() -> None:
     writer = None
     if args.tb:
         try:
-            from torch.utils.tensorboard import SummaryWriter  # type: ignore
-            writer = SummaryWriter(log_dir=os.path.join(args.out_dir, "tb"))
+            from torch.utils.tensorboard import SummaryWriter  ##FIXME: This importation will raise an exception
+            log_dir = os.path.join(args.out_dir, "tb")
+            print(f"[tb] logging to {log_dir}")
+            writer = SummaryWriter(log_dir=log_dir)
         except Exception:
             writer = None
 
@@ -557,7 +588,7 @@ def train() -> None:
                     image_path = batch_recs[b]["image"]
                     for g in range(G):
                         rgb_t, g_t, (orig_h, orig_w) = _prepare_model_inputs(image_path, prev_masks[b][g], (args.height, args.width))
-                        logits, label_logits = policy(rgb_t.to(device), g_t.to(device))
+                        logvs, label_logits = policy(rgb_t.to(device), g_t.to(device)) ###!!!
                         with torch.no_grad():
                             logits_old, label_logits_old = old_policy(rgb_t.to(device), g_t.to(device))
                             logits_ref, label_logits_ref = ref_policy(rgb_t.to(device), g_t.to(device))
