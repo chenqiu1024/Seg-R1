@@ -32,7 +32,7 @@ Example usage:
   # 3) 调试模式（生成调试图像）
   /opt/anaconda3/envs/seg-r1/bin/python seg-rl/annotator/gen_point_jsonl_from_masks.py \
     --debug_json datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour-1.jsonl \
-    --debug_output_dir outputs/braintumour/dbg_gen_point
+    --debug_output_dir outputs/braintumour/dbg_gen_points
 
 Notes:
 - Foreground is defined as any non-zero pixel in the mask.
@@ -235,6 +235,7 @@ def largest_diff_component_representative(A, B, connectivity=2, min_area=0, dbg_
     # A, B: 2D uint8 arrays, values {0,1} 或 {0,255}
     A = (A > 0).astype(np.uint8)
     B = (B > 0).astype(np.uint8)
+    ### C = A.astype(np.int16) - B.astype(np.int16)  # {-1, 0, +1}
     C = A.astype(np.int8) - B.astype(np.int8)  # {-1, 0, +1}
 
     regions = []
@@ -244,7 +245,7 @@ def largest_diff_component_representative(A, B, connectivity=2, min_area=0, dbg_
     for sign, mask in ((1, C > 0), (-1, C < 0)):
         if not mask.any():
             continue
-        lab, n = label(mask, structure=st)
+        lab, n = ndi.label(mask, structure=st)
         if n == 0:
             continue
         areas = np.bincount(lab.ravel())[1:]  # 忽略背景0
@@ -253,7 +254,7 @@ def largest_diff_component_representative(A, B, connectivity=2, min_area=0, dbg_
             if keep_ids.size == 0:
                 continue
             mask2 = np.isin(lab, keep_ids)
-            lab, n = label(mask2, structure=st)
+            lab, n = ndi.label(mask2, structure=st)
             if n == 0:
                 continue
             areas = np.bincount(lab.ravel())[1:]
@@ -299,6 +300,7 @@ def _render_diff_panels_with_point(
     label: int,
     dbg_out_path: Optional[str],
     connectivity: int = 2,
+    base_image_bgr: Optional[np.ndarray] = None,
 ) -> None:
     """Render 3-panel debug image reusing the visualization style in
     largest_diff_component_representative, but mark a provided point instead of
@@ -307,19 +309,28 @@ def _render_diff_panels_with_point(
     - Panel 2: signed diff C (positive green, negative red)
     - Panel 3: connected components colored, with marker at point_xy
     """
+    rng = np.random.default_rng(12345)
     try:
         if dbg_out_path is None:
             return
         h, w = A.shape[:2]
-        # Panel 1: A/B overlay (A=green, B=red)
+        # Panel 1: A/B overlay (A=green, B=red), optionally blended on base image
         overlay1 = np.zeros((h, w, 3), dtype=np.uint8)
         overlay1[..., 1] = (A > 0).astype(np.uint8) * 255  # G
         overlay1[..., 2] = (B > 0).astype(np.uint8) * 255  # R
-        bg = np.zeros_like(overlay1)
-        panel1 = cv2.addWeighted(bg, 1.0, overlay1, 0.6, 0.0)
+        if base_image_bgr is not None:
+            base = base_image_bgr
+            if base.ndim == 2:
+                base = cv2.cvtColor(base, cv2.COLOR_GRAY2BGR)
+            if base.shape[:2] != (h, w):
+                base = cv2.resize(base, (w, h), interpolation=cv2.INTER_LINEAR)
+            panel1 = cv2.addWeighted(base, 1.0, overlay1, 0.6, 0.0)
+        else:
+            bg = np.zeros_like(overlay1)
+            panel1 = cv2.addWeighted(bg, 1.0, overlay1, 0.6, 0.0)
 
         # Panel 2: signed diff C (positive green, negative red)
-        C = A.astype(np.int8) - B.astype(np.int8)
+        C = A.astype(np.int16) - B.astype(np.int16)
         panel2 = np.zeros((h, w, 3), dtype=np.uint8)
         pos = (C > 0)
         neg = (C < 0)
@@ -329,13 +340,8 @@ def _render_diff_panels_with_point(
         # Panel 3: connected components colored + provided point marker
         panel3 = np.zeros((h, w, 3), dtype=np.uint8)
         st = np.ones((3,3), dtype=np.uint8) if connectivity == 2 else np.array([[0,1,0],[1,1,1],[0,1,0]], dtype=np.uint8)
-        for sgn, mask in ((1, C > 0), (-1, C < 0)):
-            if not mask.any():
-                continue
-            lab, n = label(mask, structure=st)
-            if n == 0:
-                continue
-            rng = np.random.default_rng(12345 if sgn > 0 else 54321)
+        lab, n = ndi.label(C, structure=st)
+        if n != 0:
             colors = (rng.integers(0, 256, size=(n, 3))).astype(np.uint8)
             colors = np.clip(colors + 100, 0, 255)
             for i in range(1, n + 1):
@@ -362,6 +368,121 @@ def _render_diff_panels_with_point(
         else:
             _draw_cross(panel3, cx, cy, size=6, color=(255,255,255), thickness=2)
 
+        # Compute and draw metrics comparing B (pred) vs A (gt) on panel1
+        def _compute_metrics(gt_u8: np.ndarray, pr_u8: np.ndarray) -> dict:
+            gt = (gt_u8 > 0)
+            pr = (pr_u8 > 0)
+            tp = int(np.logical_and(gt, pr).sum())
+            fp = int(np.logical_and(~gt, pr).sum())
+            fn = int(np.logical_and(gt, ~pr).sum())
+            denom_dice = 2 * tp + fp + fn
+            dice = (2 * tp / denom_dice) if denom_dice > 0 else 1.0
+            denom_iou = tp + fp + fn
+            iou = (tp / denom_iou) if denom_iou > 0 else 1.0
+            precision = (tp / (tp + fp)) if (tp + fp) > 0 else 1.0
+            recall = (tp / (tp + fn)) if (tp + fn) > 0 else 1.0
+            f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+
+            # Lightweight S-measure implementation adapted for binary masks
+            def _s_measure_binary(pred: np.ndarray, gt: np.ndarray) -> float:
+                pred_f = pred.astype(np.float64)
+                gt_f = gt.astype(np.float64)
+                y_mean = gt_f.mean()
+                if y_mean == 0:
+                    return float(1.0 - pred_f.mean())
+                if y_mean == 1:
+                    return float(pred_f.mean())
+
+                def s_object(p: np.ndarray, g: np.ndarray) -> float:
+                    vals = p[g == 1]
+                    if vals.size == 0:
+                        return 0.0
+                    mx = float(vals.mean())
+                    sx = float(vals.std(ddof=1)) if vals.size > 1 else 0.0
+                    return float(2 * mx / (mx * mx + 1 + sx + np.spacing(1)))
+
+                def ssim(a: np.ndarray, b: np.ndarray) -> float:
+                    h_, w_ = a.shape
+                    N = h_ * w_
+                    if N <= 1:
+                        return 1.0
+                    mx = float(a.mean()); my = float(b.mean())
+                    sx = float(((a - mx) ** 2).sum() / (N - 1))
+                    sy = float(((b - my) ** 2).sum() / (N - 1))
+                    sxy = float(((a - mx) * (b - my)).sum() / (N - 1))
+                    alpha = 4 * mx * my * sxy
+                    beta = (mx * mx + my * my) * (sx + sy)
+                    if alpha != 0:
+                        return float(alpha / (beta + np.spacing(1)))
+                    if alpha == 0 and beta == 0:
+                        return 1.0
+                    return 0.0
+
+                coords = np.argwhere(gt_f == 1)
+                h_, w_ = gt_f.shape
+                if coords.size == 0:
+                    cx, cy = int(round(w_ / 2)), int(round(h_ / 2))
+                else:
+                    cy, cx = coords.mean(axis=0).round().astype(int).tolist()
+                cx = int(cx) + 1; cy = int(cy) + 1
+                gt_LT = gt_f[0:cy, 0:cx]; gt_RT = gt_f[0:cy, cx:w_]
+                gt_LB = gt_f[cy:h_, 0:cx]; gt_RB = gt_f[cy:h_, cx:w_]
+                pr_LT = pred_f[0:cy, 0:cx]; pr_RT = pred_f[0:cy, cx:w_]
+                pr_LB = pred_f[cy:h_, 0:cx]; pr_RB = pred_f[cy:h_, cx:w_]
+                area = float(h_ * w_)
+                w1 = (cx * cy) / area
+                w2 = (cy * (w_ - cx)) / area
+                w3 = ((h_ - cy) * cx) / area
+                w4 = 1.0 - w1 - w2 - w3
+                region_score = (
+                    w1 * ssim(pr_LT, gt_LT) +
+                    w2 * ssim(pr_RT, gt_RT) +
+                    w3 * ssim(pr_LB, gt_LB) +
+                    w4 * ssim(pr_RB, gt_RB)
+                )
+                alpha = 0.5
+                return float(max(0.0, alpha * s_object(pred_f, gt_f) + (1 - alpha) * region_score))
+
+            s_measure = _s_measure_binary(pr, gt)
+            return {
+                "DICE": dice,
+                "IOU": iou,
+                "PRECISION": precision,
+                "RECALL": recall,
+                "S_MEASURE": s_measure,
+                "F1_SCORE": f1,
+            }
+
+        def _draw_metrics_footer(img: np.ndarray, metrics: dict, keys: List[str]) -> None:
+            parts: List[str] = []
+            for k in keys:
+                if k in metrics:
+                    parts.append(f"{k}: {metrics[k]:.3f}")
+            if not parts:
+                return
+            text = "  ".join(parts)
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            scale = 0.5
+            thickness = 1
+            max_width = img.shape[1] - 16
+            (tw, th), _ = cv2.getTextSize(text, font, scale, thickness)
+            if tw > max_width and tw > 0:
+                scale = max(0.3, scale * (max_width / tw))
+                (tw, th), _ = cv2.getTextSize(text, font, scale, thickness)
+            x = 8
+            y = img.shape[0] - 6
+            # stroke for readability
+            cv2.putText(img, text, (x, y), font, scale, (0, 0, 0), 3, lineType=cv2.LINE_AA)
+            cv2.putText(img, text, (x, y), font, scale, (255, 255, 255), 1, lineType=cv2.LINE_AA)
+
+        try:
+            m = _compute_metrics(A, B)
+            _draw_metrics_footer(panel1, m, ["DICE", "IOU"])
+            _draw_metrics_footer(panel2, m, ["PRECISION", "RECALL"])
+            _draw_metrics_footer(panel3, m, ["S_MEASURE", "F1_SCORE"])
+        except Exception:
+            pass
+
         # Titles
         def _add_title(img: np.ndarray, text: str) -> None:
             band_h = max(20, min(48, img.shape[0] // 20))
@@ -370,8 +491,22 @@ def _render_diff_panels_with_point(
             cv2.rectangle(overlay, (0, 0), (img.shape[1] - 1, band_h - 1), (0, 0, 0), thickness=-1)
             cv2.addWeighted(overlay, 0.5, roi, 0.5, 0, dst=roi)
             org = (8, band_h - 6)
-            cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, lineType=cv2.LINE_AA)
-            cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, lineType=cv2.LINE_AA)
+            font_scale = 0.4
+            font_thickness = 1
+            # Truncate text to fit within image width
+            max_width = img.shape[1] - 16  # Leave some padding
+            (text_width, _), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thickness)
+            if text_width > max_width:
+                # Binary search to find the right truncation point
+                ellipsis = "..."
+                for i in range(len(text), 0, -1):
+                    truncated = text[:i] + ellipsis
+                    (trunc_width, _), _ = cv2.getTextSize(truncated, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thickness)
+                    if trunc_width <= max_width:
+                        text = truncated
+                        break
+            cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), 3, lineType=cv2.LINE_AA)
+            cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), font_thickness, lineType=cv2.LINE_AA)
         _add_title(panel1, "Overlay A (green) vs B (red)")
         _add_title(panel2, "Signed diff C: + (green), - (red)")
         _add_title(panel3, "Components + selected point")
@@ -424,6 +559,11 @@ def calculate_next_point(gt_mask_path, sam_masks_dir, current_points_len, dbg_ou
         except Exception:
             pass
 
+    ### For Debug Only:
+    # if stem(gt_mask_path) == "BRATS_001_z0088":
+    #     print("#Debug#")
+    ### :For Debug Only
+
     # 计算差异的最大连通分量代表点
     dbg_path = None
     if dbg_out_dir:
@@ -466,41 +606,59 @@ def main() -> None:
         for rec in arr:
             if not isinstance(rec, dict):
                 continue
+
             image_path = rec.get("image")
+            gt_mask_path = rec.get("gt_mask")
             sam_masks_dir = rec.get("sam_masks_dir")
+            if not (image_path and sam_masks_dir):
+                continue
+            sample_stem = stem(image_path)
+            ### For Debug Only:
+            # if not sample_stem == "BRATS_001_z0088":
+            #     continue
+            ### :For Debug Only
+            try:
+                subdir = os.path.join(args.debug_output_dir, sample_stem)
+                os.makedirs(subdir, exist_ok=True)
+            except Exception:
+                continue
+
             points = rec.get("points", [])
             labels = rec.get("labels", [])
-            if not (image_path and sam_masks_dir and isinstance(points, list) and isinstance(labels, list)):
+            if not (isinstance(points, list) and isinstance(labels, list)):
                 continue
             if len(points) != len(labels):
                 continue
-            sample_stem = stem(image_path)
+
+            gt_mask_u8 = np.array(_PIL.open(to_abs(gt_mask_path)), dtype=np.uint8)
+            # Load base image if exists
+            base_img_bgr = None
+            try:
+                img_arr = np.array(_PIL.open(to_abs(image_path)).convert("RGB"))
+                base_img_bgr = img_arr[:, :, ::-1]
+            except Exception:
+                base_img_bgr = None
             # Load gt as all-zero array to preserve panel structure; we visualize differences of predicted masks only
             for i, (pt, lb) in enumerate(zip(points, labels)):
-                # For step i, compare masks of step i and i-1 (i==0 uses empty prev)
-                try:
-                    cur_path = os.path.join(sam_masks_dir, sample_stem, f"{i}.png")
-                    cur = np.array(_PIL.open(to_abs(cur_path)).convert("L"), dtype=np.uint8) if os.path.isfile(cur_path) else None
-                except Exception:
-                    cur = None
-                if cur is None:
-                    continue
+                # For step i, compare masks of ground truth and step i-1 (i==0 uses empty prev)
                 if i == 0:
-                    prev = np.zeros_like(cur, dtype=np.uint8)
+                    prev = np.zeros_like(gt_mask_u8, dtype=np.uint8)
                 else:
                     try:
                         prev_path = os.path.join(sam_masks_dir, sample_stem, f"{i-1}.png")
-                        prev = np.array(_PIL.open(to_abs(prev_path)).convert("L"), dtype=np.uint8) if os.path.isfile(prev_path) else np.zeros_like(cur, dtype=np.uint8)
+                        prev = np.array(_PIL.open(to_abs(prev_path)).convert("L"), dtype=np.uint8) if os.path.isfile(prev_path) else np.zeros_like(gt_mask_u8, dtype=np.uint8)
                     except Exception:
-                        prev = np.zeros_like(cur, dtype=np.uint8)
+                        prev = np.zeros_like(gt_mask_u8, dtype=np.uint8)
                 # Render panels with provided point
-                try:
-                    subdir = os.path.join(args.debug_output_dir, sample_stem)
-                    os.makedirs(subdir, exist_ok=True)
-                    dbg_path = os.path.join(subdir, f"dbg_{i}.png")
-                except Exception:
-                    dbg_path = None
-                _render_diff_panels_with_point(prev, cur, (float(pt[0]), float(pt[1])), int(lb), dbg_path)
+                dbg_path = os.path.join(subdir, f"dbg_{i}.png")
+                _render_diff_panels_with_point(
+                    gt_mask_u8,
+                    prev,
+                    (float(pt[0]), float(pt[1])),
+                    int(lb),
+                    dbg_path,
+                    base_image_bgr=base_img_bgr,
+                )
                 num_generated += 1
         print(f"Generated debug images for {num_generated} steps into {args.debug_output_dir}")
         return

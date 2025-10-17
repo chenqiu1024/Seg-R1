@@ -452,7 +452,7 @@ def main():
     try:
         # SAM2配置文件路径
         model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
-        sam_model = build_sam2(model_cfg, args.sam_checkpoint)
+        sam_model = build_sam2(model_cfg, args.sam_checkpoint, device=device)
         # config_path = Path(__file__).parent.parent / "third_party" / "sam2" / args.config_path
         # if not config_path.exists():
         #     config_path = Path(args.config_path)

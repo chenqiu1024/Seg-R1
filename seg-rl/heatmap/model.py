@@ -45,16 +45,25 @@ class LabelHead(nn.Module):
     def __init__(self, in_channels: int, mid_channels: int = 256, num_classes: int = 2) -> None:
         super().__init__()
         self.pool = nn.AdaptiveAvgPool2d(1)
+        # 使用 GroupNorm 代替 BatchNorm2d，以兼容 batch=1 且空间为 1x1 的情况
+        # 选择能整除 mid_channels 的最大分组数，保证有效分组
+        gn_groups = 1
+        for g in (32, 16, 8, 4, 2, 1):
+            if mid_channels % g == 0:
+                gn_groups = g
+                break
         self.fc = nn.Sequential(
             nn.Conv2d(in_channels, mid_channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(mid_channels),
+            nn.GroupNorm(num_groups=gn_groups, num_channels=mid_channels),
             nn.ReLU(inplace=True),
             nn.Conv2d(mid_channels, num_classes, kernel_size=1, bias=True),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.pool(x)
-        return self.fc(x).flatten(1)
+        y = self.fc(x)
+        z = y.flatten(1)
+        return z
 
 class DoubleConv(nn.Module):
     def __init__(self, in_ch: int, out_ch: int) -> None:
@@ -221,21 +230,32 @@ def soft_argmax_from_logits(logits: torch.Tensor, temperature: float = 1.0) -> t
 # ==========================
 
 def _crop_to_stride(logits: torch.Tensor, stride: int) -> tuple[torch.Tensor, int, int]:
+    # 读取输入张量的批大小、通道数与空间尺寸 [B, C, H, W]
     B, C, H, W = logits.shape
+    # 计算按 stride 划分后的网格大小（cell 网格的高宽）
     Hc = H // stride
     Wc = W // stride
+    # 计算裁剪后的有效像素尺寸，使其恰好能被 stride 整除
     Ht = Hc * stride
     Wt = Wc * stride
+    # 返回裁剪到 [Ht, Wt] 的 logits 以及 cell 网格尺寸 Hc、Wc
     return logits[:, :, :Ht, :Wt], Hc, Wc
 
 
 def _cell_logsumexp(logits: torch.Tensor, stride: int) -> tuple[torch.Tensor, torch.Tensor, int, int]:
+    # 先裁剪 logits 到能够整除 stride 的有效区域，并得到 cell 网格大小
     logits, Hc, Wc = _crop_to_stride(logits, stride)
+    # 读取裁剪后张量的形状（Ht, Wt 是有效空间分辨率）
     B, _, Ht, Wt = logits.shape
     s = stride
+    # 使用 unfold 将每个不重叠的 s×s 区域拉平成长度为 s*s 的列，形成 patches
+    # 输出形状为 [B, s*s, Hc*Wc]，其中 Hc*Wc 表示所有 cell 的数目
     patches = F.unfold(logits, kernel_size=(s, s), stride=(s, s))  # [B, s*s, Hc*Wc]
+    # 对每个 cell（每一列）在像素维度上做 log-sum-exp 聚合，得到 cell 级别的 log 质量
     lse = torch.logsumexp(patches, dim=1)  # [B, Hc*Wc]
+    # 还原为网格形状 [B, 1, Hc, Wc] 以便后续按网格进行采样与索引
     lse_map = lse.view(B, 1, Hc, Wc)
+    # 返回：cell 级 logits 图（lse_map）、原始 cell 内像素 logits（patches）、以及网格大小
     return lse_map, patches, Hc, Wc
 
 
@@ -245,40 +265,50 @@ def sample_cell_and_offset(
     stride: int,
     temperature: float = 1.0,
 ) -> dict:
+    # 采样辅助：从像素 logits 中分两级（cell 与 cell 内像素）采样，并返回坐标、偏移与对数概率
     device = logits.device
+    # 温度下限保护，避免数值不稳定；随后将 logits 除以温度以控制分布陡峭程度
     T = max(temperature, 1e-6)
+    # 计算 cell 级别的 log-sum-exp 地图与每个 cell 内像素的展开表示
     lse_map, patches, Hc, Wc = _cell_logsumexp(logits / T, stride)
+    # 批大小 B 与 stride 的别名 s
     B = logits.size(0)
     s = stride
 
-    # p(cell)
+    # 先在 cell 网格上采样：p(cell)
+    # 将 [B,1,Hc,Wc] 展平成 [B, Hc*Wc] 作为 Categorical 的 logits 输入
     cell_logits_flat = lse_map.view(B, -1)
     cell_dist = torch.distributions.Categorical(logits=cell_logits_flat)
+    # 采样得到每个样本的 cell 索引（扁平索引）与对应的 log 概率
     cell_idx = cell_dist.sample()                       # [B]
     cell_logp = cell_dist.log_prob(cell_idx)            # [B]
 
-    # p(subpixel | cell)
+    # 在选中的 cell 内再次采样子像素：p(subpixel | cell)
+    # 先用 gather 取出被选中 cell 的长度为 s*s 的像素 logits 列向量
     within_logits = patches.gather(2, cell_idx.view(B, 1, 1).expand(B, s*s, 1)).squeeze(-1)
+    # 基于该列构造条件分布并采样像素内索引 sub_idx（范围 [0, s*s)）以及其对数概率
     sub_dist = torch.distributions.Categorical(logits=within_logits)
     sub_idx = sub_dist.sample()
     sub_logp = sub_dist.log_prob(sub_idx)
 
-    # index -> (i,j)
-    ci = (cell_idx // Wc)              # [B]
-    cj = (cell_idx % Wc)               # [B]
-    ui = (sub_idx // s)
-    uj = (sub_idx % s)
+    # 将扁平索引还原为二维坐标
+    ci = (cell_idx // Wc)              # [B] 选中 cell 的行索引（在 Hc 维度）
+    cj = (cell_idx % Wc)               # [B] 选中 cell 的列索引（在 Wc 维度）
+    ui = (sub_idx // s)                # [B] cell 内的行偏移（0..s-1）
+    uj = (sub_idx % s)                 # [B] cell 内的列偏移（0..s-1）
 
-    # pixel coordinates within cropped region
+    # 合成裁剪区域内的像素整点坐标（以像素为单位）
     yi = ci * s + ui
     xj = cj * s + uj
 
-    # offset in [-0.5, 0.5]
+    # 提供归一化到 [-0.5, 0.5] 的亚像素偏移，中心对齐，便于连续坐标建模
     off_x = (uj.to(torch.float32) + 0.5) / s - 0.5
     off_y = (ui.to(torch.float32) + 0.5) / s - 0.5
 
+    # 联合对数概率：log p(cell) + log p(subpixel | cell)
     total_logp = cell_logp + sub_logp
 
+    # 返回包含索引、坐标、偏移以及对数概率等信息的字典
     return {
         "cell_idx": cell_idx,
         "cell_ij": torch.stack([cj, ci], dim=1),
@@ -350,18 +380,24 @@ def sample_joint_label_cell_offset(
           - log_prob: [B]        (sum)
           - grid_hw, stride
     """
+    # 标签分布采样：对 label_logits 施加温度缩放并构造类别分布
     T_label = max(temperature_label, 1e-6)
     label_dist = torch.distributions.Categorical(logits=label_logits / T_label)
+    # 采样得到每个样本的标签索引与其对数概率
     label_idx = label_dist.sample()
     logp_label = label_dist.log_prob(label_idx)
 
+    # 像素分布采样：调用两级像素采样（cell + 子像素），带像素温度
     pixel = sample_cell_and_offset(logits, stride=stride, temperature=temperature_pixel)
+    # 取得像素部分的联合对数概率（cell + subpixel）
     logp_pixel = pixel["log_prob"]
 
+    # 汇总输出，将标签和像素的采样结果与对数概率拼装在一个字典中
     out = dict(pixel)
     out["label_idx"] = label_idx
     out["log_prob_label"] = logp_label
     out["log_prob_pixel"] = logp_pixel
+    # 联合动作的总 log_prob = 标签部分 + 像素部分
     out["log_prob"] = logp_label + logp_pixel
     return out
 
