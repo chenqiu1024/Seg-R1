@@ -506,11 +506,17 @@ def train() -> None:
     writer = None
     if args.tb:
         try:
-            from torch.utils.tensorboard import SummaryWriter  ##FIXME: This importation will raise an exception
+            # Try torch TensorBoard first; fall back to tensorboardX if unavailable
+            try:
+                from torch.utils.tensorboard import SummaryWriter as _TBWriter
+            except Exception:
+                from tensorboardX import SummaryWriter as _TBWriter  # type: ignore
             log_dir = os.path.join(args.out_dir, "tb")
+            os.makedirs(log_dir, exist_ok=True)
             print(f"[tb] logging to {log_dir}")
-            writer = SummaryWriter(log_dir=log_dir)
-        except Exception:
+            writer = _TBWriter(log_dir=log_dir)
+        except Exception as e:
+            print(f"[tb] disabled: {e}. Install 'tensorboard' or 'tensorboardX' to enable logs.")
             writer = None
 
     policy.train()
