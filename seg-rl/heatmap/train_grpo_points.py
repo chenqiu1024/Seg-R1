@@ -33,6 +33,15 @@ Examples (调用示例)
        --device mps \
        --height 512 --width 512 --stride 8 --max_points 16 \
        --epochs 5 --batch_size 2 --group_size 4 --tb
+    
+    python -m seg-rl.heatmap.train_grpo_points \
+       --train_json datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour-251001.jsonl \
+       --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
+       --out_dir outputs/braintumour/grpo-251018 \
+       --init_policy outputs/braintumour/heatmap_train-251001-optimized/model_epoch_185.pt \
+       --device cuda \
+       --height 512 --width 512 --stride 8 --max_points 16 \
+       --epochs 5 --batch_size 2 --group_size 4 --tb
 
   2) 在Apple Silicon上使用MPS并调整探索温度与KL权重：
      python -m seg-rl.heatmap.train_grpo_points \
@@ -51,6 +60,20 @@ Examples (调用示例)
        --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
        --out_dir outputs/braintumour/grpo-251015 \
        --resume outputs/braintumour/grpo-251015/ckpt_step1000.pt --tb
+
+### 推荐重跑命令（优先把 SAM2 放 CPU，再视情况降批量）
+```bash
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+python -m seg-rl.heatmap.train_grpo_points \
+  --train_json datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour-251001.jsonl \
+  --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
+  --out_dir outputs/braintumour/grpo-251018 \
+  --init_policy outputs/braintumour/heatmap_train-251001-optimized/model_epoch_185.pt \
+  --device cuda \
+  --sam_device cpu \
+  --height 512 --width 512 --stride 8 --max_points 16 \
+  --epochs 5 --batch_size 1 --group_size 4 --tb
+```
 """
 
 from __future__ import annotations
@@ -73,6 +96,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+from torch.cuda.amp import autocast as _autocast, GradScaler as _GradScaler
 
 # Local imports (robust to module/script execution)
 try:
@@ -429,6 +453,7 @@ def train() -> None:
     p.add_argument("--init_policy", type=str, default=None, help="Supervised checkpoint (.pt) for initialization and KL reference")
     p.add_argument("--val_ratio", type=float, default=0.1)
     p.add_argument("--max_val_items", type=int, default=64)
+    p.add_argument("--sam_device", type=str, default="cpu", help="Device for SAM2 env (e.g., cpu, cuda, cuda:1)")
     args_ns = p.parse_args()
 
     args = GRPOArgs(
@@ -465,6 +490,7 @@ def train() -> None:
     os.makedirs(args.out_dir, exist_ok=True)
     set_seed(args.seed)
     device = torch.device(args.device) if args.device else _device()
+    use_amp = (device.type == "cuda")
 
     # data
     train_ds = JsonArrayDataset(args.train_json, split="train", val_ratio=args_ns.val_ratio, seed=args.seed)
@@ -472,7 +498,8 @@ def train() -> None:
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, drop_last=True)
 
     # env
-    env = SAMEnv(args.sam_checkpoint, device=args.device)
+    # allow placing SAM2 predictor on a separate device to save GPU memory
+    env = SAMEnv(args.sam_checkpoint, device=args_ns.sam_device)
 
     # policy
     cfg = ModelConfig(backbone="unet_s", pretrained=False, main_in_channels=3, cond_in_channels=1)
@@ -489,8 +516,12 @@ def train() -> None:
     ref_policy.eval()
     for p_ref in ref_policy.parameters():
         p_ref.requires_grad_(False)
+    # reduce memory footprint of reference model when using CUDA
+    if use_amp:
+        ref_policy.half()
 
     optim = torch.optim.AdamW(policy.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scaler = _GradScaler(enabled=use_amp)
     start_epoch = 0
     global_step = 0
     ref_sd = ref_policy.state_dict()
@@ -534,6 +565,8 @@ def train() -> None:
             old_policy.eval()
             for p_old in old_policy.parameters():
                 p_old.requires_grad_(False)
+            if use_amp:
+                old_policy.half()
 
             # temperature for this step (anneal over global steps)
             prog = 0.0 if args.epochs <= 1 else float(epoch) / float(max(1, args.epochs - 1))
@@ -594,10 +627,11 @@ def train() -> None:
                     image_path = batch_recs[b]["image"]
                     for g in range(G):
                         rgb_t, g_t, (orig_h, orig_w) = _prepare_model_inputs(image_path, prev_masks[b][g], (args.height, args.width))
-                        logits, label_logits = policy(rgb_t.to(device), g_t.to(device)) ###!!!
-                        with torch.no_grad():
-                            logits_old, label_logits_old = old_policy(rgb_t.to(device), g_t.to(device))
-                            logits_ref, label_logits_ref = ref_policy(rgb_t.to(device), g_t.to(device))
+                        with _autocast(enabled=use_amp):
+                            logits, label_logits = policy(rgb_t.to(device), g_t.to(device)) ###!!!
+                            with torch.no_grad():
+                                logits_old, label_logits_old = old_policy(rgb_t.to(device), g_t.to(device))
+                                logits_ref, label_logits_ref = ref_policy(rgb_t.to(device), g_t.to(device))
 
                         # sample action
                         act = sample_joint_label_cell_offset(
@@ -676,9 +710,17 @@ def train() -> None:
             loss = torch.stack(losses).mean()
 
             optim.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
-            optim.step()
+            if use_amp:
+                scaler.scale(loss).backward()
+                # unscale before gradient clipping
+                scaler.unscale_(optim)
+                torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
+                scaler.step(optim)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
+                optim.step()
 
             global_step += 1
             log_scalar("train/loss", float(loss.item()), global_step)
