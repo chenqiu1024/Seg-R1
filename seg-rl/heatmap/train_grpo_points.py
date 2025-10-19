@@ -336,19 +336,21 @@ def _interp(start: float, end: float, ratio: float) -> float:
 
 def _calc_kl_categorical(logits_p: torch.Tensor, logits_q: torch.Tensor) -> torch.Tensor:
     # KL(P||Q) with logits [B, K]
-    logp = torch.log_softmax(logits_p, dim=1)
-    logq = torch.log_softmax(logits_q, dim=1)
-    p = torch.softmax(logits_p, dim=1)
-    return (p * (logp - logq)).sum(dim=1)
+    lp = torch.log_softmax(logits_p.float(), dim=1)
+    lq = torch.log_softmax(logits_q.float(), dim=1)
+    p = torch.softmax(logits_p.float(), dim=1)
+    out = (p * (lp - lq)).sum(dim=1)
+    return out.to(logits_p.dtype)
 
 
 def _calc_kl_pixel_full(logits_p: torch.Tensor, logits_q: torch.Tensor) -> torch.Tensor:
     # KL over flattened pixel distribution [B,1,H,W] → [B]
     B = logits_p.size(0)
-    logp = torch.log_softmax(logits_p.view(B, -1), dim=1)
-    logq = torch.log_softmax(logits_q.view(B, -1), dim=1)
-    p = torch.softmax(logits_p.view(B, -1), dim=1)
-    return (p * (logp - logq)).sum(dim=1)
+    lp = torch.log_softmax(logits_p.float().view(B, -1), dim=1)
+    lq = torch.log_softmax(logits_q.float().view(B, -1), dim=1)
+    p = torch.softmax(logits_p.float().view(B, -1), dim=1)
+    out = (p * (lp - lq)).sum(dim=1)
+    return out.to(logits_p.dtype)
 
 
 def _save_checkpoint(path: str, model: nn.Module, optim: torch.optim.Optimizer, epoch: int, step: int, args: GRPOArgs, ref_sd: Dict[str, Any]) -> None:
@@ -454,6 +456,7 @@ def train() -> None:
     p.add_argument("--val_ratio", type=float, default=0.1)
     p.add_argument("--max_val_items", type=int, default=64)
     p.add_argument("--sam_device", type=str, default="cpu", help="Device for SAM2 env (e.g., cpu, cuda, cuda:1)")
+    p.add_argument("--adv_clip", type=float, default=0.0, help="Clip absolute advantage to this value (0 to disable)")
     args_ns = p.parse_args()
 
     args = GRPOArgs(
@@ -607,21 +610,6 @@ def train() -> None:
                 rgb_cache.append(rgb)
 
             for t in range(max_T):
-                # collect metrics at t-1 to compute reward increment
-                prev_score = torch.zeros(B, G, device=device)
-                for b in range(B):
-                    gt_bool = gt_cache[b]
-                    for g in range(G):
-                        if t == 0:
-                            prev = np.zeros_like(gt_bool, dtype=np.uint8)
-                        else:
-                            prev = prev_masks[b][g]
-                            if prev is None:
-                                prev = np.zeros_like(gt_bool, dtype=np.uint8)
-                        prev_bool = prev > 0
-                        m_prev = _compute_metrics(gt_bool, prev_bool)
-                        prev_score[b, g] = torch.tensor(_metric_value(m_prev, args.metric), device=device)
-
                 # compute policy outputs and sample actions for each (b,g)
                 for b in range(B):
                     image_path = batch_recs[b]["image"]
@@ -673,21 +661,32 @@ def train() -> None:
                         pts[b][g].append((x, y))
                         lbs[b][g].append(int(act["label_idx"].item()))
 
-                # step env for all (b,g)
+                # step env for all (b,g) and compute reward increment inline
                 for b in range(B):
                     gt_bool = gt_cache[b]
                     rgb = rgb_cache[b]
                     for g in range(G):
+                        # compute previous score (state at t-1)
+                        if t == 0:
+                            prev = np.zeros_like(gt_bool, dtype=np.uint8)
+                        else:
+                            prev = prev_masks[b][g]
+                            if prev is None:
+                                prev = np.zeros_like(gt_bool, dtype=np.uint8)
+                        prev_bool = prev > 0
+                        m_prev = _compute_metrics(gt_bool, prev_bool)
+                        prev_val = _metric_value(m_prev, args.metric)
+
                         pred_mask = env.predict_mask(rgb, pts[b][g], lbs[b][g])
                         prev_masks[b][g] = pred_mask
-                        # compute reward increment
+                        # compute reward increment: current - previous
                         if pred_mask.shape[:2] != gt_bool.shape[:2]:
                             pred_bool = _resize_bool(pred_mask > 0, gt_bool.shape[1], gt_bool.shape[0])
                         else:
                             pred_bool = pred_mask > 0
                         m_now = _compute_metrics(gt_bool, pred_bool)
                         cur = _metric_value(m_now, args.metric)
-                        rewards_t[t][b, g] = torch.tensor(cur, device=device) - prev_score[b, g]
+                        rewards_t[t][b, g] = torch.tensor(cur - prev_val, device=device)
 
             # Compute group-relative advantages per time-step
             losses = []
@@ -696,8 +695,10 @@ def train() -> None:
                 mean = r.mean(dim=1, keepdim=True)
                 std = r.std(dim=1, keepdim=True)
                 adv = (r - mean) / (std + 1e-4)  # [B,G]
+                if args_ns.adv_clip and args_ns.adv_clip > 0:
+                    adv = torch.clamp(adv, -args_ns.adv_clip, args_ns.adv_clip)
                 # PPO ratio with clipping
-                ratio = torch.exp(logp_t[t] - old_logp_t[t])  # [B,G]
+                ratio = torch.exp((logp_t[t] - old_logp_t[t]).float()).to(adv.dtype)  # [B,G]
                 unclipped = ratio * adv
                 clipped = torch.clamp(ratio, 1.0 - args.clip_eps, 1.0 + args.clip_eps) * adv
                 obj = torch.minimum(unclipped, clipped)  # [B,G]
@@ -727,7 +728,14 @@ def train() -> None:
             if global_step % 10 == 0:
                 # log average reward and advantage stats
                 avg_r = torch.stack([r.mean() for r in rewards_t]).mean().item()
+                r_all = torch.stack(rewards_t)  # [T,B,G]
+                avg_abs_r = r_all.abs().mean().item()
+                frac_nz = (r_all != 0).float().mean().item()
+                std_r = r_all.std(unbiased=False).item()
                 log_scalar("train/avg_reward", float(avg_r), global_step)
+                log_scalar("train/avg_reward_abs", float(avg_abs_r), global_step)
+                log_scalar("train/reward_frac_nonzero", float(frac_nz), global_step)
+                log_scalar("train/reward_std", float(std_r), global_step)
 
             if args.save_every > 0 and (global_step % args.save_every == 0):
                 ckpt_path = os.path.join(args.out_dir, f"ckpt_step{global_step}.pt")

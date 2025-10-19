@@ -277,7 +277,7 @@ def sample_cell_and_offset(
 
     # 先在 cell 网格上采样：p(cell)
     # 将 [B,1,Hc,Wc] 展平成 [B, Hc*Wc] 作为 Categorical 的 logits 输入
-    cell_logits_flat = lse_map.view(B, -1)
+    cell_logits_flat = lse_map.view(B, -1).float()
     cell_dist = torch.distributions.Categorical(logits=cell_logits_flat)
     # 采样得到每个样本的 cell 索引（扁平索引）与对应的 log 概率
     cell_idx = cell_dist.sample()                       # [B]
@@ -285,7 +285,7 @@ def sample_cell_and_offset(
 
     # 在选中的 cell 内再次采样子像素：p(subpixel | cell)
     # 先用 gather 取出被选中 cell 的长度为 s*s 的像素 logits 列向量
-    within_logits = patches.gather(2, cell_idx.view(B, 1, 1).expand(B, s*s, 1)).squeeze(-1)
+    within_logits = patches.gather(2, cell_idx.view(B, 1, 1).expand(B, s*s, 1)).squeeze(-1).float()
     # 基于该列构造条件分布并采样像素内索引 sub_idx（范围 [0, s*s)）以及其对数概率
     sub_dist = torch.distributions.Categorical(logits=within_logits)
     sub_idx = sub_dist.sample()
@@ -382,7 +382,7 @@ def sample_joint_label_cell_offset(
     """
     # 标签分布采样：对 label_logits 施加温度缩放并构造类别分布
     T_label = max(temperature_label, 1e-6)
-    label_dist = torch.distributions.Categorical(logits=label_logits / T_label)
+    label_dist = torch.distributions.Categorical(logits=(label_logits / T_label).float())
     # 采样得到每个样本的标签索引与其对数概率
     label_idx = label_dist.sample()
     logp_label = label_dist.log_prob(label_idx)
