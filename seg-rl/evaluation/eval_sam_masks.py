@@ -254,12 +254,11 @@ def main() -> int:
             _update_metrics_file(sam_masks_dir, image_path, eff_num_prompts, metrics)
             processed += 1
             all_metrics.append(metrics)
-            print(
-                f"ok idx {i}: {Path(image_path).stem} prompts={eff_num_prompts} | "
-                f"DICE={metrics['DICE']:.4f} IOU={metrics['IOU']:.4f} "
-                f"P={metrics['PRECISION']:.4f} R={metrics['RECALL']:.4f} F1={metrics['F1']:.4f} "
+            msg = f"ok idx {i}: {Path(image_path).stem} prompts={eff_num_prompts} | " \
+                f"DICE={metrics['DICE']:.4f} IOU={metrics['IOU']:.4f} " \
+                f"P={metrics['PRECISION']:.4f} R={metrics['RECALL']:.4f} F1={metrics['F1']:.4f} " \
                 f"S={metrics['S_MEASURE']:.4f}"
-            )
+            print(f"\r{msg}", end="", flush=True)
         except Exception as e:
             print(f"[ERROR] idx {i}: failed to evaluate - {e}")
             errors += 1
