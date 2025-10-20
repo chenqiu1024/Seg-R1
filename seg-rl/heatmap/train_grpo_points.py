@@ -161,7 +161,7 @@ def _compute_metrics(gt: np.ndarray, pred: np.ndarray) -> Dict[str, float]:
     f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
 
     # lightweight S-measure surrogate (optional)
-    s_meas = float(0.0)
+    s_meas = float(0.0) ## FIXME: Do actual computing of S-measure
     return {
         "DICE": float(dice),
         "IOU": float(iou),

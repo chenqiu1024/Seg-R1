@@ -31,15 +31,25 @@ Modes:
 Examples:
   # Initial generation
   /opt/anaconda3/envs/seg-r1/bin/python -m seg-rl.heatmap.predict_next_point_from_model \
-    --model_path outputs/braintumour/points_predictor-251001-50epochs.pt \
+    --model_path outputs/braintumour/heatmap_train-251001-optimized/model_epoch_185.pt \
     --images_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/images \
     --masks_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/masks \
-    --output_json datasets/seg_r1_md/Task01_BrainTumour/pred_points-251001.jsonl
+    --output_json outputs/braintumour/pred_points-sft_e185-251018.jsonl
+
+  python -m seg-rl.heatmap.predict_next_point_from_model \
+    --model_path outputs/braintumour/points_predictor-251001-160epochs.pt \
+    --images_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/images \
+    --masks_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/masks \
+    --output_json outputs/braintumour/pred_points-e160-251019.jsonl
 
   # Append mode
   /opt/anaconda3/envs/seg-r1/bin/python -m seg-rl.heatmap.predict_next_point_from_model \
     --model_path outputs/braintumour/points_predictor-251001-160epochs.pt \
     --appendto_json datasets/seg_r1_md/Task01_BrainTumour/pred_points-251001.jsonl
+
+  python -m seg-rl.heatmap.predict_next_point_from_model \
+    --model_path outputs/braintumour/points_predictor-251001-160epochs.pt \
+    --appendto_json outputs/braintumour/pred_points-e160-251019.jsonl
 
   # Debug visualization only
   /opt/anaconda3/envs/seg-r1/bin/python -m seg-rl.heatmap.predict_next_point_from_model \

@@ -53,7 +53,25 @@
       --device cuda \
       --resize 512 512 \
       --skip_existing
-    
+
+    python seg-rl/sam2_segment_from_points.py \
+      --input_jsonl outputs/braintumour/pred_points-e160-251019.jsonl \
+      --json_output outputs/braintumour/pred_points-e160-251019.jsonl \
+      --output_dir outputs/braintumour/pred_masks-e160-251019 \
+      --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
+      --device cuda \
+      --resize 512 512 \
+      --skip_existing
+
+    python seg-rl/sam2_segment_from_points.py \
+      --input_jsonl outputs/braintumour/pred_points-sft_e185-251018.jsonl \
+      --json_output outputs/braintumour/pred_points-sft_e185-251018.jsonl \
+      --output_dir outputs/braintumour/pred_masks-sft_e185-251018 \
+      --sam_checkpoint /root/autodl-tmp/works/Seg-R0/third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
+      --device cuda \
+      --resize 512 512 \
+      --skip_existing
+ 
     /opt/anaconda3/envs/seg-r1/bin/python seg-rl/sam2_segment_from_points.py \
       --input_jsonl datasets/seg_r1_md/Task01_BrainTumour/pred_points-251001.jsonl \
       --json_output datasets/seg_r1_md/Task01_BrainTumour/pred_points-251001.jsonl \
