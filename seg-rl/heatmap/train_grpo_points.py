@@ -588,7 +588,7 @@ def train() -> None:
                     image_path = batch_recs[b]["image"]
                     for g in range(G):
                         rgb_t, g_t, (orig_h, orig_w) = _prepare_model_inputs(image_path, prev_masks[b][g], (args.height, args.width))
-                        logvs, label_logits = policy(rgb_t.to(device), g_t.to(device)) ###!!!
+                        logits, label_logits = policy(rgb_t.to(device), g_t.to(device)) ###!!!
                         with torch.no_grad():
                             logits_old, label_logits_old = old_policy(rgb_t.to(device), g_t.to(device))
                             logits_ref, label_logits_ref = ref_policy(rgb_t.to(device), g_t.to(device))
