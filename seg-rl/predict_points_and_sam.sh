@@ -1,5 +1,5 @@
 #!/bin/bash
-
+## Example: seg-rl/predict_points_and_sam.sh pred_251022 12 pretrained/points_predictor-251001-160epochs.pt cuda
 # Check if correct number of arguments are provided
 if [ $# -ne 4 ]; then
     echo "Usage: $0 <name_of_task> <length_points_sequence> <path_to_model> <device>"

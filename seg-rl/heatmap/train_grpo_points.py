@@ -26,13 +26,13 @@ Notes
 Examples (调用示例)
   1) 基本训练（使用已监督预训练权重作为初始化与参考网络）：
      /opt/anaconda3/envs/seg-r1/bin/python -m seg-rl.heatmap.train_grpo_points \
-       --train_json datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour-251003.jsonl \
+       --train_json datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour-251001.jsonl \
        --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
-       --out_dir outputs/braintumour/grpo-251015 \
-       --init_policy outputs/braintumour/points_predictor-251001-160epochs.pt \
-       --device mps \
+       --out_dir outputs/braintumour/grpo-251020 \
+       --init_policy pretrained/points_predictor-251001-160epochs.pt \
+       --device cuda \
        --height 512 --width 512 --stride 8 --max_points 16 \
-       --epochs 5 --batch_size 2 --group_size 4 --tb
+       --epochs 5 --batch_size 12 --group_size 4 --tb
 
   2) 在Apple Silicon上使用MPS并调整探索温度与KL权重：
      python -m seg-rl.heatmap.train_grpo_points \
@@ -73,6 +73,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+from torch import amp
 
 # Local imports (robust to module/script execution)
 try:
@@ -327,6 +328,18 @@ def _calc_kl_pixel_full(logits_p: torch.Tensor, logits_q: torch.Tensor) -> torch
     return (p * (logp - logq)).sum(dim=1)
 
 
+def _set_label_bn_eval(model: nn.Module) -> None:
+    """Force BatchNorm layers under label head to eval mode to support B=1.
+
+    This avoids BN training with N*H*W==1 (from AdaptiveAvgPool2d(1)) while keeping
+    the rest of the network in training mode. It does not change requires_grad.
+    Call this after any .train() call that might reset submodules.
+    """
+    for name, module in model.named_modules():
+        if "label_head" in name and isinstance(module, nn.BatchNorm2d):
+            module.eval()
+
+
 def _save_checkpoint(path: str, model: nn.Module, optim: torch.optim.Optimizer, epoch: int, step: int, args: GRPOArgs, ref_sd: Dict[str, Any]) -> None:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     torch.save({
@@ -520,6 +533,9 @@ def train() -> None:
             writer = None
 
     policy.train()
+    _set_label_bn_eval(policy)
+    use_cuda_amp = (device.type == "cuda")
+    scaler = amp.GradScaler("cuda" if use_cuda_amp else "cpu", enabled=use_cuda_amp)
 
     def log_scalar(name: str, val: float, step: int) -> None:
         print(f"{name}={val:.6f} @ {step}")
@@ -573,6 +589,9 @@ def train() -> None:
                 gt_cache.append(gt_bool)
                 rgb_cache.append(rgb)
 
+            # clear grads before accumulating per-time-step backward
+            optim.zero_grad(set_to_none=True)
+
             for t in range(max_T):
                 # collect metrics at t-1 to compute reward increment
                 prev_score = torch.zeros(B, G, device=device)
@@ -594,10 +613,13 @@ def train() -> None:
                     image_path = batch_recs[b]["image"]
                     for g in range(G):
                         rgb_t, g_t, (orig_h, orig_w) = _prepare_model_inputs(image_path, prev_masks[b][g], (args.height, args.width))
-                        logits, label_logits = policy(rgb_t.to(device), g_t.to(device)) ###!!!
-                        with torch.no_grad():
-                            logits_old, label_logits_old = old_policy(rgb_t.to(device), g_t.to(device))
-                            logits_ref, label_logits_ref = ref_policy(rgb_t.to(device), g_t.to(device))
+                        with amp.autocast("cuda", enabled=use_cuda_amp):
+                            logits, label_logits = policy(rgb_t.to(device), g_t.to(device)) ###!!!
+                        # old/ref in inference + autocast to save memory
+                        with torch.inference_mode():
+                            with amp.autocast("cuda", enabled=use_cuda_amp):
+                                logits_old, label_logits_old = old_policy(rgb_t.to(device), g_t.to(device))
+                                logits_ref, label_logits_ref = ref_policy(rgb_t.to(device), g_t.to(device))
 
                         # sample action
                         act = sample_joint_label_cell_offset(
@@ -655,6 +677,20 @@ def train() -> None:
                         cur = _metric_value(m_now, args.metric)
                         rewards_t[t][b, g] = torch.tensor(cur, device=device) - prev_score[b, g]
 
+                # per-time-step PPO objective and backward to avoid holding graphs for all T
+                r = rewards_t[t]  # [B,G]
+                mean = r.mean(dim=1, keepdim=True)
+                std = r.std(dim=1, keepdim=True)
+                adv = (r - mean) / (std + 1e-4)  # [B,G]
+                ratio = torch.exp(logp_t[t] - old_logp_t[t])  # [B,G]
+                unclipped = ratio * adv
+                clipped = torch.clamp(ratio, 1.0 - args.clip_eps, 1.0 + args.clip_eps) * adv
+                obj = torch.minimum(unclipped, clipped)  # [B,G]
+                obj = obj - kl_t[t].unsqueeze(1)
+                loss_t = -obj.mean()
+
+                scaler.scale(loss_t).backward()
+
             # Compute group-relative advantages per time-step
             losses = []
             for t in range(max_T):
@@ -673,19 +709,17 @@ def train() -> None:
                 loss_t = -obj.mean()
                 losses.append(loss_t)
 
-            loss = torch.stack(losses).mean()
-
-            optim.zero_grad(set_to_none=True)
-            loss.backward()
+            # optimizer step with AMP
+            scaler.unscale_(optim)
             torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
-            optim.step()
+            scaler.step(optim)
+            scaler.update()
 
             global_step += 1
-            log_scalar("train/loss", float(loss.item()), global_step)
-            if global_step % 10 == 0:
-                # log average reward and advantage stats
-                avg_r = torch.stack([r.mean() for r in rewards_t]).mean().item()
-                log_scalar("train/avg_reward", float(avg_r), global_step)
+            # Note: per-step loss already backpropagated; for logging compute average loss proxy
+            avg_r = torch.stack([r.mean() for r in rewards_t]).mean().item()
+            log_scalar("train/avg_reward", float(avg_r), global_step)
+            # optional: additional logs every 10 steps can be added here
 
             if args.save_every > 0 and (global_step % args.save_every == 0):
                 ckpt_path = os.path.join(args.out_dir, f"ckpt_step{global_step}.pt")
@@ -694,6 +728,8 @@ def train() -> None:
 
             if args.val_every > 0 and (global_step % args.val_every == 0):
                 val = validate(policy, val_ds, env, device, args, max_items=args_ns.max_val_items)
+                # validate() ends with model.train(); re-freeze BN in label head to avoid B=1 BN error
+                _set_label_bn_eval(policy)
                 log_scalar("val/metric", val.get("VAL_METRIC", 0.0), global_step)
 
         # end epoch
