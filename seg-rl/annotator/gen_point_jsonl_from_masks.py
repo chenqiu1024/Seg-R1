@@ -30,8 +30,10 @@ Example usage:
     --appendto_jsonl datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour-251003.jsonl
 
   # 3) 调试模式（生成调试图像）
+  # 若 sam2_segment_from_points.py 已生成 heatmap-{i}.png，本脚本会在调试图中追加第4幅：
+  # “概率热力图 + 当前提示点”，用于核对提示点与热区的一致性。
   /opt/anaconda3/envs/seg-r1/bin/python seg-rl/annotator/gen_point_jsonl_from_masks.py \
-    --debug_json datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour-1.jsonl \
+    --debug_json outputs/braintumour/pred_251023.jsonl \
     --debug_output_dir outputs/braintumour/dbg_gen_points
 
 Notes:
@@ -301,6 +303,7 @@ def _render_diff_panels_with_point(
     dbg_out_path: Optional[str],
     connectivity: int = 2,
     base_image_bgr: Optional[np.ndarray] = None,
+    heatmap_rgb: Optional[np.ndarray] = None,
 ) -> None:
     """Render 3-panel debug image reusing the visualization style in
     largest_diff_component_representative, but mark a provided point instead of
@@ -308,6 +311,7 @@ def _render_diff_panels_with_point(
     - Panel 1: A (green) vs B (red) overlay
     - Panel 2: signed diff C (positive green, negative red)
     - Panel 3: connected components colored, with marker at point_xy
+    - Panel 4 (optional): probability heatmap (RGB) + current point marker
     """
     rng = np.random.default_rng(12345)
     try:
@@ -483,6 +487,20 @@ def _render_diff_panels_with_point(
         except Exception:
             pass
 
+        # Panel 4: probability heatmap + point (若提供 heatmap_rgb)
+        if heatmap_rgb is not None:
+            hm = heatmap_rgb
+            if hm.ndim == 2:
+                hm = cv2.cvtColor(hm, cv2.COLOR_GRAY2BGR)
+            if hm.shape[:2] != (h, w):
+                hm = cv2.resize(hm, (w, h), interpolation=cv2.INTER_LINEAR)
+            panel4 = hm.copy()
+            # draw current point on heatmap
+            if int(label) > 0:
+                _draw_caret(panel4, cx, cy, size=6, color=(255,255,255), thickness=2)
+            else:
+                _draw_cross(panel4, cx, cy, size=6, color=(255,255,255), thickness=2)
+
         # Titles
         def _add_title(img: np.ndarray, text: str) -> None:
             band_h = max(20, min(48, img.shape[0] // 20))
@@ -510,8 +528,13 @@ def _render_diff_panels_with_point(
         _add_title(panel1, "Overlay A (green) vs B (red)")
         _add_title(panel2, "Signed diff C: + (green), - (red)")
         _add_title(panel3, "Components + selected point")
+        if heatmap_rgb is not None:
+            _add_title(panel4, "Probability heatmap + selected point")
 
-        canvas = np.concatenate([panel1, panel2, panel3], axis=1)
+        panels = [panel1, panel2, panel3]
+        if heatmap_rgb is not None:
+            panels.append(panel4)
+        canvas = np.concatenate(panels, axis=1)
         os.makedirs(os.path.dirname(dbg_out_path) or ".", exist_ok=True)
         _PIL.fromarray(canvas[..., ::-1]).save(dbg_out_path)
     except Exception:
@@ -638,6 +661,15 @@ def main() -> None:
                 base_img_bgr = img_arr[:, :, ::-1]
             except Exception:
                 base_img_bgr = None
+            # Load heatmap-{i}.png if exists
+            heatmap_rgb = None
+            try:
+                hm_path = os.path.join(sam_masks_dir, sample_stem, f"heatmap-{i}.png")
+                if os.path.isfile(hm_path):
+                    hm = np.array(_PIL.open(to_abs(hm_path)).convert("RGB"))
+                    heatmap_rgb = hm[:, :, ::-1]  # to BGR
+            except Exception:
+                heatmap_rgb = None
             # Load gt as all-zero array to preserve panel structure; we visualize differences of predicted masks only
             for i, (pt, lb) in enumerate(zip(points, labels)):
                 # For step i, compare masks of ground truth and step i-1 (i==0 uses empty prev)
@@ -658,6 +690,7 @@ def main() -> None:
                     int(lb),
                     dbg_path,
                     base_image_bgr=base_img_bgr,
+                    heatmap_rgb=heatmap_rgb,
                 )
                 num_generated += 1
         print(f"Generated debug images for {num_generated} steps into {args.debug_output_dir}")

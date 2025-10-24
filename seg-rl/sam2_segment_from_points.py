@@ -510,9 +510,68 @@ def main():
         # 检查是否跳过已存在的文件
         mask_existed = os.path.isfile(output_path)
         if args.skip_existing and mask_existed:
+            # 若请求生成热力图且当前步的 heatmap 不存在，仍然补齐保存 heatmap-{k}.png
+            try:
+                if hm_model is not None:
+                    k = get_mask_index_from_points(points)
+                    hm_out_path = os.path.join(get_mask_dir_for_image(image_path, args.output_dir), f"heatmap-{k}.png")
+                    if not os.path.isfile(hm_out_path):
+                        # 载入图像与尺寸（与常规路径一致）
+                        image = PILImage.open(to_abs(image_path)).convert("RGB")
+                        orig_w, orig_h = image.size
+                        if args.resize:
+                            resize_w, resize_h = int(args.resize[0]), int(args.resize[1])
+                            image_for_pred = image.resize((resize_w, resize_h), PILImage.BILINEAR)
+                            points_resized = [(px * (resize_w / float(orig_w)), py * (resize_h / float(orig_h))) for (px, py) in points]
+                        else:
+                            image_for_pred = image
+                            points_resized = points
+
+                        # 选择热力图推理尺寸
+                        if args.heatmap_size is not None:
+                            hm_w, hm_h = int(args.heatmap_size[0]), int(args.heatmap_size[1])
+                        elif args.resize is not None:
+                            hm_w, hm_h = int(args.resize[0]), int(args.resize[1])
+                        else:
+                            hm_w, hm_h = orig_w, orig_h
+
+                        # 构造上一时刻掩膜
+                        if k <= 0:
+                            prev_gray_pil = PILImage.new("L", (hm_w, hm_h), 0)
+                        else:
+                            prev_path = os.path.join(get_mask_dir_for_image(image_path, args.output_dir), f"{k-1}.png")
+                            if os.path.isfile(prev_path):
+                                prev_gray_pil = PILImage.open(prev_path).convert("L").resize((hm_w, hm_h), PILImage.NEAREST)
+                            else:
+                                prev_pts = points_resized[:-1]
+                                prev_labs = labels[:-1] if labels else None
+                                prev_mask_np, _ = sam_wrapper.predict(
+                                    image_for_pred.resize((hm_w, hm_h), PILImage.BILINEAR), prev_pts, prev_labs
+                                )
+                                prev_gray_pil = PILImage.fromarray((prev_mask_np.astype(np.uint8) * 255), mode="L")
+
+                        # 模型前处理与推理
+                        from torchvision.transforms import functional as TF  # type: ignore
+                        rgb_for_hm = image.resize((hm_w, hm_h), PILImage.BILINEAR)
+                        rgb_t = TF.to_tensor(rgb_for_hm)
+                        rgb_t = TF.normalize(rgb_t, mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)).unsqueeze(0)
+                        g_t = TF.to_tensor(prev_gray_pil)
+                        g_t = ((g_t - 0.5) / 0.5).unsqueeze(0)
+                        with torch.no_grad():
+                            logits, _ = hm_model(rgb_t.to(hm_device), g_t.to(hm_device))
+                            b, c, Hh, Wh = logits.shape
+                            p = _F.softmax(logits.view(b, -1) / max(float(args.heatmap_tau), 1e-6), dim=1)
+                            prob = p.view(Hh, Wh).detach().cpu().float().numpy()
+                        hm_img = _heatmap_to_pil(prob)
+                        if (hm_w, hm_h) != (orig_w, orig_h):
+                            hm_img = hm_img.resize((orig_w, orig_h), PILImage.BILINEAR)
+                        os.makedirs(os.path.dirname(hm_out_path), exist_ok=True)
+                        hm_img.save(hm_out_path)
+            except Exception as _:
+                pass
+
             _print_progress(num_processed, num_skipped + 1, num_errors,
                             f"skip line {line_num}: {Path(output_path).name} exists")
-            # 此分支无现成bbox，且不应为不存在的日志补写空记录
             num_skipped += 1
             continue
 
