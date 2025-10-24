@@ -501,6 +501,18 @@ def _render_diff_panels_with_point(
             else:
                 _draw_cross(panel4, cx, cy, size=6, color=(255,255,255), thickness=2)
 
+            # Optional overlay for context: blend grayscale base image under the heatmap
+            if base_image_bgr is not None:
+                base = base_image_bgr
+                if base.ndim == 2:
+                    base = cv2.cvtColor(base, cv2.COLOR_GRAY2BGR)
+                if base.shape[:2] != (h, w):
+                    base = cv2.resize(base, (w, h), interpolation=cv2.INTER_LINEAR)
+                gray = cv2.cvtColor(base, cv2.COLOR_BGR2GRAY)
+                base_gray_bgr = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+                alpha = 0.5
+                panel4 = cv2.addWeighted(base_gray_bgr, 1.0 - alpha, panel4, alpha, 0.0)
+
         # Titles
         def _add_title(img: np.ndarray, text: str) -> None:
             band_h = max(20, min(48, img.shape[0] // 20))
@@ -661,15 +673,7 @@ def main() -> None:
                 base_img_bgr = img_arr[:, :, ::-1]
             except Exception:
                 base_img_bgr = None
-            # Load heatmap-{i}.png if exists
-            heatmap_rgb = None
-            try:
-                hm_path = os.path.join(sam_masks_dir, sample_stem, f"heatmap-{i}.png")
-                if os.path.isfile(hm_path):
-                    hm = np.array(_PIL.open(to_abs(hm_path)).convert("RGB"))
-                    heatmap_rgb = hm[:, :, ::-1]  # to BGR
-            except Exception:
-                heatmap_rgb = None
+            # heatmap will be loaded per-step inside the loop (fix: previously attempted before loop)
             # Load gt as all-zero array to preserve panel structure; we visualize differences of predicted masks only
             for i, (pt, lb) in enumerate(zip(points, labels)):
                 # For step i, compare masks of ground truth and step i-1 (i==0 uses empty prev)
@@ -681,6 +685,21 @@ def main() -> None:
                         prev = np.array(_PIL.open(to_abs(prev_path)).convert("L"), dtype=np.uint8) if os.path.isfile(prev_path) else np.zeros_like(gt_mask_u8, dtype=np.uint8)
                     except Exception:
                         prev = np.zeros_like(gt_mask_u8, dtype=np.uint8)
+                # Load heatmap for this step: prefer heatmap-{i}.png; fallback to heatmap-{i-1}.png if missing
+                heatmap_rgb = None
+                try:
+                    hm_dir = os.path.join(sam_masks_dir, sample_stem)
+                    cand = [f"heatmap-{i}.png"]
+                    if i - 1 >= 0:
+                        cand.append(f"heatmap-{i-1}.png")
+                    for name in cand:
+                        hm_path = os.path.join(hm_dir, name)
+                        if os.path.isfile(hm_path):
+                            hm = np.array(_PIL.open(to_abs(hm_path)).convert("RGB"))
+                            heatmap_rgb = hm[:, :, ::-1]  # to BGR
+                            break
+                except Exception:
+                    heatmap_rgb = None
                 # Render panels with provided point
                 dbg_path = os.path.join(subdir, f"dbg_{i}.png")
                 _render_diff_panels_with_point(

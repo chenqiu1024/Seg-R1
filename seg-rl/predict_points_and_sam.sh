@@ -92,7 +92,10 @@ if [ "$SKIP_FIRST" -eq 0 ]; then
         --model_path $path_to_model \
         --images_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/images \
         --masks_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/masks \
-        --output_json $JSONL_FILE
+        --output_json $JSONL_FILE \
+        --sam_dir $SAM_MASKS_DIR \
+        --output_dir $SAM_MASKS_DIR \
+        --height 512 --width 512 --tau 1.0
 
     $PYTHON_PATH seg-rl/sam2_segment_from_points.py \
         --input_jsonl $JSONL_FILE \
@@ -101,10 +104,10 @@ if [ "$SKIP_FIRST" -eq 0 ]; then
         --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
         --device $device \
         --resize 512 512 \
-        --skip_existing \
-        --heatmap_model $path_to_model \
-        --heatmap_tau 1.0 \
-        --heatmap_size 512 512
+        --skip_existing 
+        # --heatmap_model $path_to_model \
+        # --heatmap_tau 1.0 \
+        # --heatmap_size 512 512
 
     $PYTHON_PATH seg-rl/evaluation/eval_sam_masks.py --input_json $JSONL_FILE --num_prompts 1
 else
@@ -118,7 +121,9 @@ for i in $(seq 1 $((n_points - 1))); do
     $PYTHON_PATH -m seg-rl.heatmap.predict_next_point_from_model \
         --model_path $path_to_model \
         --appendto_json $JSONL_FILE \
-        --sam_dir $SAM_MASKS_DIR 
+        --sam_dir $SAM_MASKS_DIR \
+        # --output_dir $SAM_MASKS_DIR \
+        --height 512 --width 512 --tau 1.0
     
     $PYTHON_PATH seg-rl/sam2_segment_from_points.py \
       --input_jsonl $JSONL_FILE \

@@ -78,6 +78,7 @@ import torch.nn.functional as F
 try:
     # package context
     from .model import ModelConfig, PointHeatmapModel, soft_argmax_from_logits
+    from .utils import heatmap_to_pil
 except Exception:
     # script context
     import sys as _sys
@@ -86,6 +87,7 @@ except Exception:
     if _pkg_root not in _sys.path:
         _sys.path.insert(0, _pkg_root)
     from heatmap.model import ModelConfig, PointHeatmapModel, soft_argmax_from_logits
+    from heatmap.utils import heatmap_to_pil
 
 import importlib.util as _importlib_util
 
@@ -132,6 +134,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--amp", action="store_true")
     p.add_argument("--progress", action="store_true")
     p.add_argument("--debug_output_dir", type=str, default=None)
+    # Save probability heatmaps alongside SAM masks: {output_dir}/{stem}/heatmap-{i}.png
+    p.add_argument("--output_dir", type=str, default=None, help="Directory to save per-step heatmaps (under {stem}/heatmap-{i}.png)")
     return p.parse_args()
 
 
@@ -180,12 +184,31 @@ def _to_tensor_separate(image_path: str, gray_mask: Optional[Image.Image], out_h
     return rgb_t.unsqueeze(0), g_t.unsqueeze(0), (orig_h, orig_w)  # [1,3,H,W], [1,1,H,W], (orig_h,orig_w)
 
 
-def _predict_point(model: PointHeatmapModel, rgb_tensor: torch.Tensor, gray_tensor: torch.Tensor, device: torch.device, tau: float) -> Tuple[float, float, int]:
+def _predict_point(model: PointHeatmapModel, rgb_tensor: torch.Tensor, gray_tensor: torch.Tensor, device: torch.device, tau: float) -> Tuple[float, float, int, np.ndarray]:
     with torch.no_grad():
         logits, label_logits = model(rgb_tensor.to(device), gray_tensor.to(device))
         xy = soft_argmax_from_logits(logits, temperature=tau)[0]
         lab = int(label_logits.argmax(dim=1).item())
-    return float(xy[0].item()), float(xy[1].item()), lab
+        # probability heatmap for saving: softmax over pixels
+        b, _, H, W = logits.shape
+        p = F.softmax(logits.view(b, -1) / max(float(tau), 1e-6), dim=1).view(b, 1, H, W)
+        prob = p[0, 0].detach().cpu().float().numpy()
+    return float(xy[0].item()), float(xy[1].item()), lab, prob
+
+
+def _save_heatmap_image(prob: np.ndarray, out_dir: Optional[str], stem: str, step_idx: int, orig_w: int, orig_h: int) -> None:
+    if not out_dir:
+        return
+    try:
+        hm_img = heatmap_to_pil(prob)
+        if hm_img.size != (orig_w, orig_h):
+            hm_img = hm_img.resize((orig_w, orig_h), Image.BILINEAR)
+        subdir = os.path.join(out_dir, stem)
+        os.makedirs(subdir, exist_ok=True)
+        out_path = os.path.join(subdir, f"heatmap-{step_idx}.png")
+        hm_img.save(out_path)
+    except Exception:
+        pass
 
 
 def _list_images(images_dir: str) -> List[str]:
@@ -229,7 +252,7 @@ def run_initial(args: argparse.Namespace) -> None:
     for img_path in images_iter:
         rgb_tensor, gray_tensor, (orig_h, orig_w) = _to_tensor_separate(img_path, gray_mask=None, out_hw=(H, W))
         with torch.amp.autocast(device_type=autocast_device_type, enabled=amp_enabled):
-            x, y, lab = _predict_point(model, rgb_tensor, gray_tensor, device, args.tau)
+            x, y, lab, prob = _predict_point(model, rgb_tensor, gray_tensor, device, args.tau)
         # scale back to native size if resized
         inf_H, inf_W = rgb_tensor.shape[-2], rgb_tensor.shape[-1]
         if (inf_W, inf_H) != (orig_w, orig_h):
@@ -241,6 +264,8 @@ def run_initial(args: argparse.Namespace) -> None:
         x = float(max(0.0, min(orig_w - 1.0, x)))
         y = float(max(0.0, min(orig_h - 1.0, y)))
         stem = _stem(img_path)
+        # save heatmap for step 0
+        _save_heatmap_image(prob, args.output_dir or args.sam_dir, stem, 0, orig_w, orig_h)
         gt_mask_path = os.path.join(args.masks_dir, f"{stem}.png")
         rec = {
             "image": os.path.abspath(img_path),
@@ -301,7 +326,7 @@ def run_append(args: argparse.Namespace) -> None:
             gray = Image.open(prev_path).convert("L") if os.path.isfile(prev_path) else None
         rgb_tensor, gray_tensor, (orig_h, orig_w) = _to_tensor_separate(img_path, gray_mask=gray, out_hw=(H, W))
         with torch.amp.autocast(device_type=autocast_device_type, enabled=amp_enabled):
-            x, y, lab = _predict_point(model, rgb_tensor, gray_tensor, device, args.tau)
+            x, y, lab, prob = _predict_point(model, rgb_tensor, gray_tensor, device, args.tau)
         # scale back and clamp
         inf_H, inf_W = rgb_tensor.shape[-2], rgb_tensor.shape[-1]
         if (inf_W, inf_H) != (orig_w, orig_h):
@@ -311,6 +336,10 @@ def run_append(args: argparse.Namespace) -> None:
             y = y * scale_y
         x = float(max(0.0, min(orig_w - 1.0, x)))
         y = float(max(0.0, min(orig_h - 1.0, y)))
+        # Save heatmap for next step k = len(pts)
+        stem = _stem(img_path)
+        step_k = len(pts)
+        _save_heatmap_image(prob, args.output_dir or sam_dir, stem, step_k, orig_w, orig_h)
         rec["points"] = (pts or []) + [[x, y]]
         rec["labels"] = (labs or []) + [int(lab)]
         # sam_masks_dir should be set by external segmenter; do not inject here
