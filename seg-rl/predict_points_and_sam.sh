@@ -101,7 +101,10 @@ if [ "$SKIP_FIRST" -eq 0 ]; then
         --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
         --device $device \
         --resize 512 512 \
-        --skip_existing
+        --skip_existing \
+        --heatmap_model $path_to_model \
+        --heatmap_tau 1.0 \
+        --heatmap_size 512 512
 
     $PYTHON_PATH seg-rl/evaluation/eval_sam_masks.py --input_json $JSONL_FILE --num_prompts 1
 else
@@ -124,7 +127,10 @@ for i in $(seq 1 $((n_points - 1))); do
       --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
       --device $device \
       --resize 512 512 \
-      --skip_existing
+      --skip_existing \
+      --heatmap_model $path_to_model \
+      --heatmap_tau 1.0 \
+      --heatmap_size 512 512
 
     $PYTHON_PATH seg-rl/evaluation/eval_sam_masks.py --input_json $JSONL_FILE --num_prompts $((i+1))
 done

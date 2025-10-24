@@ -98,6 +98,16 @@ import numpy as np
 import torch
 from PIL import Image as PILImage
 
+# 导入热力图点预测模型与可视化工具（用于生成 heatmap-{i}.png）
+try:
+    from heatmap.model import ModelConfig as _HMModelConfig, PointHeatmapModel as _PointHeatmapModel  # type: ignore
+    import torch.nn.functional as _F  # type: ignore
+    from heatmap.utils import heatmap_to_pil as _heatmap_to_pil  # type: ignore
+    _HEATMAP_AVAILABLE = True
+except Exception:
+    # 若用户未提供热力图权重或未安装依赖，则仅跳过热力图生成功能
+    _HEATMAP_AVAILABLE = False
+
 # 添加sam2路径
 sys.path.append(str(Path(__file__).parent.parent / "third_party" / "sam2"))
 
@@ -383,6 +393,13 @@ def parse_args() -> argparse.Namespace:
                    help="Resize input images to specified size [width height]")
     p.add_argument("--json_output", type=str, default=None,
                    help="Path to write the copied input JSON array with added 'sam_masks_dir'")
+    # 额外：生成提示点概率热力图（heatmap-{i}.png）相关参数
+    p.add_argument("--heatmap_model", type=str, default=None,
+                   help="Path to heatmap predictor checkpoint (.pt); if set, also save heatmap-{i}.png")
+    p.add_argument("--heatmap_tau", type=float, default=1.0,
+                   help="Softmax temperature for probability heatmap generation")
+    p.add_argument("--heatmap_size", type=int, nargs=2, default=None, metavar=("WIDTH", "HEIGHT"),
+                   help="Inference size [width height] for heatmap model; default = use --resize or native size")
     return p.parse_args()
 
 
@@ -414,6 +431,22 @@ def main():
         print(f"Error initializing SAM2: {e}")
         return 1
     
+    # 可选：初始化热力图点预测模型
+    hm_model = None
+    hm_device = torch.device("cuda" if torch.cuda.is_available() else "cpu") if (args.device is None) else torch.device(args.device)
+    if _HEATMAP_AVAILABLE and args.heatmap_model:
+        try:
+            cfg = _HMModelConfig(backbone="unet_s", pretrained=False, main_in_channels=3, cond_in_channels=1)
+            hm_model = _PointHeatmapModel(cfg).to(hm_device)
+            ckpt = torch.load(to_abs(args.heatmap_model), map_location="cpu")
+            sd = ckpt.get("model", ckpt)
+            hm_model.load_state_dict(sd, strict=False)
+            hm_model.eval()
+            print(f"Heatmap model loaded: {to_abs(args.heatmap_model)}")
+        except Exception as e:
+            print(f"[WARN] Failed to load heatmap model: {e}. Skip heatmap generation.")
+            hm_model = None
+
     # 读取输入（优先按JSON数组解析；失败则按JSONL逐行解析）
     print(f"Processing input: {to_abs(args.input_jsonl)}")
     
@@ -521,6 +554,65 @@ def main():
                 append_state_log(args.output_dir, image_path, (x_min, y_min, x_max, y_max))
             except Exception as e:
                 print(f"[WARN] Failed to append state log for {image_path}: {e}")
+
+            # 可选：生成并保存提示点概率热力图 heatmap-{k}.png
+            # 语义：对于第 i 步（k=i），热力图来源于“图像 + 上一步的预测掩膜（i-1步；若i=0则为全零掩膜）”。
+            if hm_model is not None:
+                try:
+                    # 选择热力图推理尺寸（优先 heatmap_size，其次使用 --resize，最后使用原始尺寸）
+                    if args.heatmap_size is not None:
+                        hm_w, hm_h = int(args.heatmap_size[0]), int(args.heatmap_size[1])
+                    elif args.resize is not None:
+                        hm_w, hm_h = int(args.resize[0]), int(args.resize[1])
+                    else:
+                        hm_w, hm_h = orig_w, orig_h
+
+                    # 构造“上一时刻”的灰度掩膜（若 i>0 且存在文件，则直接读；否则为了稳健性直接用上一时刻的SAM预测）
+                    k = get_mask_index_from_points(points)
+                    prev_gray_pil: Optional[PILImage.Image]
+                    if k <= 0:
+                        prev_gray_pil = PILImage.new("L", (hm_w, hm_h), 0)
+                    else:
+                        mask_dir = get_mask_dir_for_image(image_path, args.output_dir)
+                        prev_path = os.path.join(mask_dir, f"{k-1}.png")
+                        if os.path.isfile(prev_path):
+                            prev_gray_pil = PILImage.open(prev_path).convert("L").resize((hm_w, hm_h), PILImage.NEAREST)
+                        else:
+                            # 若上一步掩膜文件缺失，则用上一时刻点再次运行一次SAM以得到上一时刻掩膜
+                            prev_pts = points_resized[:-1]
+                            prev_labs = labels[:-1] if labels else None
+                            prev_mask_np, _ = sam_wrapper.predict(
+                                image_for_pred.resize((hm_w, hm_h), PILImage.BILINEAR), prev_pts, prev_labs
+                            )
+                            prev_gray = (prev_mask_np.astype(np.uint8) * 255)
+                            prev_gray_pil = PILImage.fromarray(prev_gray, mode="L")
+
+                    # 构造模型输入张量：RGB 与 灰度条件（范围与归一化与训练一致）
+                    # 注意：这里独立于 SAM2 的 resize，确保热力图与指定 hm_w/h 对齐
+                    from torchvision.transforms import functional as TF  # type: ignore
+                    rgb_for_hm = image.resize((hm_w, hm_h), PILImage.BILINEAR)
+                    rgb_t = TF.to_tensor(rgb_for_hm)
+                    rgb_t = TF.normalize(rgb_t, mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)).unsqueeze(0)
+                    gray_pil = prev_gray_pil if prev_gray_pil is not None else PILImage.new("L", (hm_w, hm_h), 0)
+                    g_t = TF.to_tensor(gray_pil)
+                    g_t = ((g_t - 0.5) / 0.5).unsqueeze(0)
+
+                    with torch.no_grad():
+                        logits, _ = hm_model(rgb_t.to(hm_device), g_t.to(hm_device))  # [1,1,H,W]
+                        # 将 logits 转为概率热力图（按像素 softmax），与训练/可视化一致
+                        b, c, Hh, Wh = logits.shape
+                        p = _F.softmax(logits.view(b, -1) / max(float(args.heatmap_tau), 1e-6), dim=1)
+                        prob = p.view(Hh, Wh).detach().cpu().float().numpy()
+
+                    # 映射为彩色图并按原图尺寸保存，便于与 {k}.png 对齐查看
+                    hm_img = _heatmap_to_pil(prob)
+                    if (hm_w, hm_h) != (orig_w, orig_h):
+                        hm_img = hm_img.resize((orig_w, orig_h), PILImage.BILINEAR)
+                    heatmap_path = os.path.join(get_mask_dir_for_image(image_path, args.output_dir), f"heatmap-{k}.png")
+                    os.makedirs(os.path.dirname(heatmap_path), exist_ok=True)
+                    hm_img.save(heatmap_path)
+                except Exception as e:
+                    print(f"[WARN] Failed to save heatmap for {image_path}: {e}")
 
             _print_progress(num_processed + 1, num_skipped, num_errors,
                             f"ok line {line_num}: {Path(output_path).name} conf={confidence:.3f}")
