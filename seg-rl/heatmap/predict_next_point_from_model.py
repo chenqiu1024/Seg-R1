@@ -131,6 +131,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--height", type=int, default=0, help="0 = use native image height")
     p.add_argument("--width", type=int, default=0, help="0 = use native image width")
     p.add_argument("--tau", type=float, default=1.0, help="Softmax temperature for heatmap -> probability")
+    # Coordinate/label selection strategy
+    p.add_argument(
+        "--coord_label_mode",
+        type=str,
+        choices=["decoupled", "argmax", "two_map"],
+        default="decoupled",
+        help=(
+            "How to pick (x,y,label): decoupled = current default (soft-argmax coords + label head argmax); "
+            "argmax = hard argmax coords + label head argmax; two_map = derive foreground/background maps from heatmap "
+            "(p_fg = softmax(logits/tau), p_bg = 1 - p_fg), pick global maximum over 2xHxW to jointly decide label and pixel."
+        ),
+    )
     p.add_argument("--amp", action="store_true")
     p.add_argument("--progress", action="store_true")
     p.add_argument("--debug_output_dir", type=str, default=None)
@@ -184,19 +196,52 @@ def _to_tensor_separate(image_path: str, gray_mask: Optional[Image.Image], out_h
     return rgb_t.unsqueeze(0), g_t.unsqueeze(0), (orig_h, orig_w)  # [1,3,H,W], [1,1,H,W], (orig_h,orig_w)
 
 
-def _predict_point(model: PointHeatmapModel, rgb_tensor: torch.Tensor, gray_tensor: torch.Tensor, device: torch.device, tau: float) -> Tuple[float, float, int, np.ndarray]:
+def _predict_point(model: PointHeatmapModel, rgb_tensor: torch.Tensor, gray_tensor: torch.Tensor, device: torch.device, tau: float, coord_label_mode: str) -> Tuple[float, float, int, np.ndarray]:
     with torch.no_grad():
         logits, label_logits = model(rgb_tensor.to(device), gray_tensor.to(device))
-        xy = soft_argmax_from_logits(logits, temperature=tau)[0]
-        lab = int(label_logits.argmax(dim=1).item())
         # probability heatmap for saving: softmax over pixels
         b, _, H, W = logits.shape
-        p = F.softmax(logits.view(b, -1) / max(float(tau), 1e-6), dim=1).view(b, 1, H, W)
+        T = max(float(tau), 1e-6)
+        p = F.softmax(logits.view(b, -1) / T, dim=1).view(b, 1, H, W)
+
+        if coord_label_mode == "decoupled":
+            xy = soft_argmax_from_logits(logits, temperature=tau)[0]
+            lab = int(label_logits.argmax(dim=1).item())
+        elif coord_label_mode == "argmax":
+            # Hard argmax over pixels for coordinates
+            idx = logits.view(b, -1).argmax(dim=1)
+            y = (idx // W).to(torch.float32)
+            x = (idx % W).to(torch.float32)
+            xy = torch.stack([x, y], dim=1)[0]
+            lab = int(label_logits.argmax(dim=1).item())
+        elif coord_label_mode == "two_map":
+            # Minimal heuristic: build two maps p_fg = p, p_bg = 1 - p; pick global maximum over both
+            p_fg = p  # [B,1,H,W]
+            p_bg = 1.0 - p_fg
+            two_maps = torch.cat([p_fg, p_bg], dim=1)  # [B,2,H,W]
+            idx = two_maps.view(b, -1).argmax(dim=1)
+            # decode index -> label, y, x
+            per_map = H * W
+            lab_idx = (idx // per_map).to(torch.int64)
+            rem = (idx % per_map)
+            y = (rem // W).to(torch.float32)
+            x = (rem % W).to(torch.float32)
+            xy = torch.stack([x, y], dim=1)
+            lab = int(lab_idx.item())
+        else:
+            # fallback to default
+            xy = soft_argmax_from_logits(logits, temperature=tau)[0]
+            lab = int(label_logits.argmax(dim=1).item())
+
         prob = p[0, 0].detach().cpu().float().numpy()
-    return float(xy[0].item()), float(xy[1].item()), lab, prob
+        # Also return p_bg when two_map to allow caller to save both
+        prob_bg = None
+        if coord_label_mode == "two_map":
+            prob_bg = (1.0 - p)[0, 0].detach().cpu().float().numpy()
+    return float(xy[0].item()), float(xy[1].item()), lab, (prob if prob is not None else None), (prob_bg if prob_bg is not None else None)
 
 
-def _save_heatmap_image(prob: np.ndarray, out_dir: Optional[str], stem: str, step_idx: int, orig_w: int, orig_h: int) -> None:
+def _save_heatmap_image(prob: np.ndarray, out_dir: Optional[str], stem: str, step_idx: int, orig_w: int, orig_h: int, name_prefix: str = "heatmap") -> None:
     if not out_dir:
         return
     try:
@@ -205,7 +250,7 @@ def _save_heatmap_image(prob: np.ndarray, out_dir: Optional[str], stem: str, ste
             hm_img = hm_img.resize((orig_w, orig_h), Image.BILINEAR)
         subdir = os.path.join(out_dir, stem)
         os.makedirs(subdir, exist_ok=True)
-        out_path = os.path.join(subdir, f"heatmap-{step_idx}.png")
+        out_path = os.path.join(subdir, f"{name_prefix}-{step_idx}.png")
         hm_img.save(out_path)
     except Exception:
         pass
@@ -252,7 +297,7 @@ def run_initial(args: argparse.Namespace) -> None:
     for img_path in images_iter:
         rgb_tensor, gray_tensor, (orig_h, orig_w) = _to_tensor_separate(img_path, gray_mask=None, out_hw=(H, W))
         with torch.amp.autocast(device_type=autocast_device_type, enabled=amp_enabled):
-            x, y, lab, prob = _predict_point(model, rgb_tensor, gray_tensor, device, args.tau)
+            x, y, lab, prob_fg, prob_bg = _predict_point(model, rgb_tensor, gray_tensor, device, args.tau, args.coord_label_mode)
         # scale back to native size if resized
         inf_H, inf_W = rgb_tensor.shape[-2], rgb_tensor.shape[-1]
         if (inf_W, inf_H) != (orig_w, orig_h):
@@ -265,7 +310,12 @@ def run_initial(args: argparse.Namespace) -> None:
         y = float(max(0.0, min(orig_h - 1.0, y)))
         stem = _stem(img_path)
         # save heatmap for step 0
-        _save_heatmap_image(prob, args.output_dir or args.sam_dir, stem, 0, orig_w, orig_h)
+        # Save probability maps
+        if args.coord_label_mode == "two_map" and prob_bg is not None:
+            _save_heatmap_image(prob_fg, args.output_dir or args.sam_dir, stem, 0, orig_w, orig_h, name_prefix="p_fg")
+            _save_heatmap_image(prob_bg, args.output_dir or args.sam_dir, stem, 0, orig_w, orig_h, name_prefix="p_bg")
+        else:
+            _save_heatmap_image(prob_fg, args.output_dir or args.sam_dir, stem, 0, orig_w, orig_h, name_prefix="heatmap")
         gt_mask_path = os.path.join(args.masks_dir, f"{stem}.png")
         rec = {
             "image": os.path.abspath(img_path),
@@ -326,7 +376,7 @@ def run_append(args: argparse.Namespace) -> None:
             gray = Image.open(prev_path).convert("L") if os.path.isfile(prev_path) else None
         rgb_tensor, gray_tensor, (orig_h, orig_w) = _to_tensor_separate(img_path, gray_mask=gray, out_hw=(H, W))
         with torch.amp.autocast(device_type=autocast_device_type, enabled=amp_enabled):
-            x, y, lab, prob = _predict_point(model, rgb_tensor, gray_tensor, device, args.tau)
+            x, y, lab, prob_fg, prob_bg = _predict_point(model, rgb_tensor, gray_tensor, device, args.tau, args.coord_label_mode)
         # scale back and clamp
         inf_H, inf_W = rgb_tensor.shape[-2], rgb_tensor.shape[-1]
         if (inf_W, inf_H) != (orig_w, orig_h):
@@ -339,7 +389,11 @@ def run_append(args: argparse.Namespace) -> None:
         # Save heatmap for next step k = len(pts)
         stem = _stem(img_path)
         step_k = len(pts)
-        _save_heatmap_image(prob, args.output_dir or sam_dir, stem, step_k, orig_w, orig_h)
+        if args.coord_label_mode == "two_map" and prob_bg is not None:
+            _save_heatmap_image(prob_fg, args.output_dir or sam_dir, stem, step_k, orig_w, orig_h, name_prefix="p_fg")
+            _save_heatmap_image(prob_bg, args.output_dir or sam_dir, stem, step_k, orig_w, orig_h, name_prefix="p_bg")
+        else:
+            _save_heatmap_image(prob_fg, args.output_dir or sam_dir, stem, step_k, orig_w, orig_h, name_prefix="heatmap")
         rec["points"] = (pts or []) + [[x, y]]
         rec["labels"] = (labs or []) + [int(lab)]
         # sam_masks_dir should be set by external segmenter; do not inject here

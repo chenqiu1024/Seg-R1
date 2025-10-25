@@ -304,6 +304,8 @@ def _render_diff_panels_with_point(
     connectivity: int = 2,
     base_image_bgr: Optional[np.ndarray] = None,
     heatmap_rgb: Optional[np.ndarray] = None,
+    heatmap_fg_rgb: Optional[np.ndarray] = None,
+    heatmap_bg_rgb: Optional[np.ndarray] = None,
 ) -> None:
     """Render 3-panel debug image reusing the visualization style in
     largest_diff_component_representative, but mark a provided point instead of
@@ -487,21 +489,18 @@ def _render_diff_panels_with_point(
         except Exception:
             pass
 
-        # Panel 4: probability heatmap + point (若提供 heatmap_rgb)
-        if heatmap_rgb is not None:
-            hm = heatmap_rgb
+        # Helpers to build heatmap panels
+        def _make_hm_panel(hm_img: np.ndarray) -> np.ndarray:
+            hm = hm_img
             if hm.ndim == 2:
                 hm = cv2.cvtColor(hm, cv2.COLOR_GRAY2BGR)
             if hm.shape[:2] != (h, w):
                 hm = cv2.resize(hm, (w, h), interpolation=cv2.INTER_LINEAR)
-            panel4 = hm.copy()
-            # draw current point on heatmap
+            panel = hm.copy()
             if int(label) > 0:
-                _draw_caret(panel4, cx, cy, size=6, color=(255,255,255), thickness=2)
+                _draw_caret(panel, cx, cy, size=6, color=(255,255,255), thickness=2)
             else:
-                _draw_cross(panel4, cx, cy, size=6, color=(255,255,255), thickness=2)
-
-            # Optional overlay for context: blend grayscale base image under the heatmap
+                _draw_cross(panel, cx, cy, size=6, color=(255,255,255), thickness=2)
             if base_image_bgr is not None:
                 base = base_image_bgr
                 if base.ndim == 2:
@@ -511,7 +510,17 @@ def _render_diff_panels_with_point(
                 gray = cv2.cvtColor(base, cv2.COLOR_BGR2GRAY)
                 base_gray_bgr = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
                 alpha = 0.5
-                panel4 = cv2.addWeighted(base_gray_bgr, 1.0 - alpha, panel4, alpha, 0.0)
+                panel = cv2.addWeighted(base_gray_bgr, 1.0 - alpha, panel, alpha, 0.0)
+            return panel
+
+        panel4 = None
+        panel5 = None
+        # Prefer two maps when both provided
+        if heatmap_fg_rgb is not None and heatmap_bg_rgb is not None:
+            panel4 = _make_hm_panel(heatmap_fg_rgb)
+            panel5 = _make_hm_panel(heatmap_bg_rgb)
+        elif heatmap_rgb is not None:
+            panel4 = _make_hm_panel(heatmap_rgb)
 
         # Titles
         def _add_title(img: np.ndarray, text: str) -> None:
@@ -540,11 +549,16 @@ def _render_diff_panels_with_point(
         _add_title(panel1, "Overlay A (green) vs B (red)")
         _add_title(panel2, "Signed diff C: + (green), - (red)")
         _add_title(panel3, "Components + selected point")
-        if heatmap_rgb is not None:
+        if panel4 is not None and panel5 is not None:
+            _add_title(panel4, "FG probability heatmap + selected point")
+            _add_title(panel5, "BG probability heatmap + selected point")
+        elif panel4 is not None:
             _add_title(panel4, "Probability heatmap + selected point")
 
         panels = [panel1, panel2, panel3]
-        if heatmap_rgb is not None:
+        if panel4 is not None and panel5 is not None:
+            panels.extend([panel4, panel5])
+        elif panel4 is not None:
             panels.append(panel4)
         canvas = np.concatenate(panels, axis=1)
         os.makedirs(os.path.dirname(dbg_out_path) or ".", exist_ok=True)
@@ -685,21 +699,35 @@ def main() -> None:
                         prev = np.array(_PIL.open(to_abs(prev_path)).convert("L"), dtype=np.uint8) if os.path.isfile(prev_path) else np.zeros_like(gt_mask_u8, dtype=np.uint8)
                     except Exception:
                         prev = np.zeros_like(gt_mask_u8, dtype=np.uint8)
-                # Load heatmap for this step: prefer heatmap-{i}.png; fallback to heatmap-{i-1}.png if missing
+                # Load heatmap for this step:
+                # Prefer two-map if present: p_fg-{i}.png and p_bg-{i}.png; else fallback to heatmap-{i}.png; else heatmap-{i-1}.png
                 heatmap_rgb = None
+                heatmap_fg_rgb = None
+                heatmap_bg_rgb = None
                 try:
                     hm_dir = os.path.join(sam_masks_dir, sample_stem)
-                    cand = [f"heatmap-{i}.png"]
-                    if i - 1 >= 0:
-                        cand.append(f"heatmap-{i-1}.png")
-                    for name in cand:
-                        hm_path = os.path.join(hm_dir, name)
-                        if os.path.isfile(hm_path):
-                            hm = np.array(_PIL.open(to_abs(hm_path)).convert("RGB"))
-                            heatmap_rgb = hm[:, :, ::-1]  # to BGR
-                            break
+                    # try two maps first
+                    fg_path = os.path.join(hm_dir, f"p_fg-{i}.png")
+                    bg_path = os.path.join(hm_dir, f"p_bg-{i}.png")
+                    if os.path.isfile(fg_path) and os.path.isfile(bg_path):
+                        hm_fg = np.array(_PIL.open(to_abs(fg_path)).convert("RGB"))
+                        hm_bg = np.array(_PIL.open(to_abs(bg_path)).convert("RGB"))
+                        heatmap_fg_rgb = hm_fg[:, :, ::-1]
+                        heatmap_bg_rgb = hm_bg[:, :, ::-1]
+                    else:
+                        cand = [f"heatmap-{i}.png"]
+                        if i - 1 >= 0:
+                            cand.append(f"heatmap-{i-1}.png")
+                        for name in cand:
+                            hm_path = os.path.join(hm_dir, name)
+                            if os.path.isfile(hm_path):
+                                hm = np.array(_PIL.open(to_abs(hm_path)).convert("RGB"))
+                                heatmap_rgb = hm[:, :, ::-1]  # to BGR
+                                break
                 except Exception:
                     heatmap_rgb = None
+                    heatmap_fg_rgb = None
+                    heatmap_bg_rgb = None
                 # Render panels with provided point
                 dbg_path = os.path.join(subdir, f"dbg_{i}.png")
                 _render_diff_panels_with_point(
@@ -710,6 +738,8 @@ def main() -> None:
                     dbg_path,
                     base_image_bgr=base_img_bgr,
                     heatmap_rgb=heatmap_rgb,
+                    heatmap_fg_rgb=heatmap_fg_rgb,
+                    heatmap_bg_rgb=heatmap_bg_rgb,
                 )
                 num_generated += 1
         print(f"Generated debug images for {num_generated} steps into {args.debug_output_dir}")
