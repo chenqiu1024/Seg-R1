@@ -185,7 +185,9 @@ def train_one_epoch(
     Returns:
         (avg_loss, global_step)
     """
+    # 确保模型处于训练模式
     point_predictor.train()
+    sam2_lora.model.train()  # 确保 SAM 模型也处于训练模式，以便 LoRA 参数参与梯度计算
     
     loss_meter = AverageMeter()
     heatmap_loss_meter = AverageMeter()
@@ -220,17 +222,41 @@ def train_one_epoch(
         if scaler is not None:
             scaler.scale(total_loss).backward()
             
-            # 梯度裁剪
+            # 在使用 scaler.step() 之前，必须先 unscale 来检查梯度
+            # 即使不需要梯度裁剪，也需要 unscale 来记录 inf checks
+            # 注意：必须对每个优化器分别调用 unscale_，且必须在 step 之前
+            # 重要：如果优化器中的参数没有梯度，unscale_ 不会记录 inf checks
+            # 因此需要确保参数有梯度，或者检查是否有梯度再调用 unscale
+            if optimizer_sam is not None:
+                # 检查 LoRA 参数是否有梯度
+                # 如果参数没有梯度，unscale_ 不会记录 inf checks，导致 step 失败
+                has_grad = any(p.grad is not None for p in sam2_lora.get_lora_parameters())
+                if not has_grad:
+                    # 如果没有梯度，说明 LoRA 参数没有参与计算
+                    # 这可能是因为 SAM 模型被设置为 eval 模式，或者使用了 no_grad
+                    # 在这种情况下，跳过这个优化器的更新
+                    print(f"Warning: LoRA parameters have no gradients, skipping optimizer_sam update")
+                    optimizer_sam = None
+                else:
+                    # 有梯度，调用 unscale
+                    scaler.unscale_(optimizer_sam)
+            
+            # 总是对 point_predictor 调用 unscale（因为它应该总是有梯度）
+            scaler.unscale_(optimizer_point)
+            
+            # 梯度裁剪（在 unscale 之后，在 step 之前）
             if args.grad_clip > 0:
                 if optimizer_sam is not None:
-                    scaler.unscale_(optimizer_sam)
                     torch.nn.utils.clip_grad_norm_(sam2_lora.get_lora_parameters(), args.grad_clip)
-                scaler.unscale_(optimizer_point)
                 torch.nn.utils.clip_grad_norm_(point_predictor.parameters(), args.grad_clip)
             
+            # 更新参数（必须在 unscale 之后）
+            # 注意：如果 unscale 检测到 inf/NaN，step 会跳过这次更新
             if optimizer_sam is not None:
                 scaler.step(optimizer_sam)
             scaler.step(optimizer_point)
+            
+            # 更新 scaler 的缩放因子（根据是否有 inf/NaN）
             scaler.update()
         else:
             total_loss.backward()
@@ -380,8 +406,19 @@ def main():
     print("\n" + "="*80)
     print("Initializing Point Predictor...")
     print("="*80)
+    
+    # 根据 feature_scale 确定 SAM 特征通道数
+    # SAM2 不同 scale 的特征通道数：
+    # - Scale 4: 32 channels
+    # - Scale 8: 64 channels
+    # - Scale 16: 256 channels
+    sam_feature_dim_map = {4: 32, 8: 64, 16: 256}
+    if args.feature_scale not in sam_feature_dim_map:
+        raise ValueError(f"Unsupported feature_scale: {args.feature_scale}. Use 4, 8, or 16.")
+    sam_feature_dim = sam_feature_dim_map[args.feature_scale]
+    
     point_predictor = PointPredictorFromSAMFeatures(
-        sam_feature_dim=256,
+        sam_feature_dim=sam_feature_dim,
         output_size=tuple(args.image_size),
         fusion_mode=args.fusion_mode,
         feature_scale=args.feature_scale,

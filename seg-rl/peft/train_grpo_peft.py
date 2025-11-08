@@ -465,8 +465,14 @@ def main():
         device=str(device)
     )
     
+    # 根据 feature_scale 确定 SAM 特征通道数
+    sam_feature_dim_map = {4: 32, 8: 64, 16: 256}
+    if feature_scale not in sam_feature_dim_map:
+        raise ValueError(f"Unsupported feature_scale: {feature_scale}. Use 4, 8, or 16.")
+    sam_feature_dim = sam_feature_dim_map[feature_scale]
+    
     point_predictor_policy = PointPredictorFromSAMFeatures(
-        sam_feature_dim=256,
+        sam_feature_dim=sam_feature_dim,
         output_size=(args.height, args.width),
         fusion_mode=fusion_mode,
         feature_scale=feature_scale,
@@ -489,7 +495,7 @@ def main():
         device=str(device)
     )
     point_predictor_ref = PointPredictorFromSAMFeatures(
-        sam_feature_dim=256,
+        sam_feature_dim=sam_feature_dim,
         output_size=(args.height, args.width),
         fusion_mode=fusion_mode,
         feature_scale=feature_scale,

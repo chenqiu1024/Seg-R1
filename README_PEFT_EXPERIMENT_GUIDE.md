@@ -324,7 +324,7 @@ python -m seg-rl.peft.train_supervised_peft \
 
 ```bash
 # 启动TensorBoard
-tensorboard --logdir outputs/braintumour/peft_supervised_baseline/tensorboard --port 6006
+tensorboard --logdir outputs/braintumour/peft_supervised_baseline-251107/tensorboard --port 6006
 
 # 在浏览器打开 http://localhost:6006
 # 查看：
@@ -336,7 +336,7 @@ tensorboard --logdir outputs/braintumour/peft_supervised_baseline/tensorboard --
 
 ```bash
 # 训练日志
-tail -f outputs/braintumour/peft_supervised_baseline/train.log
+tail -f outputs/braintumour/peft_supervised_baseline-251107/train.log
 
 # Checkpoint列表
 ls outputs/braintumour/peft_supervised_baseline/*.pt

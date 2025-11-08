@@ -199,8 +199,15 @@ def main():
     
     # 2. 初始化点预测网络
     print("Initializing Point Predictor...")
+    
+    # 根据 feature_scale 确定 SAM 特征通道数
+    sam_feature_dim_map = {4: 32, 8: 64, 16: 256}
+    if feature_scale not in sam_feature_dim_map:
+        raise ValueError(f"Unsupported feature_scale: {feature_scale}. Use 4, 8, or 16.")
+    sam_feature_dim = sam_feature_dim_map[feature_scale]
+    
     point_predictor = PointPredictorFromSAMFeatures(
-        sam_feature_dim=256,
+        sam_feature_dim=sam_feature_dim,
         output_size=tuple(args.image_size),
         fusion_mode=fusion_mode,
         feature_scale=feature_scale,
