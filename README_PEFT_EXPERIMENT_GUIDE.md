@@ -529,10 +529,15 @@ cat outputs/braintumour/eval_supervised/eval_results.json | jq '.summary'
 #   "mean_num_points": 8.3
 # }
 ```
-OR ###!!! 使用先前的 预测下一点+SAM分割 交替方式：
+OR 使用先前的 预测下一点+SAM分割 交替方式：
 #### 4.1b.1 预测第一提示点：
 ```
-python -m seg-rl.heatmap.predict_next_point_from_model     --model_path outputs/braintumour/peft_supervised_baseline-251107A/checkpoint_best.pt     --images_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/images     --masks_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/masks     --output_json outputs/braintumour/pred-peft_test-251107.jsonl
+python -m seg-rl.heatmap.predict_next_point_from_model \
+    --model_path outputs/braintumour/peft_supervised_baseline-251107A/checkpoint_best.pt \
+    --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
+    --images_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/images \
+    --masks_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/masks \
+    --output_json outputs/braintumour/pred-peft_test-251107.jsonl
 ```
 #### 4.1b.2 生成第一个掩膜
 ```bash
@@ -553,6 +558,7 @@ for i in {2..15}; do
   echo "=== Predicting point $i ==="
   python -m seg-rl.heatmap.predict_next_point_from_model \
     --model_path outputs/braintumour/peft_supervised_baseline-251107A/checkpoint_best.pt \
+    --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
     --appendto_json outputs/braintumour/pred-peft_test-251107.jsonl
   
   python seg-rl/sam2_segment_from_points.py \

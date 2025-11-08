@@ -270,24 +270,21 @@ def _predict_point_peft(sam2_lora, point_predictor, image_tensor: torch.Tensor, 
         # 点预测网络
         heatmap_logits, label_logits = point_predictor(sam_features, prev_mask)
         
-        # 使用soft_argmax获取点坐标
-        b, _, H, W = heatmap_logits.shape
-        heatmap_flat = heatmap_logits.view(b, -1)
+        # 使用soft_argmax获取点坐标（返回[x, y]）
+        xy = soft_argmax_from_logits(heatmap_logits, temperature=tau)[0]  # [2] -> (x, y)
+        x = xy[0].item()
+        y = xy[1].item()
         
-        # 使用softmax和加权平均计算坐标
-        p = F.softmax(heatmap_flat / max(float(tau), 1e-6), dim=1)
-        indices = torch.arange(heatmap_flat.size(1), device=device, dtype=torch.float32)
-        x_flat = indices % W
-        y_flat = indices // W
-        x = (p * x_flat).sum(dim=1)
-        y = (p * y_flat).sum(dim=1)
-        
+        # 标签预测：label_logits形状是[B, 2]，其中[0]是背景，[1]是前景
+        # argmax返回0或1，对应背景或前景
         lab = int(label_logits.argmax(dim=1).item())
         
         # 概率热力图用于保存
-        prob = p.view(b, 1, H, W)[0, 0].detach().cpu().float().numpy()
+        b, _, H, W = heatmap_logits.shape
+        p = F.softmax(heatmap_logits.view(b, -1) / max(float(tau), 1e-6), dim=1).view(b, 1, H, W)
+        prob = p[0, 0].detach().cpu().float().numpy()
         
-    return float(x.item()), float(y.item()), lab, prob
+    return float(x), float(y), lab, prob
 
 
 def _save_heatmap_image(prob: np.ndarray, out_dir: Optional[str], stem: str, step_idx: int, orig_w: int, orig_h: int) -> None:
@@ -377,7 +374,6 @@ def run_initial(args: argparse.Namespace) -> None:
             
             # 调整概率热力图尺寸用于保存
             if prob.shape != (orig_h, orig_w):
-                from scipy.ndimage import zoom
                 scale_y_prob = orig_h / prob.shape[0]
                 scale_x_prob = orig_w / prob.shape[1]
                 prob = zoom(prob, (scale_y_prob, scale_x_prob), order=1)
@@ -496,7 +492,6 @@ def run_append(args: argparse.Namespace) -> None:
             
             # 调整概率热力图尺寸用于保存
             if prob.shape != (orig_h, orig_w):
-                from scipy.ndimage import zoom
                 scale_y_prob = orig_h / prob.shape[0]
                 scale_x_prob = orig_w / prob.shape[1]
                 prob = zoom(prob, (scale_y_prob, scale_x_prob), order=1)
