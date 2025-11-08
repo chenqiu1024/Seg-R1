@@ -199,7 +199,7 @@ def load_checkpoint(
     Returns:
         (epoch, step, config, metrics)
     """
-    checkpoint = torch.load(path, map_location=device)
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
     
     # 加载模型状态
     point_predictor.load_state_dict(checkpoint['point_predictor_state'])
@@ -215,9 +215,25 @@ def load_checkpoint(
     
     # 恢复随机状态
     if 'random_state' in checkpoint:
-        torch.set_rng_state(checkpoint['random_state']['torch'])
-        np.random.set_state(checkpoint['random_state']['numpy'])
-        random.setstate(checkpoint['random_state']['python'])
+        # 确保 torch RNG 状态是正确的类型 (ByteTensor/uint8)
+        torch_rng_state = checkpoint['random_state']['torch']
+        try:
+            # 转换为 numpy 数组，然后使用 ByteTensor 构造函数
+            if isinstance(torch_rng_state, torch.Tensor):
+                # 先转换为 numpy，确保是 uint8 类型
+                rng_numpy = torch_rng_state.cpu().numpy().astype(np.uint8)
+            elif isinstance(torch_rng_state, np.ndarray):
+                rng_numpy = torch_rng_state.astype(np.uint8)
+            else:
+                rng_numpy = np.array(torch_rng_state, dtype=np.uint8)
+            
+            # 使用 ByteTensor 构造函数创建正确的类型
+            torch.set_rng_state(torch.ByteTensor(rng_numpy))
+            np.random.set_state(checkpoint['random_state']['numpy'])
+            random.setstate(checkpoint['random_state']['python'])
+        except (TypeError, AttributeError, ValueError) as e:
+            # 如果恢复随机状态失败，打印警告但继续执行（评估时不需要随机状态）
+            print(f"Warning: Failed to restore random state: {e}. Continuing without restoring RNG state.")
     
     epoch = checkpoint.get('epoch', 0)
     step = checkpoint.get('step', 0)

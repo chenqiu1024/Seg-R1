@@ -381,7 +381,7 @@ class LoRASAM2Wrapper:
         Args:
             path: checkpoint路径
         """
-        checkpoint = torch.load(path, map_location='cpu')
+        checkpoint = torch.load(path, map_location='cpu', weights_only=False)
         lora_state = checkpoint['lora_state_dict']
         
         # 验证配置一致性

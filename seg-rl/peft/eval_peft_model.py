@@ -116,7 +116,11 @@ def rollout_single_image(
             prev_mask = sam2_lora.predict_mask(
                 np.array(image), points_orig, labels_seq
             )
-            prev_mask = torch.from_numpy(prev_mask).unsqueeze(0).to(device)
+            # predict_mask 返回的是 torch.Tensor，不是 numpy 数组
+            if isinstance(prev_mask, torch.Tensor):
+                prev_mask = prev_mask.unsqueeze(0).to(device)
+            else:
+                prev_mask = torch.from_numpy(prev_mask).unsqueeze(0).to(device)
             prev_mask = torch.nn.functional.interpolate(
                 prev_mask.unsqueeze(0), size=tuple(args.image_size), mode='nearest'
             )[0]
@@ -153,9 +157,17 @@ def rollout_single_image(
         
         prev_dice = dice
     
+    # 将点坐标从resize后的尺寸缩放回原始图像尺寸
+    # points_seq中的坐标是在args.image_size坐标系中的，需要缩放回orig_w x orig_h
+    # args.image_size是[H, W]，所以args.image_size[0]是H，args.image_size[1]是W
+    points_orig = [
+        (px * orig_w / args.image_size[1], py * orig_h / args.image_size[0])
+        for px, py in points_seq
+    ]
+    
     return {
         'image_path': image_path,
-        'points': points_seq,
+        'points': points_orig,  # 返回原始图像尺寸的坐标
         'labels': labels_seq,
         'dice_history': dice_history,
         'iou_history': iou_history,
@@ -177,7 +189,7 @@ def main():
     
     # 加载checkpoint配置
     print(f"\nLoading checkpoint: {args.checkpoint}")
-    ckpt = torch.load(args.checkpoint, map_location='cpu')
+    ckpt = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
     config = ckpt.get('config', {})
     
     # 提取配置

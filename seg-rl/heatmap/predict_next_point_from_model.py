@@ -71,6 +71,7 @@ from typing import Dict, List, Optional, Tuple, Callable
 
 import numpy as np
 from PIL import Image
+from scipy.ndimage import zoom
 
 import torch
 import torch.nn.functional as F
@@ -124,6 +125,7 @@ def parse_args() -> argparse.Namespace:
     group.add_argument("--debug_json", type=str, help="Debug visualization only: read JSON array and render panels")
 
     p.add_argument("--model_path", type=str, required=False, help="Path to trained model checkpoint (.pt)")
+    p.add_argument("--sam_checkpoint", type=str, default=None, help="SAM2 checkpoint path (required for PEFT models)")
     p.add_argument("--images_dir", type=str, default=None, help="Directory of input images (initial mode)")
     p.add_argument("--masks_dir", type=str, default=None, help="Ground-truth masks directory (initial mode only, to fill 'gt_mask' field)")
     p.add_argument("--sam_dir", type=str, default=None, help="Directory of predicted SAM masks per step: {sam_dir}/{stem}/{k}.png (initial/debug mode)")
@@ -151,15 +153,78 @@ def _device_and_amp(args: argparse.Namespace) -> Tuple[torch.device, bool, str]:
     return device, amp_enabled, autocast_device_type
 
 
-def _load_model(model_path: str, device: torch.device) -> PointHeatmapModel:
-    cfg = ModelConfig(backbone="unet_s", pretrained=False, main_in_channels=3, cond_in_channels=1)
-    model = PointHeatmapModel(cfg).to(device)
-    ckpt = torch.load(model_path, map_location="cpu") if model_path and os.path.isfile(model_path) else None
-    if ckpt is not None:
+def _is_peft_checkpoint(ckpt: dict) -> bool:
+    """检查checkpoint是否是PEFT格式"""
+    return 'point_predictor_state' in ckpt and 'sam_lora_state' in ckpt
+
+
+def _load_model(model_path: str, device: torch.device, sam_checkpoint: Optional[str] = None):
+    """加载模型，支持heatmap模型和PEFT模型"""
+    if not model_path or not os.path.isfile(model_path):
+        raise ValueError(f"Model path not found: {model_path}")
+    
+    ckpt = torch.load(model_path, map_location="cpu", weights_only=False)
+    
+    # 检查是否是PEFT checkpoint
+    if _is_peft_checkpoint(ckpt):
+        # 加载PEFT模型
+        if not sam_checkpoint:
+            raise ValueError("--sam_checkpoint is required for PEFT models")
+        
+        # 导入PEFT模块
+        import sys
+        from pathlib import Path
+        _PARENT_DIR = Path(__file__).parent.parent
+        if str(_PARENT_DIR) not in sys.path:
+            sys.path.insert(0, str(_PARENT_DIR))
+        
+        from peft.lora_sam2 import LoRASAM2Wrapper
+        from peft.point_predictor_peft import PointPredictorFromSAMFeatures
+        from peft.utils_peft import load_checkpoint
+        
+        config = ckpt.get('config', {})
+        lora_rank = config.get('lora_rank', 16)
+        lora_alpha = config.get('lora_alpha', 32)
+        fusion_mode = config.get('fusion_mode', 'film')
+        feature_scale = config.get('feature_scale', 8)
+        image_size = config.get('image_size', [512, 512])
+        
+        # 初始化SAM2 LoRA
+        sam2_lora = LoRASAM2Wrapper(
+            sam_checkpoint=sam_checkpoint,
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
+            device=str(device),
+        )
+        
+        # 初始化点预测网络
+        sam_feature_dim_map = {4: 32, 8: 64, 16: 256}
+        if feature_scale not in sam_feature_dim_map:
+            raise ValueError(f"Unsupported feature_scale: {feature_scale}")
+        sam_feature_dim = sam_feature_dim_map[feature_scale]
+        
+        point_predictor = PointPredictorFromSAMFeatures(
+            sam_feature_dim=sam_feature_dim,
+            output_size=tuple(image_size),
+            fusion_mode=fusion_mode,
+            feature_scale=feature_scale,
+        ).to(device)
+        
+        # 加载权重
+        load_checkpoint(
+            model_path, point_predictor, sam2_lora, None, None, None, str(device)
+        )
+        
+        point_predictor.eval()
+        return ('peft', sam2_lora, point_predictor, feature_scale, tuple(image_size))
+    else:
+        # 加载heatmap模型
+        cfg = ModelConfig(backbone="unet_s", pretrained=False, main_in_channels=3, cond_in_channels=1)
+        model = PointHeatmapModel(cfg).to(device)
         sd = ckpt.get("model", ckpt)
         model.load_state_dict(sd, strict=False)
-    model.eval()
-    return model
+        model.eval()
+        return ('heatmap', model)
 
 
 def _to_tensor_separate(image_path: str, gray_mask: Optional[Image.Image], out_hw: Tuple[int, int]) -> Tuple[torch.Tensor, torch.Tensor, Tuple[int, int]]:
@@ -184,7 +249,7 @@ def _to_tensor_separate(image_path: str, gray_mask: Optional[Image.Image], out_h
     return rgb_t.unsqueeze(0), g_t.unsqueeze(0), (orig_h, orig_w)  # [1,3,H,W], [1,1,H,W], (orig_h,orig_w)
 
 
-def _predict_point(model: PointHeatmapModel, rgb_tensor: torch.Tensor, gray_tensor: torch.Tensor, device: torch.device, tau: float) -> Tuple[float, float, int, np.ndarray]:
+def _predict_point_heatmap(model: PointHeatmapModel, rgb_tensor: torch.Tensor, gray_tensor: torch.Tensor, device: torch.device, tau: float) -> Tuple[float, float, int, np.ndarray]:
     with torch.no_grad():
         logits, label_logits = model(rgb_tensor.to(device), gray_tensor.to(device))
         xy = soft_argmax_from_logits(logits, temperature=tau)[0]
@@ -194,6 +259,35 @@ def _predict_point(model: PointHeatmapModel, rgb_tensor: torch.Tensor, gray_tens
         p = F.softmax(logits.view(b, -1) / max(float(tau), 1e-6), dim=1).view(b, 1, H, W)
         prob = p[0, 0].detach().cpu().float().numpy()
     return float(xy[0].item()), float(xy[1].item()), lab, prob
+
+
+def _predict_point_peft(sam2_lora, point_predictor, image_tensor: torch.Tensor, prev_mask: torch.Tensor, device: torch.device, feature_scale: int, tau: float) -> Tuple[float, float, int, np.ndarray]:
+    """使用PEFT模型预测点"""
+    with torch.no_grad():
+        # 提取SAM特征
+        sam_features = sam2_lora.get_image_features(image_tensor, feature_scale=feature_scale)
+        
+        # 点预测网络
+        heatmap_logits, label_logits = point_predictor(sam_features, prev_mask)
+        
+        # 使用soft_argmax获取点坐标
+        b, _, H, W = heatmap_logits.shape
+        heatmap_flat = heatmap_logits.view(b, -1)
+        
+        # 使用softmax和加权平均计算坐标
+        p = F.softmax(heatmap_flat / max(float(tau), 1e-6), dim=1)
+        indices = torch.arange(heatmap_flat.size(1), device=device, dtype=torch.float32)
+        x_flat = indices % W
+        y_flat = indices // W
+        x = (p * x_flat).sum(dim=1)
+        y = (p * y_flat).sum(dim=1)
+        
+        lab = int(label_logits.argmax(dim=1).item())
+        
+        # 概率热力图用于保存
+        prob = p.view(b, 1, H, W)[0, 0].detach().cpu().float().numpy()
+        
+    return float(x.item()), float(y.item()), lab, prob
 
 
 def _save_heatmap_image(prob: np.ndarray, out_dir: Optional[str], stem: str, step_idx: int, orig_w: int, orig_h: int) -> None:
@@ -235,8 +329,17 @@ def run_initial(args: argparse.Namespace) -> None:
     if not args.masks_dir:
         raise RuntimeError("--masks_dir is required for initial mode to fill 'gt_mask' field")
     device, amp_enabled, autocast_device_type = _device_and_amp(args)
-    model = _load_model(args.model_path, device)
-    H, W = int(args.height), int(args.width)
+    
+    # 加载模型（支持heatmap和PEFT）
+    model_info = _load_model(args.model_path, device, args.sam_checkpoint)
+    is_peft = model_info[0] == 'peft'
+    
+    if is_peft:
+        sam2_lora, point_predictor, feature_scale, image_size = model_info[1], model_info[2], model_info[3], model_info[4]
+        H, W = image_size[0], image_size[1]
+    else:
+        model = model_info[1]
+        H, W = int(args.height), int(args.width)
 
     records: List[Dict] = []
     images = _list_images(args.images_dir)
@@ -250,16 +353,47 @@ def run_initial(args: argparse.Namespace) -> None:
         images_iter = images
 
     for img_path in images_iter:
-        rgb_tensor, gray_tensor, (orig_h, orig_w) = _to_tensor_separate(img_path, gray_mask=None, out_hw=(H, W))
-        with torch.amp.autocast(device_type=autocast_device_type, enabled=amp_enabled):
-            x, y, lab, prob = _predict_point(model, rgb_tensor, gray_tensor, device, args.tau)
-        # scale back to native size if resized
-        inf_H, inf_W = rgb_tensor.shape[-2], rgb_tensor.shape[-1]
-        if (inf_W, inf_H) != (orig_w, orig_h):
-            scale_x = float(orig_w) / float(inf_W)
-            scale_y = float(orig_h) / float(inf_H)
+        if is_peft:
+            # PEFT模型：需要SAM特征
+            import torchvision.transforms.functional as TF
+            image = Image.open(img_path).convert('RGB')
+            orig_w, orig_h = image.size
+            
+            # Resize到模型输入尺寸
+            image_resized = image.resize((W, H), Image.BILINEAR)
+            image_tensor = TF.to_tensor(image_resized).unsqueeze(0).to(device)  # [1, 3, H, W]
+            
+            # 初始掩模为全零
+            prev_mask = torch.zeros(1, 1, H, W).to(device)
+            
+            with torch.amp.autocast(device_type=autocast_device_type, enabled=amp_enabled):
+                x, y, lab, prob = _predict_point_peft(sam2_lora, point_predictor, image_tensor, prev_mask, device, feature_scale, args.tau)
+            
+            # 缩放回原始尺寸
+            scale_x = float(orig_w) / float(W)
+            scale_y = float(orig_h) / float(H)
             x = x * scale_x
             y = y * scale_y
+            
+            # 调整概率热力图尺寸用于保存
+            if prob.shape != (orig_h, orig_w):
+                from scipy.ndimage import zoom
+                scale_y_prob = orig_h / prob.shape[0]
+                scale_x_prob = orig_w / prob.shape[1]
+                prob = zoom(prob, (scale_y_prob, scale_x_prob), order=1)
+        else:
+            # Heatmap模型：使用RGB和灰度掩模
+            rgb_tensor, gray_tensor, (orig_h, orig_w) = _to_tensor_separate(img_path, gray_mask=None, out_hw=(H, W))
+            with torch.amp.autocast(device_type=autocast_device_type, enabled=amp_enabled):
+                x, y, lab, prob = _predict_point_heatmap(model, rgb_tensor, gray_tensor, device, args.tau)
+            # scale back to native size if resized
+            inf_H, inf_W = rgb_tensor.shape[-2], rgb_tensor.shape[-1]
+            if (inf_W, inf_H) != (orig_w, orig_h):
+                scale_x = float(orig_w) / float(inf_W)
+                scale_y = float(orig_h) / float(inf_H)
+                x = x * scale_x
+                y = y * scale_y
+        
         # clamp to bounds
         x = float(max(0.0, min(orig_w - 1.0, x)))
         y = float(max(0.0, min(orig_h - 1.0, y)))
@@ -294,8 +428,17 @@ def run_append(args: argparse.Namespace) -> None:
     if not isinstance(arr, list):
         raise RuntimeError("Append target must be a JSON array")
     device, amp_enabled, autocast_device_type = _device_and_amp(args)
-    model = _load_model(args.model_path, device)
-    H, W = int(args.height), int(args.width)
+    
+    # 加载模型（支持heatmap和PEFT）
+    model_info = _load_model(args.model_path, device, args.sam_checkpoint)
+    is_peft = model_info[0] == 'peft'
+    
+    if is_peft:
+        sam2_lora, point_predictor, feature_scale, image_size = model_info[1], model_info[2], model_info[3], model_info[4]
+        H, W = image_size[0], image_size[1]
+    else:
+        model = model_info[1]
+        H, W = int(args.height), int(args.width)
 
     updated = 0
     # progress bar
@@ -317,23 +460,66 @@ def run_append(args: argparse.Namespace) -> None:
         if not img_path:
             continue
         k = len(pts)
-        # prev mask
-        if k == 0:
-            gray = None
-        else:
-            stem = _stem(img_path)
-            prev_path = os.path.join(sam_dir, stem, f"{k-1}.png")
-            gray = Image.open(prev_path).convert("L") if os.path.isfile(prev_path) else None
-        rgb_tensor, gray_tensor, (orig_h, orig_w) = _to_tensor_separate(img_path, gray_mask=gray, out_hw=(H, W))
-        with torch.amp.autocast(device_type=autocast_device_type, enabled=amp_enabled):
-            x, y, lab, prob = _predict_point(model, rgb_tensor, gray_tensor, device, args.tau)
-        # scale back and clamp
-        inf_H, inf_W = rgb_tensor.shape[-2], rgb_tensor.shape[-1]
-        if (inf_W, inf_H) != (orig_w, orig_h):
-            scale_x = float(orig_w) / float(inf_W)
-            scale_y = float(orig_h) / float(inf_H)
+        
+        if is_peft:
+            # PEFT模型：需要SAM特征
+            import torchvision.transforms.functional as TF
+            image = Image.open(img_path).convert('RGB')
+            orig_w, orig_h = image.size
+            
+            # Resize到模型输入尺寸
+            image_resized = image.resize((W, H), Image.BILINEAR)
+            image_tensor = TF.to_tensor(image_resized).unsqueeze(0).to(device)
+            
+            # 加载前一步掩模
+            if k == 0:
+                prev_mask = torch.zeros(1, 1, H, W).to(device)
+            else:
+                stem = _stem(img_path)
+                prev_path = os.path.join(sam_dir, stem, f"{k-1}.png")
+                if os.path.isfile(prev_path):
+                    prev_mask_img = Image.open(prev_path).convert('L')
+                    prev_mask_resized = prev_mask_img.resize((W, H), Image.NEAREST)
+                    prev_mask_tensor = TF.to_tensor(prev_mask_resized).to(device)
+                    prev_mask = (prev_mask_tensor > 0.5).float().unsqueeze(0)
+                else:
+                    prev_mask = torch.zeros(1, 1, H, W).to(device)
+            
+            with torch.amp.autocast(device_type=autocast_device_type, enabled=amp_enabled):
+                x, y, lab, prob = _predict_point_peft(sam2_lora, point_predictor, image_tensor, prev_mask, device, feature_scale, args.tau)
+            
+            # 缩放回原始尺寸
+            scale_x = float(orig_w) / float(W)
+            scale_y = float(orig_h) / float(H)
             x = x * scale_x
             y = y * scale_y
+            
+            # 调整概率热力图尺寸用于保存
+            if prob.shape != (orig_h, orig_w):
+                from scipy.ndimage import zoom
+                scale_y_prob = orig_h / prob.shape[0]
+                scale_x_prob = orig_w / prob.shape[1]
+                prob = zoom(prob, (scale_y_prob, scale_x_prob), order=1)
+        else:
+            # Heatmap模型：使用RGB和灰度掩模
+            # prev mask
+            if k == 0:
+                gray = None
+            else:
+                stem = _stem(img_path)
+                prev_path = os.path.join(sam_dir, stem, f"{k-1}.png")
+                gray = Image.open(prev_path).convert("L") if os.path.isfile(prev_path) else None
+            rgb_tensor, gray_tensor, (orig_h, orig_w) = _to_tensor_separate(img_path, gray_mask=gray, out_hw=(H, W))
+            with torch.amp.autocast(device_type=autocast_device_type, enabled=amp_enabled):
+                x, y, lab, prob = _predict_point_heatmap(model, rgb_tensor, gray_tensor, device, args.tau)
+            # scale back and clamp
+            inf_H, inf_W = rgb_tensor.shape[-2], rgb_tensor.shape[-1]
+            if (inf_W, inf_H) != (orig_w, orig_h):
+                scale_x = float(orig_w) / float(inf_W)
+                scale_y = float(orig_h) / float(inf_H)
+                x = x * scale_x
+                y = y * scale_y
+        
         x = float(max(0.0, min(orig_w - 1.0, x)))
         y = float(max(0.0, min(orig_h - 1.0, y)))
         # Save heatmap for next step k = len(pts)

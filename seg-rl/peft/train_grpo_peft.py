@@ -448,7 +448,7 @@ def main():
     
     # 1. 加载初始策略checkpoint
     print(f"\nLoading initial policy from {args.init_policy}")
-    init_ckpt = torch.load(args.init_policy, map_location='cpu')
+    init_ckpt = torch.load(args.init_policy, map_location='cpu', weights_only=False)
     init_config = init_ckpt.get('config', {})
     
     lora_rank = init_config.get('lora_rank', 16)

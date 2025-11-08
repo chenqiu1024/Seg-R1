@@ -159,6 +159,7 @@ python seg-rl/sam2_segment_from_points.py \
   --json_output outputs/braintumour/pretrain_251107.jsonl \
   --output_dir outputs/braintumour/sam_masks_ref \
   --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
+  ###!!! --heatmap_model outputs/braintumour/peft_supervised_baseline-251107A-tau0/checkpoint_epoch039.pt
   --device cuda \
   --resize 512 512 \
   --skip_existing
@@ -305,7 +306,7 @@ python -m seg-rl.peft.train_supervised_peft \
   --num_workers 4 \
   --seed 42
 ```
-
+###!!! 1. 生成outputs/braintumour/peft_supervised_baseline-251107A/checkpoint_best.pt
 **参数说明**：
 - `--lora_rank 16`: LoRA秩，控制适配器容量（典型值：8-32）
 - `--lora_alpha 32`: LoRA缩放，通常是rank的2倍
@@ -491,10 +492,10 @@ python -m seg-rl.peft.train_grpo_peft \
 
 ```bash
 python -m seg-rl.peft.eval_peft_model \
-  --test_json datasets/Task01_BrainTumour/peft_test.jsonl \
-  --checkpoint outputs/braintumour/peft_supervised_baseline/checkpoint_best.pt \
+  --test_json outputs/braintumour/peft_test-251107.jsonl \
+  --checkpoint outputs/braintumour/peft_supervised_baseline-251107A/checkpoint_best.pt \
   --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
-  --out_dir outputs/braintumour/eval_supervised \
+  --out_dir outputs/braintumour/eval_supervised_pred_test-251107A \
   --image_size 512 512 \
   --max_rollout_steps 16 \
   --dice_threshold 0.95 \
@@ -527,6 +528,43 @@ cat outputs/braintumour/eval_supervised/eval_results.json | jq '.summary'
 #   "mean_iou": 0.7654,
 #   "mean_num_points": 8.3
 # }
+```
+OR ###!!! 使用先前的 预测下一点+SAM分割 交替方式：
+#### 4.1b.1 预测第一提示点：
+```
+python -m seg-rl.heatmap.predict_next_point_from_model     --model_path outputs/braintumour/peft_supervised_baseline-251107A/checkpoint_best.pt     --images_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/images     --masks_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/masks     --output_json outputs/braintumour/pred-peft_test-251107.jsonl
+```
+#### 4.1b.2 生成第一个掩膜
+```bash
+python seg-rl/sam2_segment_from_points.py \
+  --input_jsonl outputs/braintumour/pred-peft_test-251107.jsonl \
+  --json_output outputs/braintumour/pred-peft_test-251107.jsonl\
+  --output_dir outputs/braintumour/sam_masks-pred-peft_test-251107 \
+  --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
+  --heatmap_model outputs/braintumour/peft_supervised_baseline-251107A/checkpoint_best.pt
+  --device cuda \
+  --resize 512 512 \
+  --skip_existing
+```
+#### 4.1b.3 继续迭代直到达到期望的点数（通常8-16个点）：
+```bash
+# 一键脚本（循环N次）
+for i in {2..15}; do
+  echo "=== Predicting point $i ==="
+  python -m seg-rl.heatmap.predict_next_point_from_model \
+    --model_path outputs/braintumour/peft_supervised_baseline-251107A/checkpoint_best.pt \
+    --appendto_json outputs/braintumour/pred-peft_test-251107.jsonl
+  
+  python seg-rl/sam2_segment_from_points.py \
+  --input_jsonl outputs/braintumour/pred-peft_test-251107.jsonl \
+  --json_output outputs/braintumour/pred-peft_test-251107.jsonl\
+  --output_dir outputs/braintumour/sam_masks-pred-peft_test-251107 \
+  --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
+  --heatmap_model outputs/braintumour/peft_supervised_baseline-251107A/checkpoint_best.pt
+  --device cuda \
+  --resize 512 512 \
+  --skip_existing
+done
 ```
 
 #### 实验4.2: 评估GRPO模型
