@@ -415,7 +415,7 @@ ls outputs/braintumour/peft_supervised_baseline/*.pt
 
 ```bash
 python -m seg-rl.peft.train_supervised_peft \
-  --jsonl datasets/Task01_BrainTumour/peft_train.jsonl \
+  --jsonl outputs/braintumour/peft_train-251107.jsonl \
   --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
   --freeze_sam \
   --lora_rank 16 \
@@ -447,7 +447,7 @@ python -m seg-rl.peft.train_supervised_peft \
 # LoRA秩对比
 for rank in 8 16 32; do
   python -m seg-rl.peft.train_supervised_peft \
-    --jsonl datasets/Task01_BrainTumour/peft_train.jsonl \
+    --jsonl outputs/braintumour/peft_train-251107.jsonl \
     --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
     --lora_rank $rank \
     --lora_alpha $((rank * 2)) \
@@ -459,7 +459,7 @@ done
 # 融合方式对比
 for fusion in film concat; do
   python -m seg-rl.peft.train_supervised_peft \
-    --jsonl datasets/Task01_BrainTumour/peft_train.jsonl \
+    --jsonl outputs/braintumour/peft_train-251107.jsonl \
     --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
     --fusion_mode $fusion \
     --out_dir outputs/braintumour/peft_fusion_${fusion} \
@@ -478,7 +478,7 @@ done
 
 ```bash
 python -m seg-rl.peft.train_grpo_peft \
-  --train_json datasets/Task01_BrainTumour/peft_train.jsonl \
+  --train_json outputs/braintumour/peft_train-251107.jsonl \
   --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
   --init_policy outputs/braintumour/peft_supervised_baseline/checkpoint_best.pt \
   --out_dir outputs/braintumour/peft_grpo_baseline \
@@ -813,7 +813,7 @@ FileNotFoundError: sam_masks_dir/.../0.png not found
 # 检查JSONL文件中的sam_masks_dir字段
 python -c "
 import json
-with open('datasets/Task01_BrainTumour/peft_train.jsonl', 'r') as f:
+with open('outputs/braintumour/peft_train-251107.jsonl', 'r') as f:
     data = json.load(f)
     print('sam_masks_dir:', data[0].get('sam_masks_dir'))
 "
@@ -852,7 +852,7 @@ RuntimeError: Cannot find qkv or q/k/v projection layers in attention
    python -c "
    import json
    import numpy as np
-   with open('datasets/Task01_BrainTumour/peft_train.jsonl', 'r') as f:
+   with open('outputs/braintumour/peft_train-251107.jsonl', 'r') as f:
        data = json.load(f)
        num_points = [len(d['points']) for d in data]
        print(f'Points per sample: mean={np.mean(num_points):.1f}, min={min(num_points)}, max={max(num_points)}')
@@ -1984,7 +1984,7 @@ ls outputs/braintumour/peft_supervised_baseline/*.pt
 
 ```bash
 python -m seg-rl.peft.train_supervised_peft \
-  --jsonl datasets/Task01_BrainTumour/peft_train.jsonl \
+  --jsonl outputs/braintumour/peft_train-251107.jsonl \
   --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
   --freeze_sam \
   --lora_rank 16 \
@@ -2016,7 +2016,7 @@ python -m seg-rl.peft.train_supervised_peft \
 # LoRA秩对比
 for rank in 8 16 32; do
   python -m seg-rl.peft.train_supervised_peft \
-    --jsonl datasets/Task01_BrainTumour/peft_train.jsonl \
+    --jsonl outputs/braintumour/peft_train-251107.jsonl \
     --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
     --lora_rank $rank \
     --lora_alpha $((rank * 2)) \
@@ -2028,7 +2028,7 @@ done
 # 融合方式对比
 for fusion in film concat; do
   python -m seg-rl.peft.train_supervised_peft \
-    --jsonl datasets/Task01_BrainTumour/peft_train.jsonl \
+    --jsonl outputs/braintumour/peft_train-251107.jsonl \
     --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
     --fusion_mode $fusion \
     --out_dir outputs/braintumour/peft_fusion_${fusion} \
@@ -2047,7 +2047,7 @@ done
 
 ```bash
 python -m seg-rl.peft.train_grpo_peft \
-  --train_json datasets/Task01_BrainTumour/peft_train.jsonl \
+  --train_json outputs/braintumour/peft_train-251107.jsonl \
   --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
   --init_policy outputs/braintumour/peft_supervised_baseline/checkpoint_best.pt \
   --out_dir outputs/braintumour/peft_grpo_baseline \
@@ -2382,7 +2382,7 @@ FileNotFoundError: sam_masks_dir/.../0.png not found
 # 检查JSONL文件中的sam_masks_dir字段
 python -c "
 import json
-with open('datasets/Task01_BrainTumour/peft_train.jsonl', 'r') as f:
+with open('outputs/braintumour/peft_train-251107.jsonl', 'r') as f:
     data = json.load(f)
     print('sam_masks_dir:', data[0].get('sam_masks_dir'))
 "
@@ -2421,7 +2421,7 @@ RuntimeError: Cannot find qkv or q/k/v projection layers in attention
    python -c "
    import json
    import numpy as np
-   with open('datasets/Task01_BrainTumour/peft_train.jsonl', 'r') as f:
+   with open('outputs/braintumour/peft_train-251107.jsonl', 'r') as f:
        data = json.load(f)
        num_points = [len(d['points']) for d in data]
        print(f'Points per sample: mean={np.mean(num_points):.1f}, min={min(num_points)}, max={max(num_points)}')
@@ -3568,7 +3568,7 @@ ls outputs/braintumour/peft_supervised_baseline/*.pt
 
 ```bash
 python -m seg-rl.peft.train_supervised_peft \
-  --jsonl datasets/Task01_BrainTumour/peft_train.jsonl \
+  --jsonl outputs/braintumour/peft_train-251107.jsonl \
   --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
   --freeze_sam \
   --lora_rank 16 \
@@ -3600,7 +3600,7 @@ python -m seg-rl.peft.train_supervised_peft \
 # LoRA秩对比
 for rank in 8 16 32; do
   python -m seg-rl.peft.train_supervised_peft \
-    --jsonl datasets/Task01_BrainTumour/peft_train.jsonl \
+    --jsonl outputs/braintumour/peft_train-251107.jsonl \
     --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
     --lora_rank $rank \
     --lora_alpha $((rank * 2)) \
@@ -3612,7 +3612,7 @@ done
 # 融合方式对比
 for fusion in film concat; do
   python -m seg-rl.peft.train_supervised_peft \
-    --jsonl datasets/Task01_BrainTumour/peft_train.jsonl \
+    --jsonl outputs/braintumour/peft_train-251107.jsonl \
     --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
     --fusion_mode $fusion \
     --out_dir outputs/braintumour/peft_fusion_${fusion} \
@@ -3631,7 +3631,7 @@ done
 
 ```bash
 python -m seg-rl.peft.train_grpo_peft \
-  --train_json datasets/Task01_BrainTumour/peft_train.jsonl \
+  --train_json outputs/braintumour/peft_train-251107.jsonl \
   --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
   --init_policy outputs/braintumour/peft_supervised_baseline/checkpoint_best.pt \
   --out_dir outputs/braintumour/peft_grpo_baseline \
@@ -3966,7 +3966,7 @@ FileNotFoundError: sam_masks_dir/.../0.png not found
 # 检查JSONL文件中的sam_masks_dir字段
 python -c "
 import json
-with open('datasets/Task01_BrainTumour/peft_train.jsonl', 'r') as f:
+with open('outputs/braintumour/peft_train-251107.jsonl', 'r') as f:
     data = json.load(f)
     print('sam_masks_dir:', data[0].get('sam_masks_dir'))
 "
@@ -4005,7 +4005,7 @@ RuntimeError: Cannot find qkv or q/k/v projection layers in attention
    python -c "
    import json
    import numpy as np
-   with open('datasets/Task01_BrainTumour/peft_train.jsonl', 'r') as f:
+   with open('outputs/braintumour/peft_train-251107.jsonl', 'r') as f:
        data = json.load(f)
        num_points = [len(d['points']) for d in data]
        print(f'Points per sample: mean={np.mean(num_points):.1f}, min={min(num_points)}, max={max(num_points)}')
@@ -5191,7 +5191,7 @@ python -m seg-rl.peft.train_supervised_peft \
 
 ```bash
 # 启动TensorBoard
-tensorboard --logdir outputs/braintumour/peft_supervised_baseline/tensorboard --port 6006
+tensorboard --logdir outputs/braintumour/peft_supervised_baseline-251107/tensorboard --port 6006
 
 # 在浏览器打开 http://localhost:6006
 # 查看：
@@ -5216,7 +5216,7 @@ ls outputs/braintumour/peft_supervised_baseline/*.pt
 
 ```bash
 python -m seg-rl.peft.train_supervised_peft \
-  --jsonl datasets/Task01_BrainTumour/peft_train.jsonl \
+  --jsonl outputs/braintumour/peft_train-251107.jsonl \
   --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
   --freeze_sam \
   --lora_rank 16 \
@@ -5227,9 +5227,9 @@ python -m seg-rl.peft.train_supervised_peft \
   --loss kl \
   --sigma 8.0 \
   --batch_size 8 \
-  --epochs 20 \
+  --epochs 40 \
   --lr_point 1e-4 \
-  --out_dir outputs/braintumour/peft_frozen_sam \
+  --out_dir outputs/braintumour/peft_frozen_sam-251107 \
   --save_every 5 \
   --tb \
   --device cuda
@@ -5248,7 +5248,7 @@ python -m seg-rl.peft.train_supervised_peft \
 # LoRA秩对比
 for rank in 8 16 32; do
   python -m seg-rl.peft.train_supervised_peft \
-    --jsonl datasets/Task01_BrainTumour/peft_train.jsonl \
+    --jsonl outputs/braintumour/peft_train-251107.jsonl \
     --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
     --lora_rank $rank \
     --lora_alpha $((rank * 2)) \
@@ -5260,7 +5260,7 @@ done
 # 融合方式对比
 for fusion in film concat; do
   python -m seg-rl.peft.train_supervised_peft \
-    --jsonl datasets/Task01_BrainTumour/peft_train.jsonl \
+    --jsonl outputs/braintumour/peft_train-251107.jsonl \
     --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
     --fusion_mode $fusion \
     --out_dir outputs/braintumour/peft_fusion_${fusion} \
@@ -5279,7 +5279,7 @@ done
 
 ```bash
 python -m seg-rl.peft.train_grpo_peft \
-  --train_json datasets/Task01_BrainTumour/peft_train.jsonl \
+  --train_json outputs/braintumour/peft_train-251107.jsonl \
   --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
   --init_policy outputs/braintumour/peft_supervised_baseline/checkpoint_best.pt \
   --out_dir outputs/braintumour/peft_grpo_baseline \
@@ -5614,7 +5614,7 @@ FileNotFoundError: sam_masks_dir/.../0.png not found
 # 检查JSONL文件中的sam_masks_dir字段
 python -c "
 import json
-with open('datasets/Task01_BrainTumour/peft_train.jsonl', 'r') as f:
+with open('outputs/braintumour/peft_train-251107.jsonl', 'r') as f:
     data = json.load(f)
     print('sam_masks_dir:', data[0].get('sam_masks_dir'))
 "
@@ -5653,7 +5653,7 @@ RuntimeError: Cannot find qkv or q/k/v projection layers in attention
    python -c "
    import json
    import numpy as np
-   with open('datasets/Task01_BrainTumour/peft_train.jsonl', 'r') as f:
+   with open('outputs/braintumour/peft_train-251107.jsonl', 'r') as f:
        data = json.load(f)
        num_points = [len(d['points']) for d in data]
        print(f'Points per sample: mean={np.mean(num_points):.1f}, min={min(num_points)}, max={max(num_points)}')

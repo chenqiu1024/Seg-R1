@@ -287,7 +287,7 @@ python -m seg-rl.peft.train_supervised_peft \
   --tau 1.0 \
   --label_loss_weight 0.1 \
   --batch_size 8 \
-  --epochs 40 \
+  --epochs 100 \
   --amp \
   --lr_sam 1e-5 \
   --lr_point 1e-4 \
@@ -296,8 +296,8 @@ python -m seg-rl.peft.train_supervised_peft \
   --lr_scheduler warmup_cosine \
   --warmup_epochs 3 \
   --val_ratio 0.1 \
-  --eval_thresholds "8,12,16,20" \
-  --out_dir outputs/braintumour/peft_supervised_baseline-251107 \
+  --eval_thresholds "8,12,16,20,40" \
+  --out_dir outputs/braintumour/peft_supervised_baseline-251107A \
   --save_every 5 \
   --auto_resume \
   --tb \

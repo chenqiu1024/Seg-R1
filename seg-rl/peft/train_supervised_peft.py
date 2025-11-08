@@ -122,7 +122,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--resume", type=str, default=None, help="Resume from specific checkpoint")
     
     # 验证与评估
-    p.add_argument("--eval_thresholds", type=str, default="8,12,16,20",
+    p.add_argument("--eval_thresholds", type=str, default="8,12,16,20,40",
                    help="PCK thresholds (comma-separated)")
     
     # 其他
