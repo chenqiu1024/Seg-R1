@@ -99,6 +99,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sigma", type=float, default=8.0, help="Gaussian sigma for target heatmap")
     p.add_argument("--tau", type=float, default=1.0, help="Temperature for KL loss")
     p.add_argument("--label_loss_weight", type=float, default=0.1, help="Label loss weight")
+    p.add_argument("--use_class_weights", action="store_true",
+                   help="Use class weights for label loss (weight foreground more)")
+    p.add_argument("--foreground_weight", type=float, default=2.0,
+                   help="Weight for foreground class (when use_class_weights=True)")
     
     # 训练
     p.add_argument("--batch_size", type=int, default=8, help="Batch size")
@@ -143,9 +147,17 @@ def compute_loss(
     sigma: float,
     tau: float,
     label_weight: float,
+    use_class_weights: bool = False,
+    foreground_weight: float = 2.0,
+    device: Optional[torch.device] = None,
 ) -> tuple:
     """
     计算总损失
+    
+    Args:
+        use_class_weights: 是否使用类别权重平衡
+        foreground_weight: 前景类别的权重（当use_class_weights=True时）
+        device: 设备（当use_class_weights=True时需要）
     
     Returns:
         (total_loss, heatmap_loss, label_loss)
@@ -159,7 +171,13 @@ def compute_loss(
         raise ValueError(f"Unknown loss type: {loss_type}")
     
     # 标签loss
-    label_loss = F.cross_entropy(label_logits, target_labels)
+    if use_class_weights and device is not None:
+        # 使用类别权重平衡：给前景点更高的权重
+        # [背景, 前景] = [0, 1]
+        class_weights = torch.tensor([1.0, foreground_weight], device=device)
+        label_loss = F.cross_entropy(label_logits, target_labels, weight=class_weights)
+    else:
+        label_loss = F.cross_entropy(label_logits, target_labels)
     
     # 总loss
     total_loss = heatmap_loss + label_weight * label_loss
@@ -209,9 +227,11 @@ def train_one_epoch(
             heatmap_logits, label_logits = point_predictor(sam_features, prev_masks)
             
             # 计算loss
+            device_obj = torch.device(args.device) if isinstance(args.device, str) else args.device
             total_loss, heatmap_loss, label_loss = compute_loss(
                 heatmap_logits, target_points, label_logits, target_labels,
-                args.loss, args.sigma, args.tau, args.label_loss_weight
+                args.loss, args.sigma, args.tau, args.label_loss_weight,
+                args.use_class_weights, args.foreground_weight, device_obj
             )
         
         # 反向传播

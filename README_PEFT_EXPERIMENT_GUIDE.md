@@ -283,12 +283,15 @@ python -m seg-rl.peft.train_supervised_peft \
   --feature_scale 8 \
   --fusion_mode film \
   --image_size 512 512 \
+  --label_loss_weight 0.5 \
+  --use_class_weights \
+  --foreground_weight 2.0 \
   --loss kl \
   --sigma 8.0 \
   --tau 1.0 \
   --label_loss_weight 0.1 \
   --batch_size 8 \
-  --epochs 100 \
+  --epochs 50 \
   --amp \
   --lr_sam 1e-5 \
   --lr_point 1e-4 \
@@ -298,7 +301,7 @@ python -m seg-rl.peft.train_supervised_peft \
   --warmup_epochs 3 \
   --val_ratio 0.1 \
   --eval_thresholds "8,12,16,20,40" \
-  --out_dir outputs/braintumour/peft_supervised_baseline-251107A \
+  --out_dir outputs/braintumour/peft_supervised_baseline-251108 \
   --save_every 5 \
   --auto_resume \
   --tb \
@@ -533,20 +536,20 @@ OR 使用先前的 预测下一点+SAM分割 交替方式：
 #### 4.1b.1 预测第一提示点：
 ```
 python -m seg-rl.heatmap.predict_next_point_from_model \
-    --model_path outputs/braintumour/peft_supervised_baseline-251107A/checkpoint_best.pt \
+    --model_path outputs/braintumour/peft_supervised_baseline-251108/checkpoint_epoch049.pt \
     --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
     --images_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/images \
     --masks_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/masks \
-    --output_json outputs/braintumour/pred-peft_test-251107.jsonl
+    --output_json outputs/braintumour/pred-peft_all-251108.jsonl
 ```
 #### 4.1b.2 生成第一个掩膜
 ```bash
 python seg-rl/sam2_segment_from_points.py \
-  --input_jsonl outputs/braintumour/pred-peft_test-251107.jsonl \
-  --json_output outputs/braintumour/pred-peft_test-251107.jsonl\
-  --output_dir outputs/braintumour/sam_masks-pred-peft_test-251107 \
+  --input_jsonl outputs/braintumour/pred-peft_all-251108.jsonl \
+  --json_output outputs/braintumour/pred-peft_all-251108.jsonl \
+  --output_dir outputs/braintumour/sam_masks-pred-peft_all-251108 \
   --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
-  --heatmap_model outputs/braintumour/peft_supervised_baseline-251107A/checkpoint_best.pt
+  --heatmap_model outputs/braintumour/peft_supervised_baseline-251108/checkpoint_epoch049.pt \
   --device cuda \
   --resize 512 512 \
   --skip_existing
@@ -557,16 +560,16 @@ python seg-rl/sam2_segment_from_points.py \
 for i in {2..15}; do
   echo "=== Predicting point $i ==="
   python -m seg-rl.heatmap.predict_next_point_from_model \
-    --model_path outputs/braintumour/peft_supervised_baseline-251107A/checkpoint_best.pt \
+    --model_path outputs/braintumour/peft_supervised_baseline-251108/checkpoint_epoch049.pt \
     --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
-    --appendto_json outputs/braintumour/pred-peft_test-251107.jsonl
+    --appendto_json outputs/braintumour/pred-peft_all-251108.jsonl
   
   python seg-rl/sam2_segment_from_points.py \
-  --input_jsonl outputs/braintumour/pred-peft_test-251107.jsonl \
-  --json_output outputs/braintumour/pred-peft_test-251107.jsonl\
-  --output_dir outputs/braintumour/sam_masks-pred-peft_test-251107 \
+  --input_jsonl outputs/braintumour/pred-peft_all-251108.jsonl \
+  --json_output outputs/braintumour/pred-peft_all-251108.jsonl \
+  --output_dir outputs/braintumour/sam_masks-pred-peft_all-251108 \
   --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
-  --heatmap_model outputs/braintumour/peft_supervised_baseline-251107A/checkpoint_best.pt
+  --heatmap_model outputs/braintumour/peft_supervised_baseline-251108/checkpoint_epoch049.pt \
   --device cuda \
   --resize 512 512 \
   --skip_existing
