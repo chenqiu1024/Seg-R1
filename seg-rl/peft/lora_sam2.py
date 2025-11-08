@@ -86,9 +86,12 @@ class LoRALinear(nn.Module):
         in_features = base_linear.in_features
         out_features = base_linear.out_features
         
+        # 获取base_linear的设备，确保LoRA参数在同一设备上
+        device = base_linear.weight.device
+        
         # LoRA矩阵初始化：A用小随机值，B用零（保证初始时LoRA不影响输出）
-        self.lora_A = nn.Parameter(torch.randn(rank, in_features) * 0.01)
-        self.lora_B = nn.Parameter(torch.zeros(out_features, rank))
+        self.lora_A = nn.Parameter(torch.randn(rank, in_features, device=device) * 0.01)
+        self.lora_B = nn.Parameter(torch.zeros(out_features, rank, device=device))
         self.scaling = alpha / rank
         
         self.rank = rank
@@ -170,26 +173,21 @@ class LoRASAM2Wrapper:
         
         对于Hiera模型，结构为:
         - trunk (Hiera backbone)
-          - stages: List[Stage]
-            - blocks: List[Block]
-              - attn: Attention
-                - qkv: Linear  <- 注入LoRA的目标
+          - blocks: nn.ModuleList[MultiScaleBlock]  <- 所有块的列表
+          - stage_ends: List[int]  <- 每个阶段结束的块索引
+            - blocks[i].attn: MultiScaleAttention
+              - qkv: Linear  <- 注入LoRA的目标
         """
         # 获取image encoder的trunk (Hiera)
         image_encoder = self.model.image_encoder
         trunk = image_encoder.trunk
         
-        # 访问最后一个stage
-        if not hasattr(trunk, 'stages') or len(trunk.stages) == 0:
-            raise RuntimeError("Cannot find stages in Hiera trunk")
+        # 访问blocks列表（Hiera使用blocks而不是stages）
+        if not hasattr(trunk, 'blocks') or len(trunk.blocks) == 0:
+            raise RuntimeError("Cannot find blocks in Hiera trunk")
         
-        last_stage = trunk.stages[-1]
-        
-        # 访问最后一个block
-        if not hasattr(last_stage, 'blocks') or len(last_stage.blocks) == 0:
-            raise RuntimeError("Cannot find blocks in last stage")
-        
-        last_block = last_stage.blocks[-1]
+        # 获取最后一个block（最后一个阶段的最后一个块）
+        last_block = trunk.blocks[-1]
         
         # 找到attention层的qkv投影
         if not hasattr(last_block, 'attn'):
@@ -272,19 +270,30 @@ class LoRASAM2Wrapper:
         backbone_out = self.model.forward_image(image)
         
         # SAM2内部方法: 准备backbone特征
-        # 返回: (image_embed, vision_feats, vision_pos_embeds, feat_sizes)
-        _, vision_feats, _, _ = self.model._prepare_backbone_features(backbone_out)
+        # 返回: (backbone_out, vision_feats, vision_pos_embeds, feat_sizes)
+        # vision_feats格式: [HW, B, C] (已展平)
+        _, vision_feats, _, feat_sizes = self.model._prepare_backbone_features(backbone_out)
         
         # vision_feats是一个list，包含多个尺度的特征
         # 根据feature_scale选择对应的level
         if feature_scale == 4:
-            feature = vision_feats[0]  # Level 0
+            feat_idx = 0
         elif feature_scale == 8:
-            feature = vision_feats[1] if len(vision_feats) > 1 else vision_feats[0]  # Level 1
+            feat_idx = 1 if len(vision_feats) > 1 else 0
         elif feature_scale == 16:
-            feature = vision_feats[2] if len(vision_feats) > 2 else vision_feats[-1]  # Level 2
+            feat_idx = 2 if len(vision_feats) > 2 else len(vision_feats) - 1
         else:
             raise ValueError(f"Unsupported feature_scale: {feature_scale}. Use 4, 8, or 16.")
+        
+        # 获取选中的特征和尺寸
+        feature = vision_feats[feat_idx]  # [HW, B, C]
+        feat_size = feat_sizes[feat_idx]  # (H, W)
+        batch_size = image.shape[0]
+        
+        # 将特征从 [HW, B, C] 转换为 [B, C, H, W]
+        # 参考 sam2_image_predictor.py 中的转换方式
+        feature = feature.permute(1, 2, 0)  # [B, C, HW]
+        feature = feature.view(batch_size, -1, *feat_size)  # [B, C, H, W]
         
         return feature
     

@@ -136,12 +136,12 @@ python -m seg-rl.peft.test_modules --device cuda
 
 ```bash
 python seg-rl/annotator/gen_point_jsonl_from_masks.py \
-  --images_dir datasets/Task01_BrainTumour/canonical/images \
-  --masks_dir datasets/Task01_BrainTumour/canonical/masks \
-  --output_jsonl datasets/Task01_BrainTumour/peft_train_step0.jsonl
+  --images_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/images \
+  --masks_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/masks \
+  --output_jsonl outputs/braintumour/pretrain_251107.jsonl
 ```
 
-**输出**：`peft_train_step0.jsonl`，每个样本包含第一个点：
+**输出**：`pretrain_251107.jsonl`，每个样本包含第一个点：
 ```json
 {
   "image": "/abs/path/to/sample_001.jpg",
@@ -155,9 +155,9 @@ python seg-rl/annotator/gen_point_jsonl_from_masks.py \
 
 ```bash
 python seg-rl/sam2_segment_from_points.py \
-  --input_jsonl datasets/Task01_BrainTumour/peft_train_step0.jsonl \
-  --json_output datasets/Task01_BrainTumour/peft_train_step0.jsonl \
-  --output_dir datasets/Task01_BrainTumour/sam_masks_peft \
+  --input_jsonl outputs/braintumour/pretrain_251107.jsonl \
+  --json_output outputs/braintumour/pretrain_251107.jsonl \
+  --output_dir outputs/braintumour/sam_masks_ref \
   --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
   --device cuda \
   --resize 512 512 \
@@ -165,14 +165,14 @@ python seg-rl/sam2_segment_from_points.py \
 ```
 
 **输出**：
-- `sam_masks_peft/sample_001/0.png` - 第一个点生成的掩模
-- 更新`peft_train_step0.jsonl`，添加`sam_masks_dir`字段
+- `sam_masks_ref/sample_001/0.png` - 第一个点生成的掩模
+- 更新`pretrain_251107.jsonl`，添加`sam_masks_dir`字段
 
 #### 步骤1.3: 生成第二个提示点
 
 ```bash
 python seg-rl/annotator/gen_point_jsonl_from_masks.py \
-  --appendto_jsonl datasets/Task01_BrainTumour/peft_train_step0.jsonl
+  --appendto_jsonl outputs/braintumour/pretrain_251107.jsonl 
 ```
 
 **输出**：更新JSONL，添加第二个点：
@@ -188,16 +188,16 @@ python seg-rl/annotator/gen_point_jsonl_from_masks.py \
 
 ```bash
 python seg-rl/sam2_segment_from_points.py \
-  --input_jsonl datasets/Task01_BrainTumour/peft_train_step0.jsonl \
-  --json_output datasets/Task01_BrainTumour/peft_train_step0.jsonl \
-  --output_dir datasets/Task01_BrainTumour/sam_masks_peft \
+  --input_jsonl outputs/braintumour/pretrain_251107.jsonl \
+  --json_output outputs/braintumour/pretrain_251107.jsonl \
+  --output_dir outputs/braintumour/sam_masks_ref \
   --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
   --device cuda \
   --resize 512 512 \
   --skip_existing
 ```
 
-**输出**：`sam_masks_peft/sample_001/1.png`
+**输出**：`sam_masks_ref/sample_001/1.png`
 
 #### 步骤1.5-1.N: 继续迭代
 
@@ -208,12 +208,12 @@ python seg-rl/sam2_segment_from_points.py \
 for i in {2..15}; do
   echo "=== Generating point $i ==="
   python seg-rl/annotator/gen_point_jsonl_from_masks.py \
-    --appendto_jsonl datasets/Task01_BrainTumour/peft_train_step0.jsonl
+    --appendto_jsonl outputs/braintumour/pretrain_251107.jsonl 
   
   python seg-rl/sam2_segment_from_points.py \
-    --input_jsonl datasets/Task01_BrainTumour/peft_train_step0.jsonl \
-    --json_output datasets/Task01_BrainTumour/peft_train_step0.jsonl \
-    --output_dir datasets/Task01_BrainTumour/sam_masks_peft \
+    --input_jsonl outputs/braintumour/pretrain_251107.jsonl \
+    --json_output outputs/braintumour/pretrain_251107.jsonl \
+    --output_dir outputs/braintumour/sam_masks_ref \
     --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
     --device cuda --resize 512 512 --skip_existing
 done
@@ -225,7 +225,7 @@ done
 # 检查生成的数据
 python -c "
 import json
-with open('datasets/Task01_BrainTumour/peft_train_step0.jsonl', 'r') as f:
+with open('outputs/braintumour/pretrain_251107.jsonl', 'r') as f:
     data = json.load(f)
     print(f'Total samples: {len(data)}')
     print(f'Points per sample: {len(data[0][\"points\"])}')
@@ -233,7 +233,7 @@ with open('datasets/Task01_BrainTumour/peft_train_step0.jsonl', 'r') as f:
 "
 
 # 检查掩模文件
-ls datasets/Task01_BrainTumour/sam_masks_peft/sample_001/ | wc -l
+ls outputs/braintumour/sam_masks_ref/BRATS_001_z0029/ | wc -l
 # 应该输出：16（如果生成了16个点）
 ```
 
@@ -245,7 +245,7 @@ python -c "
 import json
 import random
 
-with open('datasets/Task01_BrainTumour/peft_train_step0.jsonl', 'r') as f:
+with open('outputs/braintumour/pretrain_251107.jsonl', 'r') as f:
     data = json.load(f)
 
 random.seed(42)
@@ -255,10 +255,10 @@ split_idx = int(len(data) * 0.8)
 train_data = data[:split_idx]
 test_data = data[split_idx:]
 
-with open('datasets/Task01_BrainTumour/peft_train.jsonl', 'w') as f:
+with open('outputs/braintumour/peft_train-251107.jsonl', 'w') as f:
     json.dump(train_data, f, indent=2)
 
-with open('datasets/Task01_BrainTumour/peft_test.jsonl', 'w') as f:
+with open('outputs/braintumour/peft_test-251107.jsonl', 'w') as f:
     json.dump(test_data, f, indent=2)
 
 print(f'Train: {len(train_data)}, Test: {len(test_data)}')
@@ -275,7 +275,7 @@ print(f'Train: {len(train_data)}, Test: {len(test_data)}')
 
 ```bash
 python -m seg-rl.peft.train_supervised_peft \
-  --jsonl datasets/Task01_BrainTumour/peft_train.jsonl \
+  --jsonl outputs/braintumour/peft_train-251107.jsonl \
   --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
   --lora_rank 16 \
   --lora_alpha 32 \
@@ -297,7 +297,7 @@ python -m seg-rl.peft.train_supervised_peft \
   --warmup_epochs 3 \
   --val_ratio 0.1 \
   --eval_thresholds "8,12,16,20" \
-  --out_dir outputs/braintumour/peft_supervised_baseline \
+  --out_dir outputs/braintumour/peft_supervised_baseline-251107 \
   --save_every 5 \
   --auto_resume \
   --tb \
@@ -824,6 +824,148 @@ RuntimeError: Cannot find qkv or q/k/v projection layers in attention
      --output_dir test_sam_output \
      --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt
    ```
+
+### 问题6: ModuleNotFoundError: No module named 'iopath'
+
+**症状**：
+```
+ModuleNotFoundError: No module named 'iopath'
+ImportError: Error loading 'sam2.modeling.backbones.hieradet.Hiera':
+ModuleNotFoundError("No module named 'iopath'")
+```
+
+**原因**：
+`iopath` 是 SAM2 的必需依赖，但在安装 SAM2 时可能没有正确安装。
+
+**解决方案**：
+```bash
+# 方法1: 直接安装 iopath
+pip install iopath
+
+# 方法2: 重新安装 SAM2 并确保依赖被安装
+cd third_party/sam2
+pip install -e . --force-reinstall
+cd ../..
+
+# 验证安装
+python -c "from iopath.common.file_io import g_pathmgr; print('iopath 安装成功')"
+```
+
+### 问题7: RuntimeError: Cannot find stages in Hiera trunk
+
+**症状**：
+```
+RuntimeError: Cannot find stages in Hiera trunk
+```
+
+**原因**：
+代码尝试访问 Hiera trunk 的 `stages` 属性，但 Hiera 模型实际使用的是 `blocks` 属性（`nn.ModuleList`）来存储所有块。
+
+**解决方案**：
+这个问题已经在最新版本的代码中修复。如果仍然遇到此错误，请确保使用最新版本的 `lora_sam2.py`。修复后的代码会：
+- 使用 `trunk.blocks` 而不是 `trunk.stages`
+- 直接访问最后一个块：`trunk.blocks[-1]`
+
+如果问题仍然存在，可以手动检查模型结构：
+```bash
+python -c "
+import sys
+sys.path.insert(0, 'third_party/sam2')
+from sam2.build_sam import build_sam2
+model = build_sam2('configs/sam2.1/sam2.1_hiera_l.yaml', 
+                   'third_party/sam2/checkpoints/sam2.1_hiera_large.pt', 
+                   device='cpu')
+trunk = model.image_encoder.trunk
+print(f'Has blocks: {hasattr(trunk, \"blocks\")}')
+print(f'Number of blocks: {len(trunk.blocks)}')
+print(f'Last block has attn: {hasattr(trunk.blocks[-1], \"attn\")}')
+"
+```
+
+### 问题8: RuntimeError: Expected all tensors to be on the same device
+
+**症状**：
+```
+RuntimeError: Expected all tensors to be on the same device, but found at least two devices, cuda:0 and cpu!
+(when checking argument for argument mat2 in method wrapper_CUDA_mm)
+```
+
+**原因**：
+LoRA 参数（`lora_A` 和 `lora_B`）在创建时默认在 CPU 上，而模型和输入数据在 CUDA 上，导致设备不匹配。
+
+**解决方案**：
+这个问题已经在最新版本的代码中修复。修复后的代码会在创建 LoRA 参数时自动检测 `base_linear` 的设备，并将 LoRA 参数创建在同一设备上。
+
+如果问题仍然存在，可以手动检查：
+```bash
+python -c "
+import torch
+import sys
+sys.path.insert(0, 'third_party/sam2')
+from sam2.build_sam import build_sam2
+sys.path.insert(0, 'seg-rl/peft')
+from lora_sam2 import LoRALinear
+
+model = build_sam2('configs/sam2.1/sam2.1_hiera_l.yaml', 
+                   'third_party/sam2/checkpoints/sam2.1_hiera_large.pt', 
+                   device='cuda')
+trunk = model.image_encoder.trunk
+last_block = trunk.blocks[-1]
+attn = last_block.attn
+
+print(f'Original qkv device: {attn.qkv.weight.device}')
+lora_qkv = LoRALinear(attn.qkv, rank=16, alpha=32)
+print(f'LoRA A device: {lora_qkv.lora_A.device}')
+print(f'LoRA B device: {lora_qkv.lora_B.device}')
+"
+```
+
+### 问题9: RuntimeError: The size of tensor a (8) must match the size of tensor b (64)
+
+**症状**：
+```
+RuntimeError: The size of tensor a (8) must match the size of tensor b (64) at non-singleton dimension 2
+```
+
+**原因**：
+SAM2 的 `_prepare_backbone_features` 方法返回的特征格式是 `[HW, B, C]`（展平格式），而 FiLM 融合层期望的格式是 `[B, C, H, W]`。如果直接使用返回的特征，会导致空间维度不匹配。
+
+**解决方案**：
+这个问题已经在最新版本的代码中修复。修复后的 `get_image_features` 方法会：
+1. 获取 SAM2 返回的特征（格式：`[HW, B, C]`）
+2. 获取对应的特征尺寸 `(H, W)`
+3. 将特征从 `[HW, B, C]` 转换为 `[B, C, H, W]`
+
+如果问题仍然存在，可以手动检查：
+```bash
+python -c "
+import torch
+import sys
+sys.path.insert(0, 'third_party/sam2')
+from sam2.build_sam import build_sam2
+sys.path.insert(0, 'seg-rl/peft')
+from lora_sam2 import LoRASAM2Wrapper
+from point_predictor_peft import MaskEncoder
+
+sam2_lora = LoRASAM2Wrapper(
+    sam_checkpoint='third_party/sam2/checkpoints/sam2.1_hiera_large.pt',
+    lora_rank=16,
+    lora_alpha=32,
+    device='cuda'
+)
+
+test_image = torch.randn(1, 3, 512, 512).to('cuda')
+sam_features = sam2_lora.get_image_features(test_image, feature_scale=8)
+print(f'SAM features shape: {sam_features.shape}')
+
+test_mask = torch.randn(1, 1, 512, 512).to('cuda')
+mask_encoder = MaskEncoder(output_channels=64, output_scale=8).to('cuda')
+mask_features = mask_encoder(test_mask)
+print(f'Mask features shape: {mask_features.shape}')
+
+print(f'空间维度匹配: {sam_features.shape[2:] == mask_features.shape[2:]}')
+"
+```
 
 ---
 
