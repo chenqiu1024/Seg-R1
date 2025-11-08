@@ -25,6 +25,15 @@
   - GRPO 点策略训练: `train_grpo_points.py`（`validate` 行364；`train` 行413；`__main__` 行744）
   - 推理/调试: `predict_next_point_from_model.py`（`_to_tensor_separate` 行161；`run_initial` 行209；`run_append` 行263；`main` 行399）
   - 工具: `utils.py`（`compute_pck` 行44；`draw_*` 59/68/82；`overlay_heatmap` 行122）
+- **PEFT（参数高效微调）**: `seg-rl/peft/` **[NEW 2025-11-08]**
+  - Late LoRA 与 SAM2: `lora_sam2.py`（`LoRALinear`；`LoRASAM2Wrapper`；LoRA注入、特征提取、掩模预测）
+  - 基于SAM特征的点预测网络: `point_predictor_peft.py`（`MaskEncoder`；`FiLMFusion`/`ConcatFusion`；`Decoder`；`PointPredictorFromSAMFeatures`）
+  - 数据加载: `datasets_peft.py`（`PEFTPointDataset` 支持k=0全零掩模；`PEFTPointDatasetForEval`）
+  - 监督预训练: `train_supervised_peft.py`（双优化器、AMP、自动续传）
+  - GRPO强化学习: `train_grpo_peft.py`（`PolicyNetwork`；rollout；GRPO更新）
+  - 评估: `eval_peft_model.py`（完整rollout评估）
+  - 工具: `utils_peft.py`（metrics、checkpoint管理、可视化辅助）
+  - 文档: `README.md`（技术细节）；`../README_PEFT_EXPERIMENT_GUIDE.md`（完整实验指南）；`../PEFT_COMMANDS_CHEATSHEET.md`（命令速查）
 - SAM2 集成与分割: `seg-rl/sam2_segment_from_points.py`（`SAMWrapper` 行125；`calculate_bounding_box` 行324；`main` 行389；`__main__` 行565），`seg-rl/sam2_segment_simple.py`
 - 端到端编排: `seg-rl/predict_points_and_sam.py`（`main` 行172）
 - 评估与可视化:
@@ -78,7 +87,15 @@
 
 - 2025-10-22
   - `docs/cursor_fix_rl_v1_20251022.md`
-    - 主题：训练中出现的 `ValueError` 的定位与修复；文档内多次出现“SAM2 integration”小节，涉及依赖与导入稳健性。
+    - 主题：训练中出现的 `ValueError` 的定位与修复；文档内多次出现"SAM2 integration"小节，涉及依赖与导入稳健性。
+
+- 2025-11-08 **[NEW PEFT Implementation]**
+  - **PEFT（参数高效微调）模块完整实现**
+    - 主题：集成Late LoRA到SAM2，实现基于SAM特征的点预测网络，包含监督预训练和GRPO强化学习两阶段训练。
+    - **快速开始**：见 `README_PEFT_EXPERIMENT_GUIDE.md`（完整实验指南，包含环境准备、数据生成、训练、评估的详细命令）。
+    - **命令速查**：见 `PEFT_COMMANDS_CHEATSHEET.md`（常用命令快速参考）。
+    - 技术文档：见 `seg-rl/peft/README.md`（架构设计、模块说明、超参数建议）。
+    - 理论参考：Late LoRA方法来自论文 `docs/Parameter Efficient Fine-Tuning of Segment Anything Model for Biomedical Imaging.pdf`。
 
 - 其他专题/需求文档（数据与可视化等）
   - `docs/rl_data_requirements.md`，`docs/prerl_data_requirements.md`，`docs/sft_data_requirements.md`，`docs/sod_finetune_data_requirements.md`
@@ -89,17 +106,25 @@
     - 主题：可视化优化、掩膜对比、代码理解与沟通方式等辅助材料。
 
 ### 四、常见问题到代码/文档的快速跳转
-- 想“端到端”跑通：看 `seg-rl/predict_points_and_sam.py` 的 `main` 行172；配合 `docs/cursor_sam2_segment-20250924.md` 的使用说明与参数。
-- 想训练“监督热力图模型”：
+- 想"端到端"跑通：看 `seg-rl/predict_points_and_sam.py` 的 `main` 行172；配合 `docs/cursor_sam2_segment-20250924.md` 的使用说明与参数。
+- 想训练"监督热力图模型"（baseline，无PEFT）：
   - 配置/入口见 `seg-rl/heatmap/train.py`（`parse_args` 行92；`main` 行131）。
   - 模型定义与采样见 `seg-rl/heatmap/model.py`（详见上文行号）。
   - 损失函数/目标生成见 `seg-rl/heatmap/losses.py`；数据集见 `datasets.py`。
-- 想做“GRPO 点策略微调”：看 `seg-rl/heatmap/train_grpo_points.py`（`validate` 行364；`train` 行413）。
-- 想只做“点预测推理/调试”：看 `seg-rl/heatmap/predict_next_point_from_model.py`（`run_initial` 行209；`run_append` 行263；`main` 行399）。
-- 想“用点喂给 SAM2 出掩膜”：看 `seg-rl/sam2_segment_from_points.py`（`SAMWrapper` 行125；`calculate_bounding_box` 行324；`main` 行389）。
-- 想“评估掩膜质量”：看 `seg-rl/evaluation/eval_sam_masks.py`（`_compute_metrics` 行161；`main` 行206）。
-- 想“调试可视化（点更清晰）”：看 `seg-rl/visualization/viz_heuristic_sam_points.py`（`_draw_caret` 行94；`_draw_cross` 行108）。
-- 想理解“层级/联合策略”与数学推导：优先看 `docs/cursor_heatmap_model.md` 对应小节（行962/2274/3032/10077；3137/10182 等），再对照 `model.py` 相应函数实现。
+- 想做"GRPO 点策略微调"（baseline）：看 `seg-rl/heatmap/train_grpo_points.py`（`validate` 行364；`train` 行413）。
+- **想用"PEFT + SAM2微调"训练点预测模型**：
+  - **完整实验指南**：看 `README_PEFT_EXPERIMENT_GUIDE.md`（端到端流程、所有命令、参数说明）。
+  - **命令速查表**：看 `PEFT_COMMANDS_CHEATSHEET.md`（常用命令快速参考）。
+  - **技术细节**：看 `seg-rl/peft/README.md`（架构说明、模块文档）。
+  - 监督训练入口：`seg-rl/peft/train_supervised_peft.py`
+  - GRPO训练入口：`seg-rl/peft/train_grpo_peft.py`
+  - LoRA实现：`seg-rl/peft/lora_sam2.py`（`LoRALinear`；`LoRASAM2Wrapper`）
+  - 点预测网络：`seg-rl/peft/point_predictor_peft.py`（`PointPredictorFromSAMFeatures`）
+- 想只做"点预测推理/调试"：看 `seg-rl/heatmap/predict_next_point_from_model.py`（`run_initial` 行209；`run_append` 行263；`main` 行399）。
+- 想"用点喂给 SAM2 出掩膜"：看 `seg-rl/sam2_segment_from_points.py`（`SAMWrapper` 行125；`calculate_bounding_box` 行324；`main` 行389）。
+- 想"评估掩膜质量"：看 `seg-rl/evaluation/eval_sam_masks.py`（`_compute_metrics` 行161；`main` 行206）。
+- 想"调试可视化（点更清晰）"：看 `seg-rl/visualization/viz_heuristic_sam_points.py`（`_draw_caret` 行94；`_draw_cross` 行108）。
+- 想理解"层级/联合策略"与数学推导：优先看 `docs/cursor_heatmap_model.md` 对应小节（行962/2274/3032/10077；3137/10182 等），再对照 `model.py` 相应函数实现。
 
 ### 五、数据与产物路径要点
 - 数据集与 JSONL：参考 `docs/*_data_requirements.md` 与 `seg-rl/annotator/gen_point_jsonl_from_masks.py`。
@@ -107,7 +132,12 @@
 - 预训练权重示例：`pretrained/points_predictor-251001-160epochs.pt`。
 
 ### 六、建议的阅读顺序
-1) 本索引（本文）→ 2) `cursor_heatmap_model.md` 的“核心思路/层级与联合策略”→ 3) `seg-rl/heatmap/model.py` 实现 → 4) `train.py` 与 `train_grpo_points.py` 训练入口 → 5) `sam2_segment_from_points.py` → 6) 评估与可视化脚本。
+
+**对于baseline（无PEFT）**:
+1) 本索引（本文）→ 2) `cursor_heatmap_model.md` 的"核心思路/层级与联合策略"→ 3) `seg-rl/heatmap/model.py` 实现 → 4) `train.py` 与 `train_grpo_points.py` 训练入口 → 5) `sam2_segment_from_points.py` → 6) 评估与可视化脚本。
+
+**对于PEFT（SAM2微调）**:
+1) 本索引（本文）→ 2) `README_PEFT_EXPERIMENT_GUIDE.md`（完整实验流程）→ 3) `seg-rl/peft/README.md`（技术细节）→ 4) `seg-rl/peft/lora_sam2.py`（LoRA实现）→ 5) `seg-rl/peft/point_predictor_peft.py`（新点预测网络）→ 6) `train_supervised_peft.py` 与 `train_grpo_peft.py`（训练入口）。
 
 ---
 维护说明：新增文档或改动核心函数后，请同步更新本文的行号锚点与条目简述。

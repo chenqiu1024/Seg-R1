@@ -1,0 +1,24 @@
+# PEFT模块依赖
+
+# 核心依赖
+torch>=2.0.0
+torchvision>=0.15.0
+numpy>=1.21.0
+scipy>=1.7.0
+
+# 图像处理
+pillow>=9.0.0
+opencv-python>=4.5.0
+
+# 工具
+tqdm>=4.62.0
+tensorboard>=2.10.0
+
+# 可视化（可选）
+scikit-learn>=1.0.0  # PCA for feature visualization
+matplotlib>=3.5.0
+
+# SAM2
+# 注意：需要手动安装SAM2
+# cd third_party/sam2 && pip install -e .
+
