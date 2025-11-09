@@ -18,6 +18,14 @@ class ModelConfig:
         - "resnet18": ResNet18 + 插值上采样，速度快但空间精度略低
     pretrained: 是否使用预训练权重（仅对resnet18有效）
     upsample_to_input: resnet18时是否上采样到输入分辨率
+    
+    SAM LoRA 相关配置:
+    use_sam_encoder: 是否使用 SAM image encoder 作为特征提取器
+    sam_checkpoint: SAM 模型检查点路径
+    sam_lora_enabled: 是否启用 Late LoRA 微调
+    sam_lora_rank: LoRA 秩（通常为 4-16）
+    sam_lora_alpha: LoRA 缩放因子
+    sam_lora_dropout: LoRA dropout 概率
     """
     backbone: Literal["resnet18", "unet_s"] = "unet_s"
     pretrained: bool = False
@@ -25,6 +33,15 @@ class ModelConfig:
     # 明确两路输入通道数：主图(灰度或RGB)与条件灰度图
     main_in_channels: int = 3
     cond_in_channels: int = 1
+    
+    # SAM Late LoRA 配置
+    use_sam_encoder: bool = False
+    sam_checkpoint: Optional[str] = None
+    sam_lora_enabled: bool = False
+    sam_lora_rank: int = 8
+    sam_lora_alpha: float = 16.0
+    sam_lora_dropout: float = 0.0
+    sam_freeze_encoder: bool = True  # 是否冻结 SAM encoder（不启用 LoRA 时）
 
 
 class HeatmapHead(nn.Module):
@@ -391,4 +408,216 @@ def log_prob_of_joint_action(
         temperature=temperature_pixel,
     )
     return logp_label + logp_pixel
+
+
+# ==========================
+# SAM Encoder 集成
+# ==========================
+
+class SAMEncoderWrapper(nn.Module):
+    """SAM Image Encoder 包装器，用于特征提取
+    
+    可选地应用 Late LoRA 进行参数高效微调
+    """
+    
+    def __init__(
+        self,
+        sam_checkpoint: str,
+        device: torch.device,
+        lora_enabled: bool = False,
+        lora_rank: int = 8,
+        lora_alpha: float = 16.0,
+        lora_dropout: float = 0.0,
+        freeze_encoder: bool = True,
+    ):
+        super().__init__()
+        
+        # 延迟导入以避免不必要的依赖
+        try:
+            import sys
+            import os
+            # 添加 SAM2 路径
+            sam2_path = os.path.join(os.path.dirname(__file__), "..", "..", "third_party", "sam2")
+            if os.path.exists(sam2_path) and sam2_path not in sys.path:
+                sys.path.insert(0, sam2_path)
+            
+            from sam2.build_sam import build_sam2
+        except ImportError as e:
+            raise ImportError(
+                "SAM2 is required but not found. Please install it:\n"
+                "git clone https://github.com/facebookresearch/segment-anything-2.git third_party/sam2\n"
+                "cd third_party/sam2 && pip install -e ."
+            ) from e
+        
+        # 加载 SAM 模型
+        print(f"[SAM] Loading SAM checkpoint from {sam_checkpoint}")
+        model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
+        self.sam_model = build_sam2(model_cfg, sam_checkpoint, device=str(device))
+        
+        # 提取 image encoder
+        self.image_encoder = self.sam_model.image_encoder
+        
+        # 冻结或启用 LoRA
+        if lora_enabled:
+            print(f"[SAM] Enabling Late LoRA: rank={lora_rank}, alpha={lora_alpha}")
+            try:
+                from .sam_lora import apply_late_lora_to_sam_encoder, print_lora_info
+                self.lora_modules = apply_late_lora_to_sam_encoder(
+                    self.sam_model,
+                    rank=lora_rank,
+                    alpha=lora_alpha,
+                    dropout=lora_dropout,
+                )
+                print_lora_info(self.sam_model)
+            except Exception as e:
+                print(f"[SAM] Warning: Failed to apply LoRA: {e}")
+                self.lora_modules = {}
+        else:
+            self.lora_modules = {}
+            if freeze_encoder:
+                print("[SAM] Freezing SAM image encoder")
+                for param in self.image_encoder.parameters():
+                    param.requires_grad = False
+            else:
+                print("[SAM] SAM image encoder is trainable (no LoRA)")
+        
+        # 获取输出特征维度
+        self.feature_dim = self._get_feature_dim()
+        print(f"[SAM] Encoder feature dimension: {self.feature_dim}")
+    
+    def _get_feature_dim(self) -> int:
+        """通过前向传播一个假输入来获取特征维度"""
+        with torch.no_grad():
+            # SAM 期望输入为 1024x1024
+            dummy = torch.randn(1, 3, 1024, 1024, device=next(self.image_encoder.parameters()).device)
+            feat = self.image_encoder(dummy)
+            if isinstance(feat, (list, tuple)):
+                feat = feat[0]
+            return feat.shape[1]  # [B, C, H, W] -> C
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """提取图像特征
+        
+        Args:
+            x: 输入图像 [B, 3, H, W]，任意尺寸（将被调整为 1024x1024）
+            
+        Returns:
+            特征图 [B, C, H', W']
+        """
+        # SAM encoder 需要 1024x1024 输入
+        orig_size = x.shape[-2:]
+        if orig_size != (1024, 1024):
+            x = F.interpolate(x, size=(1024, 1024), mode="bilinear", align_corners=False)
+        
+        # 提取特征
+        feat = self.image_encoder(x)
+        
+        # 如果输出是多尺度特征，取第一个
+        if isinstance(feat, (list, tuple)):
+            feat = feat[0]
+        
+        return feat
+
+
+class PointHeatmapModelWithSAM(nn.Module):
+    """结合 SAM encoder 的点热力图预测模型
+    
+    使用 SAM image encoder 提取特征，然后通过热力图头预测点位置
+    """
+    
+    def __init__(self, cfg: ModelConfig) -> None:
+        super().__init__()
+        self.cfg = cfg
+        
+        if not cfg.use_sam_encoder:
+            raise ValueError("This model requires use_sam_encoder=True")
+        
+        if cfg.sam_checkpoint is None:
+            raise ValueError("sam_checkpoint must be provided when use_sam_encoder=True")
+        
+        # 确定设备
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # 创建 SAM encoder
+        self.sam_encoder = SAMEncoderWrapper(
+            sam_checkpoint=cfg.sam_checkpoint,
+            device=device,
+            lora_enabled=cfg.sam_lora_enabled,
+            lora_rank=cfg.sam_lora_rank,
+            lora_alpha=cfg.sam_lora_alpha,
+            lora_dropout=cfg.sam_lora_dropout,
+            freeze_encoder=cfg.sam_freeze_encoder,
+        )
+        
+        # 获取 SAM encoder 输出维度
+        sam_feat_dim = self.sam_encoder.feature_dim
+        
+        # 条件输入处理：独立的小网络处理条件图像（灰度 mask）
+        self.cond_encoder = nn.Sequential(
+            nn.Conv2d(cfg.cond_in_channels, 32, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+        )
+        
+        # 特征融合：将 SAM 特征和条件特征拼接
+        # SAM 输出通常是 256 通道 @ 64x64（对于 1024x1024 输入）
+        # 条件特征需要匹配空间尺寸
+        self.feature_fusion = nn.Conv2d(sam_feat_dim + 128, 512, kernel_size=1)
+        
+        # 热力图头和标签头
+        self.head = HeatmapHead(512, mid_channels=256)
+        self.label_head = LabelHead(512, mid_channels=256)
+        
+    def forward(self, x: torch.Tensor, cond: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        """前向传播
+        
+        Args:
+            x: 主图像 [B, 3, H, W]
+            cond: 条件图像（灰度 mask）[B, 1, H, W]
+            
+        Returns:
+            logits: 热力图 logits [B, 1, H, W]
+            label_logits: 标签 logits [B, 2]
+        """
+        b, _, h, w = x.shape
+        
+        # 提取 SAM 特征
+        sam_feat = self.sam_encoder(x)  # [B, C, H', W']
+        
+        # 处理条件输入
+        if cond is None:
+            cond = torch.zeros(b, self.cfg.cond_in_channels, h, w, device=x.device)
+        
+        cond_feat = self.cond_encoder(cond)  # [B, 128, H'', W'']
+        
+        # 匹配空间尺寸
+        if cond_feat.shape[-2:] != sam_feat.shape[-2:]:
+            cond_feat = F.interpolate(
+                cond_feat, 
+                size=sam_feat.shape[-2:], 
+                mode="bilinear", 
+                align_corners=False
+            )
+        
+        # 融合特征
+        fused = torch.cat([sam_feat, cond_feat], dim=1)
+        fused = self.feature_fusion(fused)
+        
+        # 预测热力图
+        logits = self.head(fused)  # [B, 1, H', W']
+        
+        # 上采样到输入分辨率
+        if logits.shape[-2:] != (h, w):
+            logits = F.interpolate(logits, size=(h, w), mode="bilinear", align_corners=False)
+        
+        # 预测标签
+        label_logits = self.label_head(fused)  # [B, 2]
+        
+        return logits, label_logits
 

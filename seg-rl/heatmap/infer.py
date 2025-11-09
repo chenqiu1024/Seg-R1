@@ -10,14 +10,16 @@ from PIL import Image
 import torchvision.transforms.functional as TF
 
 try:
-    from .model import ModelConfig, PointHeatmapModel, argmax_from_logits, soft_argmax_from_logits
+    from .model import ModelConfig, PointHeatmapModel, PointHeatmapModelWithSAM, argmax_from_logits, soft_argmax_from_logits
+    from .utils import load_checkpoint
 except ImportError:  # allow running as a script without package context
     import sys as _sys
     import os as _os
     _pkg_root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
     if _pkg_root not in _sys.path:
         _sys.path.insert(0, _pkg_root)
-    from heatmap.model import ModelConfig, PointHeatmapModel, argmax_from_logits, soft_argmax_from_logits
+    from heatmap.model import ModelConfig, PointHeatmapModel, PointHeatmapModelWithSAM, argmax_from_logits, soft_argmax_from_logits
+    from heatmap.utils import load_checkpoint
 
 """
 热力图点定位模型推理
@@ -69,6 +71,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--soft", action="store_true", help="Use soft-argmax instead of argmax")
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--save_json", type=str, default=None)
+    
+    # SAM Late LoRA 相关参数（用于加载 SAM-based checkpoint）
+    p.add_argument("--sam_checkpoint", type=str, default=None, 
+                   help="Path to SAM checkpoint (auto-detected from model checkpoint if not provided)")
+    
     return p.parse_args()
 
 
@@ -88,13 +95,55 @@ def main() -> None:
     args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    cfg = ModelConfig(backbone=args.arch, pretrained=False)
-    model = PointHeatmapModel(cfg).to(device)
+    # 加载 checkpoint 元数据以检测模型类型
     state = torch.load(args.ckpt, map_location="cpu")
-    # supports both raw model state and full checkpoint
-    sd = state.get("model", state)
-    model.load_state_dict(sd)
+    metadata = state.get("metadata", {})
+    use_sam_encoder = metadata.get("use_sam_encoder", False)
+    sam_lora_enabled = metadata.get("sam_lora_enabled", False)
+    
+    print(f"[Inference] Loading checkpoint from {args.ckpt}")
+    print(f"[Inference] Model type: {'SAM encoder' if use_sam_encoder else 'Standard'}")
+    if use_sam_encoder:
+        print(f"[Inference] LoRA enabled: {sam_lora_enabled}")
+    
+    # 根据 checkpoint 类型创建模型
+    if use_sam_encoder:
+        # 需要 SAM checkpoint 路径
+        sam_checkpoint = args.sam_checkpoint
+        if sam_checkpoint is None:
+            # 尝试从元数据中获取
+            sam_checkpoint = metadata.get("sam_checkpoint")
+        
+        if sam_checkpoint is None:
+            print("[Error] SAM checkpoint path required for SAM-based model")
+            print("[Error] Please provide --sam_checkpoint argument")
+            return
+        
+        print(f"[Inference] SAM checkpoint: {sam_checkpoint}")
+        
+        cfg = ModelConfig(
+            backbone=args.arch,
+            pretrained=False,
+            main_in_channels=3,
+            cond_in_channels=1,
+            use_sam_encoder=True,
+            sam_checkpoint=sam_checkpoint,
+            sam_lora_enabled=sam_lora_enabled,
+            sam_lora_rank=metadata.get("sam_lora_rank", 8),
+            sam_lora_alpha=metadata.get("sam_lora_alpha", 16.0),
+            sam_lora_dropout=metadata.get("sam_lora_dropout", 0.0),
+            sam_freeze_encoder=True,  # 推理时总是冻结
+        )
+        model = PointHeatmapModelWithSAM(cfg).to(device)
+    else:
+        # 标准模型
+        cfg = ModelConfig(backbone=args.arch, pretrained=False)
+        model = PointHeatmapModel(cfg).to(device)
+    
+    # 加载模型参数
+    load_checkpoint(args.ckpt, model, strict=False)
     model.eval()
+    print(f"[Inference] Model loaded successfully\n")
 
     paths = expand_paths(args.images)
     results = []
@@ -103,7 +152,14 @@ def main() -> None:
         (orig_w, orig_h), t = load_image(p, args.height, args.width)
         t = t.to(device)
         with torch.no_grad():
-            logits = model(t)
+            # SAM-based 模型需要分离输入
+            if use_sam_encoder:
+                # 对于单张图片推理，条件图像为空（第一步）
+                cond = torch.zeros(1, 1, args.height, args.width, device=device)
+                logits, _ = model(t, cond)
+            else:
+                logits, _ = model(t)
+        
             if args.soft:
                 xy = soft_argmax_from_logits(logits, temperature=args.temperature)[0]
             else:

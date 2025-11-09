@@ -18,27 +18,134 @@ class Checkpoint:
     scaler: Dict
     epoch: int
     step: int
+    metadata: Dict | None = None  # 添加元数据字段
 
 
-def save_checkpoint(path: str, model: nn.Module, optimizer: torch.optim.Optimizer, scaler: torch.cuda.amp.GradScaler, epoch: int, step: int) -> None:
+def save_checkpoint(
+    path: str, 
+    model: nn.Module, 
+    optimizer: torch.optim.Optimizer, 
+    scaler: torch.cuda.amp.GradScaler, 
+    epoch: int, 
+    step: int,
+    metadata: Dict | None = None,
+) -> None:
+    """保存 checkpoint，包含模型元数据
+    
+    Args:
+        path: 保存路径
+        model: 模型
+        optimizer: 优化器
+        scaler: GradScaler
+        epoch: 当前 epoch
+        step: 当前步数
+        metadata: 模型元数据，如 {"use_sam_encoder": True, "sam_lora_enabled": True, ...}
+    """
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    
+    # 自动检测模型类型
+    if metadata is None:
+        metadata = {}
+        # 检测是否使用 SAM encoder
+        if hasattr(model, "sam_encoder"):
+            metadata["use_sam_encoder"] = True
+            metadata["sam_lora_enabled"] = hasattr(model.sam_encoder, "lora_modules") and len(model.sam_encoder.lora_modules) > 0
+        else:
+            metadata["use_sam_encoder"] = False
+            metadata["sam_lora_enabled"] = False
+    
     torch.save({
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "scaler": scaler.state_dict() if scaler is not None else None,
         "epoch": epoch,
         "step": step,
+        "metadata": metadata,
+        "version": "1.0",  # checkpoint 版本号
     }, path)
 
 
-def load_checkpoint(path: str, model: nn.Module, optimizer: torch.optim.Optimizer | None = None, scaler: torch.cuda.amp.GradScaler | None = None) -> Checkpoint:
+def load_checkpoint(
+    path: str, 
+    model: nn.Module, 
+    optimizer: torch.optim.Optimizer | None = None, 
+    scaler: torch.cuda.amp.GradScaler | None = None,
+    strict: bool = True,
+) -> Checkpoint:
+    """加载 checkpoint，支持向后兼容
+    
+    Args:
+        path: checkpoint 路径
+        model: 目标模型
+        optimizer: 优化器（可选）
+        scaler: GradScaler（可选）
+        strict: 是否严格匹配模型参数
+        
+    Returns:
+        Checkpoint 对象
+    """
     ckpt = torch.load(path, map_location="cpu")
-    model.load_state_dict(ckpt["model"], strict=True)
+    
+    # 获取元数据
+    metadata = ckpt.get("metadata", {})
+    
+    # 检查兼容性
+    model_has_sam = hasattr(model, "sam_encoder")
+    ckpt_has_sam = metadata.get("use_sam_encoder", False)
+    
+    if model_has_sam != ckpt_has_sam:
+        print(f"[Warning] Model type mismatch:")
+        print(f"  Current model uses SAM encoder: {model_has_sam}")
+        print(f"  Checkpoint uses SAM encoder: {ckpt_has_sam}")
+        
+        if not model_has_sam and ckpt_has_sam:
+            print("[Warning] Cannot load SAM-based checkpoint into non-SAM model")
+            print("[Warning] Attempting to load with strict=False, some parameters may be missing")
+            strict = False
+        elif model_has_sam and not ckpt_has_sam:
+            print("[Warning] Cannot load non-SAM checkpoint into SAM model")
+            print("[Warning] Only loading point prediction head parameters")
+            # 只加载非 SAM 部分的参数
+            filtered_state = {}
+            for k, v in ckpt["model"].items():
+                if not k.startswith("sam_encoder"):
+                    filtered_state[k] = v
+            ckpt["model"] = filtered_state
+            strict = False
+    
+    # 加载模型参数
+    try:
+        model.load_state_dict(ckpt["model"], strict=strict)
+        print(f"[Checkpoint] Loaded model parameters (strict={strict})")
+    except Exception as e:
+        print(f"[Error] Failed to load model parameters: {e}")
+        if strict:
+            print("[Info] Retrying with strict=False...")
+            model.load_state_dict(ckpt["model"], strict=False)
+    
+    # 加载优化器和scaler
     if optimizer is not None and "optimizer" in ckpt and ckpt["optimizer"] is not None:
-        optimizer.load_state_dict(ckpt["optimizer"])
+        try:
+            optimizer.load_state_dict(ckpt["optimizer"])
+            print("[Checkpoint] Loaded optimizer state")
+        except Exception as e:
+            print(f"[Warning] Failed to load optimizer state: {e}")
+    
     if scaler is not None and "scaler" in ckpt and ckpt["scaler"] is not None:
-        scaler.load_state_dict(ckpt["scaler"])
-    return Checkpoint(model=ckpt.get("model", {}), optimizer=ckpt.get("optimizer", {}), scaler=ckpt.get("scaler", {}), epoch=ckpt.get("epoch", 0), step=ckpt.get("step", 0))
+        try:
+            scaler.load_state_dict(ckpt["scaler"])
+            print("[Checkpoint] Loaded scaler state")
+        except Exception as e:
+            print(f"[Warning] Failed to load scaler state: {e}")
+    
+    return Checkpoint(
+        model=ckpt.get("model", {}), 
+        optimizer=ckpt.get("optimizer", {}), 
+        scaler=ckpt.get("scaler", {}), 
+        epoch=ckpt.get("epoch", 0), 
+        step=ckpt.get("step", 0),
+        metadata=metadata,
+    )
 
 
 def compute_pck(pred_xy: torch.Tensor, target_xy: torch.Tensor, thresh: float) -> float:

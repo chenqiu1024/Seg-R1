@@ -125,6 +125,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--save_steps", type=int, default=0, help="Save checkpoint every N steps (0 to disable)")
     p.add_argument("--progress", action="store_true", help="Show tqdm progress bar during training")
     p.add_argument("--auto_resume", action="store_true", help="If set and --resume not provided, try <out_dir>/last.pt")
+    
+    # SAM Late LoRA 相关参数
+    p.add_argument("--use_sam_encoder", action="store_true", help="Use SAM image encoder as feature extractor")
+    p.add_argument("--sam_checkpoint", type=str, default=None, help="Path to SAM checkpoint (required if --use_sam_encoder)")
+    p.add_argument("--sam_lora_enabled", action="store_true", help="Enable Late LoRA for SAM encoder fine-tuning")
+    p.add_argument("--sam_lora_rank", type=int, default=8, help="LoRA rank (4-16 recommended)")
+    p.add_argument("--sam_lora_alpha", type=float, default=16.0, help="LoRA alpha scaling factor")
+    p.add_argument("--sam_lora_dropout", type=float, default=0.0, help="LoRA dropout probability")
+    p.add_argument("--sam_lora_lr", type=float, default=None, help="Learning rate for SAM LoRA parameters (if None, use --lr)")
+    
     return p.parse_args()
 
 
@@ -175,10 +185,65 @@ def main() -> None:
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True, collate_fn=collate_fn) if val_ds is not None else None
     test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True, collate_fn=collate_fn) if test_ds is not None else None
 
-    cfg = ModelConfig(backbone=args.arch, pretrained=args.pretrained, main_in_channels=3, cond_in_channels=1)
-    model = PointHeatmapModel(cfg).to(device)
+    # 创建模型配置
+    if args.use_sam_encoder:
+        # 使用 SAM encoder
+        if args.sam_checkpoint is None:
+            raise ValueError("--sam_checkpoint is required when --use_sam_encoder is set")
+        
+        print("\n" + "="*60)
+        print("Using SAM Encoder with Late LoRA")
+        print("="*60)
+        print(f"SAM Checkpoint: {args.sam_checkpoint}")
+        print(f"LoRA Enabled: {args.sam_lora_enabled}")
+        if args.sam_lora_enabled:
+            print(f"LoRA Rank: {args.sam_lora_rank}")
+            print(f"LoRA Alpha: {args.sam_lora_alpha}")
+            print(f"LoRA Dropout: {args.sam_lora_dropout}")
+        print("="*60 + "\n")
+        
+        cfg = ModelConfig(
+            backbone=args.arch,
+            pretrained=args.pretrained,
+            main_in_channels=3,
+            cond_in_channels=1,
+            use_sam_encoder=True,
+            sam_checkpoint=args.sam_checkpoint,
+            sam_lora_enabled=args.sam_lora_enabled,
+            sam_lora_rank=args.sam_lora_rank,
+            sam_lora_alpha=args.sam_lora_alpha,
+            sam_lora_dropout=args.sam_lora_dropout,
+            sam_freeze_encoder=not args.sam_lora_enabled,
+        )
+        from .model import PointHeatmapModelWithSAM
+        model = PointHeatmapModelWithSAM(cfg).to(device)
+    else:
+        # 使用标准模型（向后兼容）
+        cfg = ModelConfig(
+            backbone=args.arch,
+            pretrained=args.pretrained,
+            main_in_channels=3,
+            cond_in_channels=1,
+        )
+        model = PointHeatmapModel(cfg).to(device)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    # 设置优化器：如果启用 LoRA，可以为 LoRA 参数使用不同的学习率
+    if args.use_sam_encoder and args.sam_lora_enabled and args.sam_lora_lr is not None:
+        # 分离 LoRA 参数和其他参数
+        from .sam_lora import get_lora_parameters
+        lora_params = get_lora_parameters(model)
+        lora_param_ids = {id(p) for p in lora_params}
+        other_params = [p for p in model.parameters() if id(p) not in lora_param_ids and p.requires_grad]
+        
+        param_groups = [
+            {"params": other_params, "lr": args.lr},
+            {"params": lora_params, "lr": args.sam_lora_lr},
+        ]
+        optimizer = torch.optim.AdamW(param_groups, weight_decay=args.weight_decay)
+        print(f"[Optimizer] Using separate learning rates: base_lr={args.lr}, lora_lr={args.sam_lora_lr}")
+    else:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    
     scaler = torch.amp.GradScaler(enabled=amp_enabled)
     
     # Learning rate scheduler

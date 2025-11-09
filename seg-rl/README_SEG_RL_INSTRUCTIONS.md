@@ -56,3 +56,10 @@ python seg-rl/evaluation/eval_sam_masks.py \
    --input_json outputs/braintumour/pred_supervised-251108.jsonl \ --max_prompts 17 \
    --output_plot outputs/braintumour/supervised_metrics_curve-251108.png
 ```
+
+#### 6. 可视化提示点预测效果
+python -m seg-rl.visualization.viz_training_data \
+        --jsonl outputs/braintumour/pred_supervised-80last-251108.jsonl \
+        --out_dir outputs/braintumour/viz-pred_supervised-80last-251108 \
+        --mode all \
+        --show_prediction
