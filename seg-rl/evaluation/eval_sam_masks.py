@@ -3,6 +3,9 @@
 """
 Evaluate SAM-predicted masks against ground-truth masks.
 
+该脚本会循环评估从1到N的所有提示点序列长度，统计每个长度对应的平均性能指标，
+并绘制指标随提示点数量变化的曲线图。
+
 Inputs:
   --input_json: Path to JSON array with entries like:
     [
@@ -11,22 +14,21 @@ Inputs:
       ...
     ]
 
-  --num_prompts (optional, int > 0): choose the predicted mask index=k=num_prompts-1
-    If omitted, select the highest index PNG under sam_masks_dir/<stem>/.
+  --max_prompts (required, int > 0): 最大提示点数量N，脚本会评估从1到N的所有提示点序列长度
 
-Outputs (per-sample):
-  Writes/updates a JSON dict file at:
+  --output_plot (optional): 输出曲线图的文件路径（默认: <input_json>_metrics_curve.png）
+
+Outputs:
+  - 控制台输出：每个提示点序列长度对应的平均性能指标（DICE, IoU, Precision, Recall, F1, S_MEASURE）
+  - 曲线图：保存为PNG文件，显示各指标随提示点数量增长的变化曲线
+  - 每个样本的指标文件（per-sample）：
     <sam_masks_dir>/<stem>-metrics.jsonl
-  Example content:
-    {
-      "1": {"DICE": 0.18, "IOU": 0.09},
-      "2": {"DICE": 0.93, "IOU": 0.86}
-    }
 
- Example:
- python seg-rl/evaluation/eval_sam_masks.py --input_json datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour-1.jsonl --num_prompts 1
- 
- /opt/anaconda3/envs/seg-r1/bin/python seg-rl/evaluation/eval_sam_masks.py --input_json datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour-251003.jsonl --num_prompts 1
+Example:
+ python seg-rl/evaluation/eval_sam_masks.py \
+   --input_json datasets/seg_r1_md/Task01_BrainTumour/segrl_pretrain_braintumour-1.jsonl \
+   --max_prompts 8 \
+   --output_plot outputs/braintumour/metrics_curve.png
 """
 
 import argparse
@@ -35,16 +37,21 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import matplotlib
+matplotlib.use('Agg')  # 使用非交互式后端
+import matplotlib.pyplot as plt
 import numpy as np
 from PIL import Image
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Evaluate predicted masks vs ground truth")
+    p = argparse.ArgumentParser(description="Evaluate predicted masks vs ground truth for multiple prompt counts")
     p.add_argument("--input_json", type=str, required=True,
                    help="Path to JSON array file with image, gt_mask, sam_masks_dir entries")
-    p.add_argument("--num_prompts", type=int, default=None,
-                   help="Number of prompts to evaluate (k = num_prompts-1). If omitted, use max available index")
+    p.add_argument("--max_prompts", type=int, required=True,
+                   help="Maximum number of prompts N. Script will evaluate from 1 to N prompts")
+    p.add_argument("--output_plot", type=str, default=None,
+                   help="Output path for metrics curve plot (default: <input_json>_metrics_curve.png)")
     return p.parse_args()
 
 
@@ -203,8 +210,108 @@ def _update_metrics_file(sam_masks_dir: str, image_path: str, num_prompts: int, 
         json.dump(data, f, indent=2, ensure_ascii=False)
 
 
+def _evaluate_for_num_prompts(
+    arr: List[Dict[str, Any]],
+    num_prompts: int
+) -> Tuple[List[Dict[str, float]], int, int, int]:
+    """对指定的提示点数量进行评估，返回指标列表和统计信息"""
+    all_metrics: List[Dict[str, float]] = []
+    processed = 0
+    skipped = 0
+    errors = 0
+
+    for i, rec in enumerate(arr):
+        if not isinstance(rec, dict):
+            skipped += 1
+            continue
+        image_path = rec.get("image")
+        gt_mask_path = rec.get("gt_mask")
+        sam_masks_dir = rec.get("sam_masks_dir")
+        if not (image_path and gt_mask_path and sam_masks_dir):
+            skipped += 1
+            continue
+
+        mask_path, eff_num_prompts = _find_pred_mask(sam_masks_dir, image_path, num_prompts)
+        if not mask_path or eff_num_prompts is None or not os.path.isfile(mask_path):
+            skipped += 1
+            continue
+
+        try:
+            gt = _load_mask_as_bool(gt_mask_path)
+            pred = _load_mask_as_bool(mask_path)
+            h, w = gt.shape[:2]
+            if pred.shape[:2] != (h, w):
+                pred = _resize_to(pred, w, h)
+            metrics = _compute_metrics(gt, pred)
+            _update_metrics_file(sam_masks_dir, image_path, eff_num_prompts, metrics)
+            processed += 1
+            all_metrics.append(metrics)
+        except Exception as e:
+            errors += 1
+
+    return all_metrics, processed, skipped, errors
+
+
+def _plot_metrics_curves(
+    metrics_by_prompts: Dict[int, Dict[str, float]],
+    output_path: str
+) -> None:
+    """绘制指标随提示点数量变化的曲线图"""
+    if not metrics_by_prompts:
+        print("[WARN] No metrics to plot")
+        return
+
+    # 获取所有指标名称
+    first_metrics = next(iter(metrics_by_prompts.values()))
+    metric_names = sorted(first_metrics.keys())
+    num_metrics = len(metric_names)
+
+    # 准备数据
+    prompt_counts = sorted(metrics_by_prompts.keys())
+    metric_values = {name: [metrics_by_prompts[n][name] for n in prompt_counts] for name in metric_names}
+
+    # 创建图表：根据指标数量动态调整布局
+    if num_metrics <= 3:
+        nrows, ncols = 1, num_metrics
+    elif num_metrics <= 6:
+        nrows, ncols = 2, 3
+    else:
+        nrows, ncols = (num_metrics + 2) // 3, 3
+    
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4 * nrows))
+    if num_metrics == 1:
+        axes = [axes]
+    else:
+        axes = axes.flatten()
+
+    colors = plt.cm.tab10(np.linspace(0, 1, num_metrics))
+
+    for idx, metric_name in enumerate(metric_names):
+        ax = axes[idx]
+        ax.plot(prompt_counts, metric_values[metric_name], marker='o', linewidth=2, markersize=6, color=colors[idx])
+        ax.set_xlabel('Number of Prompts', fontsize=11)
+        ax.set_ylabel(metric_name, fontsize=11)
+        ax.set_title(f'{metric_name} vs Number of Prompts', fontsize=12, fontweight='bold')
+        ax.grid(True, alpha=0.3)
+        ax.set_xlim([min(prompt_counts) - 0.5, max(prompt_counts) + 0.5])
+        ax.set_ylim([0, 1.05])
+    
+    # 隐藏多余的子图
+    for idx in range(num_metrics, len(axes)):
+        axes[idx].set_visible(False)
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close(fig)  # 关闭图形以释放内存
+    print(f"\n[INFO] Metrics curve plot saved to: {output_path}")
+
+
 def main() -> int:
     args = parse_args()
+
+    if args.max_prompts < 1:
+        print(f"Error: max_prompts must be >= 1, got {args.max_prompts}")
+        return 1
 
     if not os.path.isfile(args.input_json):
         print(f"Error: input_json not found: {args.input_json}")
@@ -221,58 +328,65 @@ def main() -> int:
         print("Error: input_json must contain a JSON array")
         return 1
 
-    processed = 0
-    skipped = 0
-    errors = 0
-    all_metrics: List[Dict[str, float]] = []
+    # 确定输出图表路径
+    if args.output_plot is None:
+        input_path = Path(args.input_json)
+        output_plot = str(input_path.parent / f"{input_path.stem}_metrics_curve.png")
+    else:
+        output_plot = args.output_plot
+    os.makedirs(os.path.dirname(output_plot) or ".", exist_ok=True)
 
-    for i, rec in enumerate(arr):
-        if not isinstance(rec, dict):
-            skipped += 1
-            continue
-        image_path = rec.get("image")
-        gt_mask_path = rec.get("gt_mask")
-        sam_masks_dir = rec.get("sam_masks_dir")
-        if not (image_path and gt_mask_path and sam_masks_dir):
-            print(f"[WARN] idx {i}: missing required fields")
-            skipped += 1
-            continue
+    print(f"\n{'='*60}")
+    print(f"Evaluating metrics for prompts from 1 to {args.max_prompts}")
+    print(f"Total samples: {len(arr)}")
+    print(f"Output plot: {output_plot}")
+    print(f"{'='*60}\n")
 
-        mask_path, eff_num_prompts = _find_pred_mask(sam_masks_dir, image_path, args.num_prompts)
-        if not mask_path or eff_num_prompts is None or not os.path.isfile(mask_path):
-            print(f"[WARN] idx {i}: predicted mask not found")
-            skipped += 1
-            continue
+    # 存储每个提示点数量对应的平均指标
+    metrics_by_prompts: Dict[int, Dict[str, float]] = {}
+    total_processed = 0
+    total_skipped = 0
+    total_errors = 0
 
-        try:
-            gt = _load_mask_as_bool(gt_mask_path)
-            pred = _load_mask_as_bool(mask_path)
-            h, w = gt.shape[:2]
-            if pred.shape[:2] != (h, w):
-                pred = _resize_to(pred, w, h)
-            metrics = _compute_metrics(gt, pred)
-            _update_metrics_file(sam_masks_dir, image_path, eff_num_prompts, metrics)
-            processed += 1
-            all_metrics.append(metrics)
-            msg = f"ok idx {i}: {Path(image_path).stem} prompts={eff_num_prompts} | " \
-                f"DICE={metrics['DICE']:.4f} IOU={metrics['IOU']:.4f} " \
-                f"P={metrics['PRECISION']:.4f} R={metrics['RECALL']:.4f} F1={metrics['F1']:.4f} " \
-                f"S={metrics['S_MEASURE']:.4f}"
-            print(f"\r{msg}", end="", flush=True)
-        except Exception as e:
-            print(f"[ERROR] idx {i}: failed to evaluate - {e}")
-            errors += 1
+    # 循环评估从1到max_prompts的所有提示点数量
+    for num_prompts in range(1, args.max_prompts + 1):
+        print(f"[评估中] num_prompts = {num_prompts}/{args.max_prompts}...", end="", flush=True)
+        
+        all_metrics, processed, skipped, errors = _evaluate_for_num_prompts(arr, num_prompts)
+        
+        total_processed += processed
+        total_skipped += skipped
+        total_errors += errors
 
-    # Dataset-wide averages
-    if all_metrics:
-        keys = sorted(all_metrics[0].keys())
-        means = {k: float(np.mean([m[k] for m in all_metrics])) for k in keys}
-        print("\nDataset averages:")
-        for k in keys:
-            print(f"  {k}: {means[k]:.4f}")
+        if all_metrics:
+            # 计算平均指标
+            keys = sorted(all_metrics[0].keys())
+            means = {k: float(np.mean([m[k] for m in all_metrics])) for k in keys}
+            metrics_by_prompts[num_prompts] = means
+            print(f" 完成 (processed={processed}, skipped={skipped}, errors={errors})")
+        else:
+            print(f" 跳过 (无有效数据: processed={processed}, skipped={skipped}, errors={errors})")
 
-    print(f"\nDone. processed={processed} skipped={skipped} errors={errors}")
-    return 0 if errors == 0 else 1
+    # 输出每个提示点数量对应的平均指标
+    print(f"\n{'='*60}")
+    print("Average Metrics by Number of Prompts:")
+    print(f"{'='*60}")
+    print(f"{'Num Prompts':<12} {'DICE':<8} {'IOU':<8} {'PRECISION':<10} {'RECALL':<8} {'F1':<8} {'S_MEASURE':<10}")
+    print("-" * 70)
+
+    for num_prompts in sorted(metrics_by_prompts.keys()):
+        m = metrics_by_prompts[num_prompts]
+        print(f"{num_prompts:<12} {m['DICE']:<8.4f} {m['IOU']:<8.4f} {m['PRECISION']:<10.4f} "
+              f"{m['RECALL']:<8.4f} {m['F1']:<8.4f} {m['S_MEASURE']:<10.4f}")
+
+    print(f"{'='*60}")
+
+    # 绘制曲线图
+    if metrics_by_prompts:
+        _plot_metrics_curves(metrics_by_prompts, output_plot)
+
+    print(f"\nDone. Total: processed={total_processed} skipped={total_skipped} errors={total_errors}")
+    return 0 if total_errors == 0 else 1
 
 
 if __name__ == "__main__":
