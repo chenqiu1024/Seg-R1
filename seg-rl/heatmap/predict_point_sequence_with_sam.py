@@ -268,6 +268,36 @@ def main() -> int:
     os.makedirs(output_jsonl_dir, exist_ok=True)
     os.makedirs(args.sam_masks_dir, exist_ok=True)
     
+    # 保存推理参数到 JSON 文件
+    import sys
+    import json
+    import shutil
+    from datetime import datetime
+    
+    inference_args_dict = vars(args).copy()
+    inference_args_dict['command'] = ' '.join(sys.argv)
+    inference_args_dict['timestamp'] = datetime.now().isoformat()
+    inference_args_path = os.path.join(args.sam_masks_dir, "inference_args.json")
+    with open(inference_args_path, 'w', encoding='utf-8') as f:
+        json.dump(inference_args_dict, f, indent=2, ensure_ascii=False)
+    print(f"[Config] Inference arguments saved to {inference_args_path}")
+    
+    # 如果模型路径所在目录下存在训练参数文件，拷贝到输出目录
+    if args.model_path and os.path.isfile(args.model_path):
+        model_dir = os.path.dirname(args.model_path)
+        training_args_src = os.path.join(model_dir, "training_args.json")
+        if os.path.isfile(training_args_src):
+            # 使用不同的文件名以避免与 inference_args.json 冲突
+            training_args_dst = os.path.join(args.sam_masks_dir, "model_training_args.json")
+            try:
+                shutil.copy2(training_args_src, training_args_dst)
+                print(f"[Config] Copied training arguments from {training_args_src}")
+                print(f"[Config]   to {training_args_dst}")
+            except Exception as e:
+                print(f"[Warning] Failed to copy training arguments: {e}")
+        else:
+            print(f"[Info] No training_args.json found in model directory: {model_dir}")
+    
     print(f"\n{'='*60}")
     print("开始执行模型预测点序列生成流程")
     print(f"{'='*60}")

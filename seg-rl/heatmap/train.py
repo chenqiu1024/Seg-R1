@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from typing import Tuple, List
 
@@ -156,6 +157,16 @@ def main() -> None:
     os.makedirs(plots_dir, exist_ok=True)
     vis_dir = args.vis_dir or os.path.join(args.out_dir, "vis")
     os.makedirs(vis_dir, exist_ok=True)
+    
+    # 保存训练参数到 JSON 文件
+    import sys
+    args_dict = vars(args).copy()
+    args_dict['command'] = ' '.join(sys.argv)  # 保存完整命令
+    args_dict['timestamp'] = __import__('datetime').datetime.now().isoformat()
+    args_json_path = os.path.join(args.out_dir, "training_args.json")
+    with open(args_json_path, 'w', encoding='utf-8') as f:
+        json.dump(args_dict, f, indent=2, ensure_ascii=False)
+    print(f"[Config] Training arguments saved to {args_json_path}")
 
     image_size = ImageSize(height=args.height, width=args.width)
     # Load once to get length for splitting
