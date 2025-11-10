@@ -49,10 +49,19 @@ def save_checkpoint(
         # 检测是否使用 SAM encoder
         if hasattr(model, "sam_encoder"):
             metadata["use_sam_encoder"] = True
-            metadata["sam_lora_enabled"] = hasattr(model.sam_encoder, "lora_modules") and len(model.sam_encoder.lora_modules) > 0
+            # 检测 PEFT 方法
+            if hasattr(model.sam_encoder, "peft_method"):
+                metadata["sam_peft_method"] = model.sam_encoder.peft_method
+                # 向后兼容
+                metadata["sam_lora_enabled"] = (model.sam_encoder.peft_method == "late_lora")
+            else:
+                # 旧版本兼容
+                metadata["sam_lora_enabled"] = hasattr(model.sam_encoder, "peft_modules") and len(model.sam_encoder.peft_modules) > 0
+                metadata["sam_peft_method"] = "late_lora" if metadata["sam_lora_enabled"] else None
         else:
             metadata["use_sam_encoder"] = False
             metadata["sam_lora_enabled"] = False
+            metadata["sam_peft_method"] = None
     
     torch.save({
         "model": model.state_dict(),

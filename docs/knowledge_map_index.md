@@ -125,15 +125,18 @@ Seg-R0/
 | `predict_next_point_from_model.py` | 预测下一个点 | ⭐⭐ |
 | `predict_point_sequence_with_sam.py` | 整合预测+SAM分割 | ⭐⭐⭐ |
 
-#### 🆕 SAM Late LoRA 相关文件（v2.0 新增）
+#### 🆕 SAM PEFT 相关文件（v2.0-v2.1）
 
-| 文件 | 功能 | 文档 |
+| 文件 | 功能 | 版本 |
 |------|------|------|
-| `sam_lora.py` | LoRA 实现 | `README_SAM_LORA.md` |
-| `README_SAM_LORA.md` | SAM LoRA 使用文档 | 359 行 |
-| `CHANGELOG_SAM_LORA.md` | 修改日志 | - |
-| `example_train_with_lora.sh` | 训练示例 | - |
-| `test_compatibility.py` | 兼容性测试 | - |
+| `sam_lora.py` | Late LoRA 实现 | v2.0 |
+| `sam_conv_lora.py` | Conv-LoRA 实现 | v2.1 🆕 |
+| `README_SAM_LORA.md` | Late LoRA 使用文档 | v2.0 |
+| `README_CONV_LORA.md` | Conv-LoRA 使用文档 | v2.1 🆕 |
+| `SAM_PEFT_METHODS_COMPARISON.md` | 方法对比指南 | v2.1 🆕 |
+| `CHANGELOG_SAM_LORA.md` | Late LoRA 修改日志 | v2.0 |
+| `example_train_with_lora.sh` | 训练示例脚本 | v2.0 |
+| `test_compatibility.py` | 兼容性测试 | v2.0 |
 
 #### 🆕 参数追踪功能（v2.0 新增）
 
@@ -343,38 +346,77 @@ python seg-rl/heatmap/predict_point_sequence_with_sam.py \
 
 ## 最新功能
 
-### 🆕 v2.0 更新（2025-11-09）
+### 🆕 v2.0-v2.1 更新（2025-11-09）
 
-#### 1. SAM Late LoRA 集成
+#### 1. SAM PEFT 集成（支持两种方法）
+
+现在支持两种参数高效微调方法（互斥）：
+
+##### a) Late LoRA（v2.0）
 
 **基于论文**: [Parameter Efficient Fine-Tuning of SAM for Biomedical Imaging](https://arxiv.org/abs/2502.00418)
 
-**核心改进**:
-- ✅ 在 SAM image encoder 的最后一个 Transformer 块中添加 LoRA
-- ✅ 同时微调 SAM encoder 和点预测头
-- ✅ 参数高效（LoRA 参数 <1% 总参数）
-- ✅ 性能提升（特别是医学图像等专业领域）
-
-**关键文件**:
-- `seg-rl/heatmap/sam_lora.py` - LoRA 实现
-- `seg-rl/heatmap/model.py` - 集成 SAM encoder（新增 `PointHeatmapModelWithSAM`）
-- `seg-rl/heatmap/README_SAM_LORA.md` - 完整使用文档
+**核心特点**:
+- ✅ 只在最后一个 Transformer 块添加 LoRA
+- ✅ 参数最少（~110K）
+- ✅ 训练最快
+- ✅ 适合通用场景
 
 **快速开始**:
 ```bash
-# 启用 SAM Late LoRA 训练
 python -m seg-rl.heatmap.train \
   --use_sam_encoder \
   --sam_checkpoint <sam2.pt> \
-  --sam_lora_enabled \
+  --sam_peft_method late_lora \
   --sam_lora_rank 8 \
   ...其他参数...
 ```
 
-**详细文档**:
-- 使用指南: `seg-rl/heatmap/README_SAM_LORA.md`
-- 修改日志: `seg-rl/heatmap/CHANGELOG_SAM_LORA.md`
-- 总结报告: `LATE_LORA_INTEGRATION_SUMMARY.md`
+**详细文档**: `seg-rl/heatmap/README_SAM_LORA.md`
+
+##### b) Conv-LoRA（v2.1 🆕）
+
+**基于论文**: "Convolution Meets LoRA: Parameter Efficient Finetuning for Segment Anything Model"
+
+**核心特点**:
+- ✅ LoRA + 卷积操作
+- ✅ 更好保持空间信息
+- ✅ 适合视觉密集任务
+- ✅ 可应用到多个块
+- ✅ 参数仍然高效（~150K）
+
+**快速开始**:
+```bash
+python -m seg-rl.heatmap.train \
+  --use_sam_encoder \
+  --sam_checkpoint <sam2.pt> \
+  --sam_peft_method conv_lora \
+  --sam_conv_lora_rank 8 \
+  --sam_conv_lora_kernel_size 3 \
+  ...其他参数...
+```
+
+**详细文档**: `seg-rl/heatmap/README_CONV_LORA.md`
+
+##### c) PEFT 方法对比
+
+**对比文档**: `seg-rl/heatmap/SAM_PEFT_METHODS_COMPARISON.md` ⭐
+
+| 方法 | 参数量 | 速度 | 性能 | 推荐场景 |
+|------|--------|------|------|---------|
+| SAM 冻结 | 0 | 最快 | 好 | 数据相似 |
+| Late LoRA | ~110K | 快 | 很好 | 通用推荐 |
+| Conv-LoRA | ~150K | 中等 | 最好 | 视觉任务 |
+
+**关键文件**:
+- `seg-rl/heatmap/sam_lora.py` - Late LoRA 实现
+- `seg-rl/heatmap/sam_conv_lora.py` - Conv-LoRA 实现 🆕
+- `seg-rl/heatmap/model.py` - 统一的 PEFT 接口
+
+**总结文档**:
+- Late LoRA: `LATE_LORA_INTEGRATION_SUMMARY.md`
+- Conv-LoRA: `CONV_LORA_INTEGRATION_SUMMARY.md` 🆕
+- 方法对比: `seg-rl/heatmap/SAM_PEFT_METHODS_COMPARISON.md` 🆕
 
 #### 2. 实验参数自动追踪
 
@@ -789,16 +831,35 @@ IoU = (预测 mask ∩ GT mask) / (预测 mask ∪ GT mask)
 | `--sigma` | 高斯标准差 | 8.0 |
 | `--tau` | Softmax 温度 | 1.0 ⚠️ |
 
-### SAM LoRA 参数（🆕 v2.0）
+### SAM PEFT 参数（🆕 v2.0-v2.1）
+
+#### 通用参数
 
 | 参数 | 说明 | 推荐值 |
 |------|------|--------|
 | `--use_sam_encoder` | 启用 SAM encoder | flag |
 | `--sam_checkpoint` | SAM checkpoint 路径 | `third_party/sam2/checkpoints/sam2.1_hiera_large.pt` |
-| `--sam_lora_enabled` | 启用 Late LoRA | flag |
+| `--sam_peft_method` | PEFT 方法 | `late_lora` 或 `conv_lora` |
+
+#### Late LoRA 参数（v2.0）
+
+| 参数 | 说明 | 推荐值 |
+|------|------|--------|
+| `--sam_lora_enabled` | 启用 Late LoRA（向后兼容） | flag |
 | `--sam_lora_rank` | LoRA 秩 | 8 (4-16) |
 | `--sam_lora_alpha` | LoRA alpha | 16.0 |
 | `--sam_lora_dropout` | LoRA dropout | 0.0 |
+| `--sam_lora_lr` | LoRA 学习率 | None（使用 --lr） |
+
+#### Conv-LoRA 参数（v2.1 🆕）
+
+| 参数 | 说明 | 推荐值 |
+|------|------|--------|
+| `--sam_conv_lora_rank` | Conv-LoRA 秩 | 8 (4-16) |
+| `--sam_conv_lora_alpha` | Conv-LoRA alpha | 16.0 |
+| `--sam_conv_lora_kernel_size` | 卷积核大小 | 3 (1,3,5) |
+| `--sam_conv_lora_dropout` | Conv-LoRA dropout | 0.0 |
+| `--sam_conv_lora_blocks` | 块索引（逗号分隔） | None（最后一个） |
 
 ### 推理参数
 
@@ -996,7 +1057,9 @@ python -m seg-rl.heatmap.train \
 - ✅ 脚本集成和优化
 - ✅ 评估工具完善
 
-### 2025-11-09 (v2.0 Major Update)
+### 2025-11-09 (v2.0-v2.1 Major Updates)
+
+#### v2.0 (上午)
 - ✅ **SAM Late LoRA 集成**
   - LoRA 核心实现
   - 模型架构扩展
@@ -1010,6 +1073,23 @@ python -m seg-rl.heatmap.train \
   - 正确加载 SAM encoder
 - ✅ **完整文档体系**
   - 使用指南、API 文档、故障排除
+
+#### v2.1 (下午) 🆕
+- ✅ **SAM Conv-LoRA 集成**
+  - Conv-LoRA 核心实现
+  - LoRA + 卷积操作
+  - 多块应用支持
+  - 与 Late LoRA 互斥设计
+- ✅ **PEFT 方法统一接口**
+  - `sam_peft_method` 参数统一控制
+  - 自动互斥验证
+  - 推理脚本自动兼容三种模式
+- ✅ **知识地图索引**
+  - 完整的项目导航文档
+  - 1670+ 行全面索引
+- ✅ **方法对比文档**
+  - Late LoRA vs Conv-LoRA 详细对比
+  - 选择指南和实验建议
 
 ---
 
@@ -1473,7 +1553,29 @@ seg-rl/heatmap/
 
 ## 版本历史
 
-### v2.0 (2025-11-09) - Major Update
+### v2.1 (2025-11-09 下午) - Conv-LoRA Update 🆕
+
+**新增功能**:
+1. ✅ SAM Conv-LoRA 集成
+   - Conv-LoRA 核心实现
+   - 卷积增强的 LoRA
+   - 多块应用支持
+2. ✅ PEFT 方法统一接口
+   - `sam_peft_method` 参数
+   - Late LoRA 与 Conv-LoRA 互斥设计
+   - 自动验证和错误提示
+3. ✅ 推理脚本三模式兼容
+   - 标准模型
+   - Late LoRA
+   - Conv-LoRA（新增）
+
+**文档**:
+1. ✅ `README_CONV_LORA.md` - Conv-LoRA 使用指南
+2. ✅ `SAM_PEFT_METHODS_COMPARISON.md` - 方法对比
+3. ✅ `CONV_LORA_INTEGRATION_SUMMARY.md` - 实现总结
+4. ✅ 更新知识地图索引
+
+### v2.0 (2025-11-09 上午) - Major Update
 
 **新增功能**:
 1. ✅ SAM Late LoRA 集成
@@ -1489,7 +1591,7 @@ seg-rl/heatmap/
 **文档**:
 1. ✅ 10+ 新增/更新文档
 2. ✅ 完整的使用指南和示例
-3. ✅ 本知识地图索引
+3. ✅ 知识地图索引框架
 
 ### v1.x (2025-09 至 2025-11)
 
@@ -1539,7 +1641,7 @@ seg-rl/heatmap/
 ### 训练命令模板
 
 ```bash
-# 标准训练
+# 模式 1: 标准训练
 python -m seg-rl.heatmap.train \
   --jsonl <DATA> --sam_dir <MASKS> \
   --height 512 --width 512 --arch unet_s \
@@ -1547,7 +1649,7 @@ python -m seg-rl.heatmap.train \
   --epochs 100 --batch_size 16 --amp \
   --out_dir <OUTPUT>
 
-# SAM LoRA 训练（🆕 推荐）
+# 模式 2: SAM 冻结
 python -m seg-rl.heatmap.train \
   --jsonl <DATA> --sam_dir <MASKS> \
   --height 512 --width 512 --arch unet_s \
@@ -1555,7 +1657,31 @@ python -m seg-rl.heatmap.train \
   --epochs 100 --batch_size 16 --amp \
   --use_sam_encoder \
   --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
-  --sam_lora_enabled --sam_lora_rank 8 \
+  --out_dir <OUTPUT>
+
+# 模式 3: SAM Late LoRA 训练（v2.0）
+python -m seg-rl.heatmap.train \
+  --jsonl <DATA> --sam_dir <MASKS> \
+  --height 512 --width 512 --arch unet_s \
+  --loss kl --sigma 8.0 --tau 1.0 \
+  --epochs 100 --batch_size 16 --amp \
+  --use_sam_encoder \
+  --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
+  --sam_peft_method late_lora \
+  --sam_lora_rank 8 --sam_lora_alpha 16.0 \
+  --out_dir <OUTPUT>
+
+# 模式 4: SAM Conv-LoRA 训练（v2.1 🆕）
+python -m seg-rl.heatmap.train \
+  --jsonl <DATA> --sam_dir <MASKS> \
+  --height 512 --width 512 --arch unet_s \
+  --loss kl --sigma 8.0 --tau 1.0 \
+  --epochs 100 --batch_size 16 --amp \
+  --use_sam_encoder \
+  --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
+  --sam_peft_method conv_lora \
+  --sam_conv_lora_rank 8 --sam_conv_lora_alpha 16.0 \
+  --sam_conv_lora_kernel_size 3 \
   --out_dir <OUTPUT>
 ```
 

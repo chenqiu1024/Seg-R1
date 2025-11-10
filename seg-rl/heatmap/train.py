@@ -127,14 +127,26 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--progress", action="store_true", help="Show tqdm progress bar during training")
     p.add_argument("--auto_resume", action="store_true", help="If set and --resume not provided, try <out_dir>/last.pt")
     
-    # SAM Late LoRA 相关参数
+    # SAM PEFT 相关参数
     p.add_argument("--use_sam_encoder", action="store_true", help="Use SAM image encoder as feature extractor")
     p.add_argument("--sam_checkpoint", type=str, default=None, help="Path to SAM checkpoint (required if --use_sam_encoder)")
-    p.add_argument("--sam_lora_enabled", action="store_true", help="Enable Late LoRA for SAM encoder fine-tuning")
-    p.add_argument("--sam_lora_rank", type=int, default=8, help="LoRA rank (4-16 recommended)")
-    p.add_argument("--sam_lora_alpha", type=float, default=16.0, help="LoRA alpha scaling factor")
-    p.add_argument("--sam_lora_dropout", type=float, default=0.0, help="LoRA dropout probability")
-    p.add_argument("--sam_lora_lr", type=float, default=None, help="Learning rate for SAM LoRA parameters (if None, use --lr)")
+    p.add_argument("--sam_peft_method", type=str, choices=["late_lora", "conv_lora"], default=None, 
+                   help="PEFT method for SAM encoder: late_lora or conv_lora (mutually exclusive)")
+    
+    # Late LoRA 参数（向后兼容）
+    p.add_argument("--sam_lora_enabled", action="store_true", help="Enable Late LoRA (equivalent to --sam_peft_method late_lora)")
+    p.add_argument("--sam_lora_rank", type=int, default=8, help="Late LoRA rank (4-16 recommended)")
+    p.add_argument("--sam_lora_alpha", type=float, default=16.0, help="Late LoRA alpha scaling factor")
+    p.add_argument("--sam_lora_dropout", type=float, default=0.0, help="Late LoRA dropout probability")
+    p.add_argument("--sam_lora_lr", type=float, default=None, help="Learning rate for SAM PEFT parameters (if None, use --lr)")
+    
+    # Conv-LoRA 参数
+    p.add_argument("--sam_conv_lora_rank", type=int, default=8, help="Conv-LoRA rank (4-16 recommended)")
+    p.add_argument("--sam_conv_lora_alpha", type=float, default=16.0, help="Conv-LoRA alpha scaling factor")
+    p.add_argument("--sam_conv_lora_kernel_size", type=int, default=3, help="Conv-LoRA kernel size (1, 3, 5)")
+    p.add_argument("--sam_conv_lora_dropout", type=float, default=0.0, help="Conv-LoRA dropout probability")
+    p.add_argument("--sam_conv_lora_blocks", type=str, default=None, 
+                   help="Comma-separated block indices for Conv-LoRA (e.g., '40,44,47' or '-1' for last block only)")
     
     return p.parse_args()
 
@@ -202,15 +214,44 @@ def main() -> None:
         if args.sam_checkpoint is None:
             raise ValueError("--sam_checkpoint is required when --use_sam_encoder is set")
         
+        # 确定 PEFT 方法（处理互斥性和向后兼容）
+        peft_method = args.sam_peft_method
+        if peft_method is None and args.sam_lora_enabled:
+            peft_method = "late_lora"  # 向后兼容
+        
+        # 验证互斥性
+        if peft_method is not None and args.sam_lora_enabled and peft_method != "late_lora":
+            raise ValueError("--sam_lora_enabled conflicts with --sam_peft_method. Use only one.")
+        
+        # 解析 Conv-LoRA blocks 参数
+        conv_lora_blocks = None
+        if args.sam_conv_lora_blocks is not None:
+            try:
+                conv_lora_blocks = [int(x.strip()) for x in args.sam_conv_lora_blocks.split(",")]
+            except ValueError:
+                raise ValueError(f"Invalid --sam_conv_lora_blocks: {args.sam_conv_lora_blocks}")
+        
         print("\n" + "="*60)
-        print("Using SAM Encoder with Late LoRA")
+        if peft_method == "late_lora":
+            print("Using SAM Encoder with Late LoRA")
+        elif peft_method == "conv_lora":
+            print("Using SAM Encoder with Conv-LoRA")
+        else:
+            print("Using SAM Encoder (Frozen)")
         print("="*60)
         print(f"SAM Checkpoint: {args.sam_checkpoint}")
-        print(f"LoRA Enabled: {args.sam_lora_enabled}")
-        if args.sam_lora_enabled:
-            print(f"LoRA Rank: {args.sam_lora_rank}")
-            print(f"LoRA Alpha: {args.sam_lora_alpha}")
-            print(f"LoRA Dropout: {args.sam_lora_dropout}")
+        print(f"PEFT Method: {peft_method or 'None'}")
+        
+        if peft_method == "late_lora":
+            print(f"Late LoRA Rank: {args.sam_lora_rank}")
+            print(f"Late LoRA Alpha: {args.sam_lora_alpha}")
+            print(f"Late LoRA Dropout: {args.sam_lora_dropout}")
+        elif peft_method == "conv_lora":
+            print(f"Conv-LoRA Rank: {args.sam_conv_lora_rank}")
+            print(f"Conv-LoRA Alpha: {args.sam_conv_lora_alpha}")
+            print(f"Conv-LoRA Kernel Size: {args.sam_conv_lora_kernel_size}")
+            print(f"Conv-LoRA Dropout: {args.sam_conv_lora_dropout}")
+            print(f"Conv-LoRA Blocks: {conv_lora_blocks or 'Last block only'}")
         print("="*60 + "\n")
         
         cfg = ModelConfig(
@@ -220,11 +261,19 @@ def main() -> None:
             cond_in_channels=1,
             use_sam_encoder=True,
             sam_checkpoint=args.sam_checkpoint,
+            sam_peft_method=peft_method,
+            sam_freeze_encoder=(peft_method is None),
+            # Late LoRA 参数
             sam_lora_enabled=args.sam_lora_enabled,
             sam_lora_rank=args.sam_lora_rank,
             sam_lora_alpha=args.sam_lora_alpha,
             sam_lora_dropout=args.sam_lora_dropout,
-            sam_freeze_encoder=not args.sam_lora_enabled,
+            # Conv-LoRA 参数
+            sam_conv_lora_rank=args.sam_conv_lora_rank,
+            sam_conv_lora_alpha=args.sam_conv_lora_alpha,
+            sam_conv_lora_kernel_size=args.sam_conv_lora_kernel_size,
+            sam_conv_lora_dropout=args.sam_conv_lora_dropout,
+            sam_conv_lora_blocks=conv_lora_blocks,
         )
         from .model import PointHeatmapModelWithSAM
         model = PointHeatmapModelWithSAM(cfg).to(device)
@@ -238,20 +287,29 @@ def main() -> None:
         )
         model = PointHeatmapModel(cfg).to(device)
 
-    # 设置优化器：如果启用 LoRA，可以为 LoRA 参数使用不同的学习率
-    if args.use_sam_encoder and args.sam_lora_enabled and args.sam_lora_lr is not None:
-        # 分离 LoRA 参数和其他参数
-        from .sam_lora import get_lora_parameters
-        lora_params = get_lora_parameters(model)
-        lora_param_ids = {id(p) for p in lora_params}
-        other_params = [p for p in model.parameters() if id(p) not in lora_param_ids and p.requires_grad]
+    # 设置优化器：如果启用 PEFT，可以为 PEFT 参数使用不同的学习率
+    peft_params = []
+    if args.use_sam_encoder and peft_method is not None and args.sam_lora_lr is not None:
+        # 获取 PEFT 参数
+        if peft_method == "late_lora":
+            from .sam_lora import get_lora_parameters
+            peft_params = get_lora_parameters(model)
+        elif peft_method == "conv_lora":
+            from .sam_conv_lora import get_conv_lora_parameters
+            peft_params = get_conv_lora_parameters(model)
         
-        param_groups = [
-            {"params": other_params, "lr": args.lr},
-            {"params": lora_params, "lr": args.sam_lora_lr},
-        ]
-        optimizer = torch.optim.AdamW(param_groups, weight_decay=args.weight_decay)
-        print(f"[Optimizer] Using separate learning rates: base_lr={args.lr}, lora_lr={args.sam_lora_lr}")
+        if len(peft_params) > 0:
+            peft_param_ids = {id(p) for p in peft_params}
+            other_params = [p for p in model.parameters() if id(p) not in peft_param_ids and p.requires_grad]
+            
+            param_groups = [
+                {"params": other_params, "lr": args.lr},
+                {"params": peft_params, "lr": args.sam_lora_lr},
+            ]
+            optimizer = torch.optim.AdamW(param_groups, weight_decay=args.weight_decay)
+            print(f"[Optimizer] Using separate learning rates: base_lr={args.lr}, peft_lr={args.sam_lora_lr}")
+        else:
+            optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     else:
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     

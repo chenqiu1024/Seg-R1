@@ -34,14 +34,24 @@ class ModelConfig:
     main_in_channels: int = 3
     cond_in_channels: int = 1
     
-    # SAM Late LoRA 配置
+    # SAM PEFT 配置
     use_sam_encoder: bool = False
     sam_checkpoint: Optional[str] = None
-    sam_lora_enabled: bool = False
+    sam_peft_method: Optional[str] = None  # None, "late_lora", "conv_lora"（互斥）
+    sam_freeze_encoder: bool = True  # 是否冻结 SAM encoder（不启用 PEFT 时）
+    
+    # Late LoRA 配置（当 sam_peft_method="late_lora" 时使用）
+    sam_lora_enabled: bool = False  # 向后兼容，等同于 sam_peft_method="late_lora"
     sam_lora_rank: int = 8
     sam_lora_alpha: float = 16.0
     sam_lora_dropout: float = 0.0
-    sam_freeze_encoder: bool = True  # 是否冻结 SAM encoder（不启用 LoRA 时）
+    
+    # Conv-LoRA 配置（当 sam_peft_method="conv_lora" 时使用）
+    sam_conv_lora_rank: int = 8
+    sam_conv_lora_alpha: float = 16.0
+    sam_conv_lora_kernel_size: int = 3
+    sam_conv_lora_dropout: float = 0.0
+    sam_conv_lora_blocks: Optional[List[int]] = None  # 要应用的 block 索引，None=只用最后一个
 
 
 class HeatmapHead(nn.Module):
@@ -417,17 +427,28 @@ def log_prob_of_joint_action(
 class SAMEncoderWrapper(nn.Module):
     """SAM Image Encoder 包装器，用于特征提取
     
-    可选地应用 Late LoRA 进行参数高效微调
+    支持多种参数高效微调方法：
+    - Late LoRA: 只在最后一个 Transformer 块
+    - Conv-LoRA: 使用卷积增强的 LoRA，可应用到多个块
     """
     
     def __init__(
         self,
         sam_checkpoint: str,
         device: torch.device,
+        peft_method: Optional[str] = None,  # None, "late_lora", "conv_lora"
+        # Late LoRA 参数（向后兼容）
         lora_enabled: bool = False,
         lora_rank: int = 8,
         lora_alpha: float = 16.0,
         lora_dropout: float = 0.0,
+        # Conv-LoRA 参数
+        conv_lora_rank: int = 8,
+        conv_lora_alpha: float = 16.0,
+        conv_lora_kernel_size: int = 3,
+        conv_lora_dropout: float = 0.0,
+        conv_lora_blocks: Optional[List[int]] = None,
+        # 通用参数
         freeze_encoder: bool = True,
     ):
         super().__init__()
@@ -457,12 +478,24 @@ class SAMEncoderWrapper(nn.Module):
         # 提取 image encoder
         self.image_encoder = self.sam_model.image_encoder
         
-        # 冻结或启用 LoRA
-        if lora_enabled:
+        # 确定 PEFT 方法（向后兼容）
+        if peft_method is None and lora_enabled:
+            peft_method = "late_lora"
+        
+        # 验证互斥性
+        if peft_method is not None and peft_method not in ["late_lora", "conv_lora"]:
+            raise ValueError(f"Invalid peft_method: {peft_method}. Must be None, 'late_lora', or 'conv_lora'")
+        
+        # 应用 PEFT 或冻结
+        self.peft_method = peft_method
+        self.peft_modules = {}
+        
+        if peft_method == "late_lora":
+            # 应用 Late LoRA
             print(f"[SAM] Enabling Late LoRA: rank={lora_rank}, alpha={lora_alpha}")
             try:
                 from .sam_lora import apply_late_lora_to_sam_encoder, print_lora_info
-                self.lora_modules = apply_late_lora_to_sam_encoder(
+                self.peft_modules = apply_late_lora_to_sam_encoder(
                     self.sam_model,
                     rank=lora_rank,
                     alpha=lora_alpha,
@@ -470,16 +503,39 @@ class SAMEncoderWrapper(nn.Module):
                 )
                 print_lora_info(self.sam_model)
             except Exception as e:
-                print(f"[SAM] Warning: Failed to apply LoRA: {e}")
-                self.lora_modules = {}
+                print(f"[SAM] Warning: Failed to apply Late LoRA: {e}")
+                import traceback
+                traceback.print_exc()
+                self.peft_modules = {}
+        
+        elif peft_method == "conv_lora":
+            # 应用 Conv-LoRA
+            print(f"[SAM] Enabling Conv-LoRA: rank={conv_lora_rank}, alpha={conv_lora_alpha}, kernel={conv_lora_kernel_size}")
+            try:
+                from .sam_conv_lora import apply_conv_lora_to_sam_encoder, print_conv_lora_info
+                self.peft_modules = apply_conv_lora_to_sam_encoder(
+                    self.sam_model,
+                    rank=conv_lora_rank,
+                    alpha=conv_lora_alpha,
+                    kernel_size=conv_lora_kernel_size,
+                    dropout=conv_lora_dropout,
+                    target_blocks=conv_lora_blocks,
+                )
+                print_conv_lora_info(self.sam_model)
+            except Exception as e:
+                print(f"[SAM] Warning: Failed to apply Conv-LoRA: {e}")
+                import traceback
+                traceback.print_exc()
+                self.peft_modules = {}
+        
         else:
-            self.lora_modules = {}
+            # 不使用 PEFT
             if freeze_encoder:
                 print("[SAM] Freezing SAM image encoder")
                 for param in self.image_encoder.parameters():
                     param.requires_grad = False
             else:
-                print("[SAM] SAM image encoder is trainable (no LoRA)")
+                print("[SAM] SAM image encoder is trainable (no PEFT)")
         
         # 获取输出特征维度
         self.feature_dim = self._get_feature_dim()
@@ -568,14 +624,28 @@ class PointHeatmapModelWithSAM(nn.Module):
         # 确定设备
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
+        # 确定 PEFT 方法
+        peft_method = cfg.sam_peft_method
+        if peft_method is None and cfg.sam_lora_enabled:
+            peft_method = "late_lora"  # 向后兼容
+        
         # 创建 SAM encoder
         self.sam_encoder = SAMEncoderWrapper(
             sam_checkpoint=cfg.sam_checkpoint,
             device=device,
+            peft_method=peft_method,
+            # Late LoRA 参数
             lora_enabled=cfg.sam_lora_enabled,
             lora_rank=cfg.sam_lora_rank,
             lora_alpha=cfg.sam_lora_alpha,
             lora_dropout=cfg.sam_lora_dropout,
+            # Conv-LoRA 参数
+            conv_lora_rank=cfg.sam_conv_lora_rank,
+            conv_lora_alpha=cfg.sam_conv_lora_alpha,
+            conv_lora_kernel_size=cfg.sam_conv_lora_kernel_size,
+            conv_lora_dropout=cfg.sam_conv_lora_dropout,
+            conv_lora_blocks=cfg.sam_conv_lora_blocks,
+            # 通用参数
             freeze_encoder=cfg.sam_freeze_encoder,
         )
         

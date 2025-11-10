@@ -99,12 +99,16 @@ def main() -> None:
     state = torch.load(args.ckpt, map_location="cpu")
     metadata = state.get("metadata", {})
     use_sam_encoder = metadata.get("use_sam_encoder", False)
-    sam_lora_enabled = metadata.get("sam_lora_enabled", False)
+    
+    # 检测 PEFT 方法（向后兼容）
+    peft_method = metadata.get("sam_peft_method")
+    if peft_method is None and metadata.get("sam_lora_enabled", False):
+        peft_method = "late_lora"
     
     print(f"[Inference] Loading checkpoint from {args.ckpt}")
     print(f"[Inference] Model type: {'SAM encoder' if use_sam_encoder else 'Standard'}")
     if use_sam_encoder:
-        print(f"[Inference] LoRA enabled: {sam_lora_enabled}")
+        print(f"[Inference] PEFT method: {peft_method or 'None (frozen)'}")
     
     # 根据 checkpoint 类型创建模型
     if use_sam_encoder:
@@ -121,6 +125,9 @@ def main() -> None:
         
         print(f"[Inference] SAM checkpoint: {sam_checkpoint}")
         
+        # 解析 Conv-LoRA blocks（如果有）
+        conv_lora_blocks = metadata.get("sam_conv_lora_blocks")
+        
         cfg = ModelConfig(
             backbone=args.arch,
             pretrained=False,
@@ -128,11 +135,19 @@ def main() -> None:
             cond_in_channels=1,
             use_sam_encoder=True,
             sam_checkpoint=sam_checkpoint,
-            sam_lora_enabled=sam_lora_enabled,
+            sam_peft_method=peft_method,
+            sam_freeze_encoder=True,  # 推理时总是冻结
+            # Late LoRA 参数
+            sam_lora_enabled=(peft_method == "late_lora"),
             sam_lora_rank=metadata.get("sam_lora_rank", 8),
             sam_lora_alpha=metadata.get("sam_lora_alpha", 16.0),
             sam_lora_dropout=metadata.get("sam_lora_dropout", 0.0),
-            sam_freeze_encoder=True,  # 推理时总是冻结
+            # Conv-LoRA 参数
+            sam_conv_lora_rank=metadata.get("sam_conv_lora_rank", 8),
+            sam_conv_lora_alpha=metadata.get("sam_conv_lora_alpha", 16.0),
+            sam_conv_lora_kernel_size=metadata.get("sam_conv_lora_kernel_size", 3),
+            sam_conv_lora_dropout=metadata.get("sam_conv_lora_dropout", 0.0),
+            sam_conv_lora_blocks=conv_lora_blocks,
         )
         model = PointHeatmapModelWithSAM(cfg).to(device)
     else:

@@ -14,14 +14,16 @@
 - 故障排除指南
 - v2.0 最新功能说明
 
-#### 🔬 我想使用 SAM Late LoRA 训练模型
-→ **阅读**: [`seg-rl/heatmap/README_SAM_LORA.md`](seg-rl/heatmap/README_SAM_LORA.md) ⭐⭐⭐
+#### 🔬 我想使用 SAM PEFT 方法训练模型
+→ **首先阅读**: [`seg-rl/heatmap/SAM_PEFT_METHODS_COMPARISON.md`](seg-rl/heatmap/SAM_PEFT_METHODS_COMPARISON.md) ⭐⭐⭐
 
-包含：
-- 安装指南
-- 4 种训练模式
-- 参数调优建议
-- 常见问题解答
+帮助您选择：
+- Late LoRA（参数少，速度快）
+- Conv-LoRA（性能好，视觉任务推荐）🆕
+
+→ **Late LoRA 详细文档**: [`seg-rl/heatmap/README_SAM_LORA.md`](seg-rl/heatmap/README_SAM_LORA.md)
+
+→ **Conv-LoRA 详细文档**: [`seg-rl/heatmap/README_CONV_LORA.md`](seg-rl/heatmap/README_CONV_LORA.md) 🆕
 
 #### 📝 我想查看实验配置和参数
 → **使用**:
@@ -60,7 +62,7 @@ python -m seg-rl.heatmap.train \
   --out_dir outputs/my_exp
 ```
 
-### 训练（SAM LoRA 模式）🆕
+### 训练（SAM Late LoRA 模式）v2.0
 ```bash
 python -m seg-rl.heatmap.train \
   --jsonl datasets/my_data/train.jsonl \
@@ -69,8 +71,24 @@ python -m seg-rl.heatmap.train \
   --epochs 100 --batch_size 16 --amp \
   --use_sam_encoder \
   --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
-  --sam_lora_enabled --sam_lora_rank 8 \
-  --out_dir outputs/my_exp_lora
+  --sam_peft_method late_lora \
+  --sam_lora_rank 8 --sam_lora_alpha 16.0 \
+  --out_dir outputs/my_exp_late_lora
+```
+
+### 训练（SAM Conv-LoRA 模式）v2.1 🆕
+```bash
+python -m seg-rl.heatmap.train \
+  --jsonl datasets/my_data/train.jsonl \
+  --sam_dir datasets/my_data/sam_masks \
+  --height 512 --width 512 \
+  --epochs 100 --batch_size 16 --amp \
+  --use_sam_encoder \
+  --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
+  --sam_peft_method conv_lora \
+  --sam_conv_lora_rank 8 --sam_conv_lora_alpha 16.0 \
+  --sam_conv_lora_kernel_size 3 \
+  --out_dir outputs/my_exp_conv_lora
 ```
 
 ### 推理
