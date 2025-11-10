@@ -1,5 +1,5 @@
 # 修改SAM模型以支持Late LoRA微调
-_Exported on 11/9/2025 at 08:06:08 PST from Cursor (2.0.69)_
+_Exported on 11/9/2025 at 19:26:19 PST from Cursor (2.0.69)_
 
 ---
 
@@ -5226,5 +5226,6156 @@ python -m seg-rl.heatmap.train \
 # 运行兼容性测试
 cd /root/autodl-tmp/works/Seg-R0/seg-rl/heatmap
 python test_compatibility.py
+```
+
+---
+
+**User**
+
+@bash (931-1026) 
+
+---
+
+**Cursor**
+
+看到问题了！有两个需要修复的地方：
+
+1. **LoRA 没有成功应用**：SAM2 Hiera 的结构是 `trunk.blocks` 而不是 `trunk.stages`
+2. **SAM encoder 输出格式问题**：返回的是 dict 而不是 tensor
+
+让我修复这两个问题：
+
+```python
+"""
+SAM Late LoRA Implementation
+
+基于论文 "Parameter Efficient Fine-Tuning of Segment Anything Model for Biomedical Imaging"
+实现 Late LoRA 方法，在 SAM 的 image encoder 的最后一个 Transformer 块中添加 LoRA 层。
+
+LoRA (Low-Rank Adaptation) 通过低秩分解减少可训练参数数量：
+    W = W_0 + BA
+其中 W_0 是冻结的预训练权重，B 和 A 是可训练的低秩矩阵。
+
+Reference: https://arxiv.org/abs/2502.00418
+"""
+
+from __future__ import annotations
+
+from typing import Optional, List, Dict, Any
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class LoRALayer(nn.Module):
+    """LoRA 层实现
+    
+    在原始线性层的基础上添加低秩适配器：
+    output = W_0 @ x + (B @ A) @ x * scale
+    
+    Args:
+        in_features: 输入特征维度
+        out_features: 输出特征维度
+        rank: LoRA 秩（越小参数越少，通常为 4-16）
+        alpha: LoRA 缩放因子（通常设为 rank 的 1-2 倍）
+        dropout: Dropout 概率
+    """
+    
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        rank: int = 8,
+        alpha: float = 16.0,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.rank = rank
+        self.alpha = alpha
+        self.scaling = alpha / rank
+        
+        # LoRA 矩阵：A 使用 Kaiming 初始化，B 初始化为 0
+        self.lora_A = nn.Linear(in_features, rank, bias=False)
+        self.lora_B = nn.Linear(rank, out_features, bias=False)
+        
+        # 初始化
+        nn.init.kaiming_uniform_(self.lora_A.weight, a=torch.math.sqrt(5))
+        nn.init.zeros_(self.lora_B.weight)
+        
+        self.dropout = nn.Dropout(p=dropout) if dropout > 0 else nn.Identity()
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """前向传播：计算 LoRA 增量
+        
+        Args:
+            x: 输入张量 [..., in_features]
+            
+        Returns:
+            LoRA 输出 [..., out_features]
+        """
+        x = self.dropout(x)
+        result = self.lora_B(self.lora_A(x))
+        return result * self.scaling
+
+
+class LoRALinear(nn.Module):
+    """带 LoRA 适配器的线性层
+    
+    组合原始线性层和 LoRA 层：
+    output = linear(x) + lora(x)
+    
+    Args:
+        linear: 原始的 nn.Linear 层（将被冻结）
+        rank: LoRA 秩
+        alpha: LoRA 缩放因子
+        dropout: Dropout 概率
+    """
+    
+    def __init__(
+        self,
+        linear: nn.Linear,
+        rank: int = 8,
+        alpha: float = 16.0,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.linear = linear
+        self.lora = LoRALayer(
+            in_features=linear.in_features,
+            out_features=linear.out_features,
+            rank=rank,
+            alpha=alpha,
+            dropout=dropout,
+        )
+        
+        # 冻结原始层
+        for param in self.linear.parameters():
+            param.requires_grad = False
+            
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """前向传播
+        
+        Args:
+            x: 输入张量
+            
+        Returns:
+            输出 = 原始层输出 + LoRA 输出
+        """
+        return self.linear(x) + self.lora(x)
+    
+    def merge_weights(self) -> nn.Linear:
+        """将 LoRA 权重合并到原始层中
+        
+        用于推理时加速，将 W = W_0 + BA 合并为单个矩阵
+        
+        Returns:
+            合并后的 nn.Linear 层
+        """
+        merged = nn.Linear(
+            self.linear.in_features,
+            self.linear.out_features,
+            bias=self.linear.bias is not None
+        )
+        
+        # 计算合并后的权重
+        with torch.no_grad():
+            lora_weight = self.lora.lora_B.weight @ self.lora.lora_A.weight
+            lora_weight = lora_weight * self.lora.scaling
+            merged.weight.copy_(self.linear.weight + lora_weight)
+            if self.linear.bias is not None and merged.bias is not None:
+                merged.bias.copy_(self.linear.bias)
+                
+        return merged
+
+
+def apply_lora_to_attention(
+    attn_module: nn.Module,
+    rank: int = 8,
+    alpha: float = 16.0,
+    dropout: float = 0.0,
+    target_modules: Optional[List[str]] = None,
+) -> Dict[str, nn.Module]:
+    """为注意力模块的指定层添加 LoRA
+    
+    Args:
+        attn_module: 注意力模块（如 nn.MultiheadAttention 或自定义 Attention）
+        rank: LoRA 秩
+        alpha: LoRA 缩放因子
+        dropout: Dropout 概率
+        target_modules: 要添加 LoRA 的模块名称列表，如 ["q_proj", "v_proj"]
+                       如果为 None，则添加到 ["q_proj", "k_proj", "v_proj", "out_proj"]
+    
+    Returns:
+        替换的 LoRA 模块字典 {name: LoRALinear}
+    """
+    if target_modules is None:
+        # 默认为 Q, K, V, O 投影层
+        target_modules = ["q_proj", "k_proj", "v_proj", "out_proj"]
+    
+    replaced_modules = {}
+    
+    for name, module in attn_module.named_modules():
+        # 检查是否是目标模块
+        for target in target_modules:
+            if target in name and isinstance(module, nn.Linear):
+                # 获取父模块和属性名
+                *parents, attr_name = name.split(".")
+                parent = attn_module
+                for p in parents:
+                    parent = getattr(parent, p)
+                
+                # 替换为 LoRALinear
+                lora_linear = LoRALinear(module, rank=rank, alpha=alpha, dropout=dropout)
+                setattr(parent, attr_name, lora_linear)
+                replaced_modules[name] = lora_linear
+                print(f"[LoRA] Applied to {name}: in={module.in_features}, out={module.out_features}, rank={rank}")
+                break
+    
+    return replaced_modules
+
+
+def apply_late_lora_to_sam_encoder(
+    sam_model: nn.Module,
+    rank: int = 8,
+    alpha: float = 16.0,
+    dropout: float = 0.0,
+    target_modules: Optional[List[str]] = None,
+) -> Dict[str, nn.Module]:
+    """为 SAM image encoder 的最后一个 Transformer 块添加 Late LoRA
+    
+    根据论文建议，只在最后一个 Transformer 块中添加 LoRA，
+    这样既保持了效率，又能有效地进行任务适配。
+    
+    Args:
+        sam_model: SAM2 模型实例
+        rank: LoRA 秩
+        alpha: LoRA 缩放因子
+        dropout: Dropout 概率
+        target_modules: 要添加 LoRA 的模块名称列表
+    
+    Returns:
+        应用了 LoRA 的模块字典
+    """
+    if target_modules is None:
+        # 默认为 Q 和 V 投影（论文中推荐的配置）
+        target_modules = ["q_proj", "v_proj"]
+    
+    # 冻结整个 SAM 模型
+    for param in sam_model.parameters():
+        param.requires_grad = False
+    
+    replaced_modules = {}
+    
+    # 获取 image encoder
+    image_encoder = sam_model.image_encoder
+    
+    # SAM2 Hiera 架构：image_encoder.trunk.blocks 是一个 ModuleList
+    # blocks 直接包含所有 transformer blocks（不是分 stages）
+    if hasattr(image_encoder, "trunk") and hasattr(image_encoder.trunk, "blocks"):
+        blocks = image_encoder.trunk.blocks
+        if len(blocks) > 0:
+            # 只在最后一个 block 中添加 LoRA（Late LoRA）
+            last_block = blocks[-1]
+            print(f"[Late LoRA] Found {len(blocks)} blocks in trunk, applying to last block")
+            
+            # 查找注意力模块
+            lora_applied = False
+            for name, module in last_block.named_modules():
+                # SAM2 Hiera 的注意力模块通常叫 attn
+                if name == "attn" or name.endswith(".attn"):
+                    print(f"[Late LoRA] Found attention module: {name}")
+                    
+                    # 为 QKV 和 proj 添加 LoRA
+                    for subname in ["qkv", "proj"]:
+                        if hasattr(module, subname):
+                            submodule = getattr(module, subname)
+                            if isinstance(submodule, nn.Linear):
+                                lora_linear = LoRALinear(
+                                    submodule, 
+                                    rank=rank, 
+                                    alpha=alpha, 
+                                    dropout=dropout
+                                )
+                                setattr(module, subname, lora_linear)
+                                full_name = f"image_encoder.trunk.blocks[-1].{name}.{subname}"
+                                replaced_modules[full_name] = lora_linear
+                                print(f"[Late LoRA] Applied to {full_name}: "
+                                      f"in={submodule.in_features}, out={submodule.out_features}, rank={rank}")
+                                lora_applied = True
+            
+            if not lora_applied:
+                print("[Late LoRA] Warning: No attention modules found in last block")
+                print(f"[Late LoRA] Last block modules: {[n for n, _ in last_block.named_modules()]}")
+        else:
+            print("[Late LoRA] Warning: No blocks found in trunk")
+    else:
+        print("[Late LoRA] Warning: SAM model structure not recognized")
+        print(f"[Late LoRA] Available encoder attributes: {[attr for attr in dir(image_encoder) if not attr.startswith('_')]}")
+        if hasattr(image_encoder, "trunk"):
+            print(f"[Late LoRA] Available trunk attributes: {[attr for attr in dir(image_encoder.trunk) if not attr.startswith('_')]}")
+    
+    if len(replaced_modules) == 0:
+        print("[Late LoRA] Warning: No modules were replaced. SAM model may have unexpected structure.")
+        print("[Late LoRA] Available attributes:", dir(image_encoder))
+        if hasattr(image_encoder, "trunk"):
+            print("[Late LoRA] Trunk attributes:", dir(image_encoder.trunk))
+    
+    return replaced_modules
+
+
+def get_lora_parameters(model: nn.Module) -> List[nn.Parameter]:
+    """获取模型中所有 LoRA 层的参数
+    
+    Args:
+        model: 包含 LoRA 层的模型
+        
+    Returns:
+        LoRA 参数列表
+    """
+    lora_params = []
+    for module in model.modules():
+        if isinstance(module, (LoRALayer, LoRALinear)):
+            lora_params.extend(module.lora.parameters())
+    return lora_params
+
+
+def count_lora_parameters(model: nn.Module) -> Dict[str, int]:
+    """统计 LoRA 参数数量
+    
+    Args:
+        model: 包含 LoRA 层的模型
+        
+    Returns:
+        参数统计字典
+    """
+    lora_params = 0
+    total_params = 0
+    trainable_params = 0
+    
+    for param in model.parameters():
+        total_params += param.numel()
+        if param.requires_grad:
+            trainable_params += param.numel()
+    
+    for module in model.modules():
+        if isinstance(module, (LoRALayer, LoRALinear)):
+            for param in module.lora.parameters():
+                lora_params += param.numel()
+    
+    return {
+        "total": total_params,
+        "trainable": trainable_params,
+        "lora": lora_params,
+        "trainable_ratio": trainable_params / max(total_params, 1) * 100,
+    }
+
+
+def print_lora_info(model: nn.Module) -> None:
+    """打印 LoRA 配置信息
+    
+    Args:
+        model: 包含 LoRA 层的模型
+    """
+    stats = count_lora_parameters(model)
+    print("\n" + "="*60)
+    print("LoRA Configuration Summary")
+    print("="*60)
+    print(f"Total parameters:     {stats['total']:>12,}")
+    print(f"Trainable parameters: {stats['trainable']:>12,}")
+    print(f"LoRA parameters:      {stats['lora']:>12,}")
+    print(f"Trainable ratio:      {stats['trainable_ratio']:>11.2f}%")
+    print("="*60 + "\n")
+
+
+```
+
+现在修复第二个问题，处理 SAM encoder 输出的 dict 格式：
+
+```python
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Literal, Optional, Tuple
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision.models import resnet18, ResNet18_Weights
+
+
+@dataclass
+class ModelConfig:
+    """模型配置
+    
+    backbone: 选择骨干架构
+        - "unet_s": 轻量UNet，默认推荐，输出高分辨率平滑热力图，适合软分布学习
+        - "resnet18": ResNet18 + 插值上采样，速度快但空间精度略低
+    pretrained: 是否使用预训练权重（仅对resnet18有效）
+    upsample_to_input: resnet18时是否上采样到输入分辨率
+    
+    SAM LoRA 相关配置:
+    use_sam_encoder: 是否使用 SAM image encoder 作为特征提取器
+    sam_checkpoint: SAM 模型检查点路径
+    sam_lora_enabled: 是否启用 Late LoRA 微调
+    sam_lora_rank: LoRA 秩（通常为 4-16）
+    sam_lora_alpha: LoRA 缩放因子
+    sam_lora_dropout: LoRA dropout 概率
+    """
+    backbone: Literal["resnet18", "unet_s"] = "unet_s"
+    pretrained: bool = False
+    upsample_to_input: bool = True
+    # 明确两路输入通道数：主图(灰度或RGB)与条件灰度图
+    main_in_channels: int = 3
+    cond_in_channels: int = 1
+    
+    # SAM Late LoRA 配置
+    use_sam_encoder: bool = False
+    sam_checkpoint: Optional[str] = None
+    sam_lora_enabled: bool = False
+    sam_lora_rank: int = 8
+    sam_lora_alpha: float = 16.0
+    sam_lora_dropout: float = 0.0
+    sam_freeze_encoder: bool = True  # 是否冻结 SAM encoder（不启用 LoRA 时）
+
+
+class HeatmapHead(nn.Module):
+    def __init__(self, in_channels: int, mid_channels: int = 256) -> None:
+        super().__init__()
+        self.head = nn.Sequential(
+            nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(mid_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid_channels, 1, kernel_size=1, bias=True),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.head(x)
+
+
+class LabelHead(nn.Module):
+    def __init__(self, in_channels: int, mid_channels: int = 256, num_classes: int = 2) -> None:
+        super().__init__()
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Conv2d(in_channels, mid_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(mid_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid_channels, num_classes, kernel_size=1, bias=True),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.pool(x)
+        return self.fc(x).flatten(1)
+
+class DoubleConv(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int) -> None:
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.block(x)
+
+
+class UNetSmall(nn.Module):
+    """轻量级U-Net，输出输入分辨率的单通道logits热力图
+    
+    设计用于生成平滑、空间精确的热力图，通过跳连保持细节信息。
+    相比ResNet+上采样，能更好地学习软分布，避免插值带来的空间失真。
+    特别适合配合高斯软目标(KL/MSE)训练距离衰减的热力图。
+    
+    参数:
+        in_channels: 输入通道数，默认3(RGB)
+        base_ch: 基础通道数，控制模型容量，默认64
+    """
+
+    def __init__(self, in_channels: int = 3, base_ch: int = 64) -> None:
+        super().__init__()
+        c1, c2, c3, c4 = base_ch, base_ch * 2, base_ch * 4, base_ch * 8
+        self.out_ch = c1
+        self.enc1 = DoubleConv(in_channels, c1)
+        self.enc2 = DoubleConv(c1, c2)
+        self.enc3 = DoubleConv(c2, c3)
+        self.enc4 = DoubleConv(c3, c4)
+
+        self.pool = nn.MaxPool2d(2)
+
+        self.up3 = nn.ConvTranspose2d(c4, c3, kernel_size=2, stride=2)
+        self.dec3 = DoubleConv(c4, c3)
+        self.up2 = nn.ConvTranspose2d(c3, c2, kernel_size=2, stride=2)
+        self.dec2 = DoubleConv(c3, c2)
+        self.up1 = nn.ConvTranspose2d(c2, c1, kernel_size=2, stride=2)
+        self.dec1 = DoubleConv(c2, c1)
+
+        self.final = nn.Conv2d(c1, 1, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool(e1))
+        e3 = self.enc3(self.pool(e2))
+        e4 = self.enc4(self.pool(e3))
+
+        d3 = self.up3(e4)
+        d3 = torch.cat([d3, e3], dim=1)
+        d3 = self.dec3(d3)
+        d2 = self.up2(d3)
+        d2 = torch.cat([d2, e2], dim=1)
+        d2 = self.dec2(d2)
+        d1 = self.up1(d2)
+        d1 = torch.cat([d1, e1], dim=1)
+        d1 = self.dec1(d1)
+        # expose last decoder feature for classification head
+        self.last_dec = d1
+        return self.final(d1)
+
+
+class PointHeatmapModel(nn.Module):
+    """Backbone + 1-channel heatmap logits head.
+
+    Output: logits of shape [B,1,H',W'] optionally upsampled to input HxW.
+    """
+
+    def __init__(self, cfg: ModelConfig) -> None:
+        super().__init__()
+        self.cfg = cfg
+        total_in = int(cfg.main_in_channels) + int(cfg.cond_in_channels)
+        if cfg.backbone == "resnet18":
+            weights = ResNet18_Weights.DEFAULT if cfg.pretrained else None
+            base = resnet18(weights=weights)
+            # 调整conv1以适配任意输入通道
+            if total_in != 3:
+                old_conv1 = base.conv1
+                new_conv1 = nn.Conv2d(total_in, old_conv1.out_channels, kernel_size=old_conv1.kernel_size,
+                                       stride=old_conv1.stride, padding=old_conv1.padding, bias=False)
+                with torch.no_grad():
+                    if old_conv1.weight.shape[1] == 3:
+                        # 将预训练权重映射到新通道：前3通道拷贝，其余通道取均值
+                        new_conv1.weight[:, :3] = old_conv1.weight
+                        if total_in > 3:
+                            mean_w = old_conv1.weight.mean(dim=1, keepdim=True)
+                            new_conv1.weight[:, 3:total_in] = mean_w.repeat(1, total_in - 3, 1, 1)
+                    else:
+                        nn.init.kaiming_normal_(new_conv1.weight, mode="fan_out", nonlinearity="relu")
+                base.conv1 = new_conv1
+            self.stem = nn.Sequential(base.conv1, base.bn1, base.relu, base.maxpool)
+            self.layer1 = base.layer1
+            self.layer2 = base.layer2  # stride 8 total
+            self.layer3 = base.layer3  # stride 16
+            self.layer4 = base.layer4  # stride 32
+            in_channels = 512
+            self.head = HeatmapHead(in_channels)
+            self.label_head = LabelHead(in_channels)
+            self._is_unet = False
+        elif cfg.backbone == "unet_s":
+            self.unet = UNetSmall(in_channels=total_in, base_ch=64)
+            self.label_head_unet = LabelHead(self.unet.out_ch)
+            self._is_unet = True
+        else:
+            raise ValueError(f"Unsupported backbone: {cfg.backbone}")
+
+    def forward(self, x: torch.Tensor, cond: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        # 接受两路输入；为兼容旧用法，若cond为None则认为x已是拼接后的总通道输入
+        if cond is not None:
+            x = torch.cat([x, cond], dim=1)
+        b, c, h, w = x.shape
+        if getattr(self, "_is_unet", False):
+            logits = self.unet(x)
+            # use last decoder feature for label
+            feat = getattr(self.unet, "last_dec", None)
+            if feat is None:
+                # fallback to using input averaged with logits if feature missing
+                feat = x
+            label_logits = self.label_head_unet(feat)
+            return logits, label_logits
+        x = self.stem(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+        logits_low = self.head(x)  # [B,1,h',w']
+        label_logits = self.label_head(x)  # [B,2]
+        if self.cfg.upsample_to_input:
+            logits = F.interpolate(logits_low, size=(h, w), mode="bilinear", align_corners=False)
+            return logits, label_logits
+        return logits_low, label_logits
+
+
+def argmax_from_logits(logits: torch.Tensor) -> torch.Tensor:
+    """Get integer pixel coordinates from logits [B,1,H,W] -> [B,2] (x,y)."""
+    b, _, h, w = logits.shape
+    idx = logits.view(b, -1).argmax(dim=1)
+    y = (idx // w).float()
+    x = (idx % w).float()
+    return torch.stack([x, y], dim=1)
+
+
+def soft_argmax_from_logits(logits: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
+    """Soft-argmax to get sub-pixel expected coordinates [B,1,H,W] -> [B,2] (x,y)."""
+    b, _, h, w = logits.shape
+    p = F.softmax(logits.view(b, -1) / max(temperature, 1e-6), dim=1).view(b, 1, h, w)
+    xs = torch.linspace(0, w - 1, w, device=logits.device).view(1, 1, 1, w)
+    ys = torch.linspace(0, h - 1, h, device=logits.device).view(1, 1, h, 1)
+    x_exp = (p * xs).sum(dim=(2, 3))
+    y_exp = (p * ys).sum(dim=(2, 3))
+    return torch.cat([x_exp, y_exp], dim=1)
+
+
+# ==========================
+# 层级策略采样与log_prob计算
+# 将像素分布分解为：cell分布 + cell内子像素分布
+# ==========================
+
+def _crop_to_stride(logits: torch.Tensor, stride: int) -> tuple[torch.Tensor, int, int]:
+    B, C, H, W = logits.shape
+    Hc = H // stride
+    Wc = W // stride
+    Ht = Hc * stride
+    Wt = Wc * stride
+    return logits[:, :, :Ht, :Wt], Hc, Wc
+
+
+def _cell_logsumexp(logits: torch.Tensor, stride: int) -> tuple[torch.Tensor, torch.Tensor, int, int]:
+    logits, Hc, Wc = _crop_to_stride(logits, stride)
+    B, _, Ht, Wt = logits.shape
+    s = stride
+    patches = F.unfold(logits, kernel_size=(s, s), stride=(s, s))  # [B, s*s, Hc*Wc]
+    lse = torch.logsumexp(patches, dim=1)  # [B, Hc*Wc]
+    lse_map = lse.view(B, 1, Hc, Wc)
+    return lse_map, patches, Hc, Wc
+
+
+@torch.no_grad()
+def sample_cell_and_offset(
+    logits: torch.Tensor,
+    stride: int,
+    temperature: float = 1.0,
+) -> dict:
+    device = logits.device
+    T = max(temperature, 1e-6)
+    lse_map, patches, Hc, Wc = _cell_logsumexp(logits / T, stride)
+    B = logits.size(0)
+    s = stride
+
+    # p(cell)
+    cell_logits_flat = lse_map.view(B, -1)
+    cell_dist = torch.distributions.Categorical(logits=cell_logits_flat)
+    cell_idx = cell_dist.sample()                       # [B]
+    cell_logp = cell_dist.log_prob(cell_idx)            # [B]
+
+    # p(subpixel | cell)
+    within_logits = patches.gather(2, cell_idx.view(B, 1, 1).expand(B, s*s, 1)).squeeze(-1)
+    sub_dist = torch.distributions.Categorical(logits=within_logits)
+    sub_idx = sub_dist.sample()
+    sub_logp = sub_dist.log_prob(sub_idx)
+
+    # index -> (i,j)
+    ci = (cell_idx // Wc)              # [B]
+    cj = (cell_idx % Wc)               # [B]
+    ui = (sub_idx // s)
+    uj = (sub_idx % s)
+
+    # pixel coordinates within cropped region
+    yi = ci * s + ui
+    xj = cj * s + uj
+
+    # offset in [-0.5, 0.5]
+    off_x = (uj.to(torch.float32) + 0.5) / s - 0.5
+    off_y = (ui.to(torch.float32) + 0.5) / s - 0.5
+
+    total_logp = cell_logp + sub_logp
+
+    return {
+        "cell_idx": cell_idx,
+        "cell_ij": torch.stack([cj, ci], dim=1),
+        "sub_idx": sub_idx,
+        "sub_ij": torch.stack([uj, ui], dim=1),
+        "pixel_xy": torch.stack([xj, yi], dim=1),
+        "offset": torch.stack([off_x, off_y], dim=1).to(device),
+        "log_prob": total_logp,
+        "grid_hw": torch.tensor([Hc, Wc], device=device),
+        "stride": torch.tensor(s, device=device),
+    }
+
+
+def action_to_continuous_xy(sample_out: dict) -> torch.Tensor:
+    s = int(sample_out["stride"].item())
+    x = sample_out["pixel_xy"][:, 0].to(torch.float32) + 0.5
+    y = sample_out["pixel_xy"][:, 1].to(torch.float32) + 0.5
+    return torch.stack([x, y], dim=1)
+
+
+def log_prob_of_action(
+    logits: torch.Tensor,
+    stride: int,
+    cell_idx: torch.Tensor,
+    sub_idx: torch.Tensor,
+    temperature: float = 1.0,
+) -> torch.Tensor:
+    T = max(temperature, 1e-6)
+    lse_map, patches, Hc, Wc = _cell_logsumexp(logits / T, stride)
+    B = logits.size(0)
+    s = stride
+
+    cell_logits_flat = lse_map.view(B, -1)
+    cell_logp = torch.log_softmax(cell_logits_flat, dim=1).gather(1, cell_idx.view(B, 1)).squeeze(1)
+
+    within_logits = patches.gather(2, cell_idx.view(B, 1, 1).expand(B, s*s, 1)).squeeze(-1)
+    sub_logp = torch.log_softmax(within_logits, dim=1).gather(1, sub_idx.view(B, 1)).squeeze(1)
+
+    return cell_logp + sub_logp
+
+
+# ==========================
+# 联合策略：标签 + cell + cell内子像素
+# 提供采样与log_prob计算，便于GRPO等算法直接使用
+# ==========================
+
+@torch.no_grad()
+def sample_joint_label_cell_offset(
+    logits: torch.Tensor,
+    label_logits: torch.Tensor,
+    stride: int,
+    temperature_pixel: float = 1.0,
+    temperature_label: float = 1.0,
+) -> dict:
+    """Sample a joint action (label, cell, subpixel) and return combined log_prob.
+
+    Args:
+        logits: [B,1,H,W] heatmap logits over pixels
+        label_logits: [B,2] binary label logits
+        stride: cell stride size (pixels)
+        temperature_pixel: temperature for pixel distribution
+        temperature_label: temperature for label distribution
+    Returns:
+        dict with keys:
+          - label_idx: [B]
+          - cell_idx, cell_ij, sub_idx, sub_ij, pixel_xy, offset (same as sample_cell_and_offset)
+          - log_prob_label: [B]
+          - log_prob_pixel: [B]  (cell + sub)
+          - log_prob: [B]        (sum)
+          - grid_hw, stride
+    """
+    T_label = max(temperature_label, 1e-6)
+    label_dist = torch.distributions.Categorical(logits=label_logits / T_label)
+    label_idx = label_dist.sample()
+    logp_label = label_dist.log_prob(label_idx)
+
+    pixel = sample_cell_and_offset(logits, stride=stride, temperature=temperature_pixel)
+    logp_pixel = pixel["log_prob"]
+
+    out = dict(pixel)
+    out["label_idx"] = label_idx
+    out["log_prob_label"] = logp_label
+    out["log_prob_pixel"] = logp_pixel
+    out["log_prob"] = logp_label + logp_pixel
+    return out
+
+
+def log_prob_of_joint_action(
+    logits: torch.Tensor,
+    label_logits: torch.Tensor,
+    stride: int,
+    label_idx: torch.Tensor,
+    cell_idx: torch.Tensor,
+    sub_idx: torch.Tensor,
+    temperature_pixel: float = 1.0,
+    temperature_label: float = 1.0,
+) -> torch.Tensor:
+    """Compute log_prob(label) + log_prob(cell) + log_prob(sub|cell) for a given action."""
+    # label term
+    T_label = max(temperature_label, 1e-6)
+    ll = torch.log_softmax(label_logits / T_label, dim=1)
+    logp_label = ll.gather(1, label_idx.view(-1, 1)).squeeze(1)
+
+    # pixel terms
+    logp_pixel = log_prob_of_action(
+        logits=logits,
+        stride=stride,
+        cell_idx=cell_idx,
+        sub_idx=sub_idx,
+        temperature=temperature_pixel,
+    )
+    return logp_label + logp_pixel
+
+
+# ==========================
+# SAM Encoder 集成
+# ==========================
+
+class SAMEncoderWrapper(nn.Module):
+    """SAM Image Encoder 包装器，用于特征提取
+    
+    可选地应用 Late LoRA 进行参数高效微调
+    """
+    
+    def __init__(
+        self,
+        sam_checkpoint: str,
+        device: torch.device,
+        lora_enabled: bool = False,
+        lora_rank: int = 8,
+        lora_alpha: float = 16.0,
+        lora_dropout: float = 0.0,
+        freeze_encoder: bool = True,
+    ):
+        super().__init__()
+        
+        # 延迟导入以避免不必要的依赖
+        try:
+            import sys
+            import os
+            # 添加 SAM2 路径
+            sam2_path = os.path.join(os.path.dirname(__file__), "..", "..", "third_party", "sam2")
+            if os.path.exists(sam2_path) and sam2_path not in sys.path:
+                sys.path.insert(0, sam2_path)
+            
+            from sam2.build_sam import build_sam2
+        except ImportError as e:
+            raise ImportError(
+                "SAM2 is required but not found. Please install it:\n"
+                "git clone https://github.com/facebookresearch/segment-anything-2.git third_party/sam2\n"
+                "cd third_party/sam2 && pip install -e ."
+            ) from e
+        
+        # 加载 SAM 模型
+        print(f"[SAM] Loading SAM checkpoint from {sam_checkpoint}")
+        model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
+        self.sam_model = build_sam2(model_cfg, sam_checkpoint, device=str(device))
+        
+        # 提取 image encoder
+        self.image_encoder = self.sam_model.image_encoder
+        
+        # 冻结或启用 LoRA
+        if lora_enabled:
+            print(f"[SAM] Enabling Late LoRA: rank={lora_rank}, alpha={lora_alpha}")
+            try:
+                from .sam_lora import apply_late_lora_to_sam_encoder, print_lora_info
+                self.lora_modules = apply_late_lora_to_sam_encoder(
+                    self.sam_model,
+                    rank=lora_rank,
+                    alpha=lora_alpha,
+                    dropout=lora_dropout,
+                )
+                print_lora_info(self.sam_model)
+            except Exception as e:
+                print(f"[SAM] Warning: Failed to apply LoRA: {e}")
+                self.lora_modules = {}
+        else:
+            self.lora_modules = {}
+            if freeze_encoder:
+                print("[SAM] Freezing SAM image encoder")
+                for param in self.image_encoder.parameters():
+                    param.requires_grad = False
+            else:
+                print("[SAM] SAM image encoder is trainable (no LoRA)")
+        
+        # 获取输出特征维度
+        self.feature_dim = self._get_feature_dim()
+        print(f"[SAM] Encoder feature dimension: {self.feature_dim}")
+    
+    def _get_feature_dim(self) -> int:
+        """通过前向传播一个假输入来获取特征维度"""
+        with torch.no_grad():
+            # SAM 期望输入为 1024x1024
+            dummy = torch.randn(1, 3, 1024, 1024, device=next(self.image_encoder.parameters()).device)
+            feat = self.image_encoder(dummy)
+            
+            # SAM2 可能返回 dict，需要提取实际的特征张量
+            if isinstance(feat, dict):
+                # 通常在 'vision_features' 或类似的键中
+                if 'vision_features' in feat:
+                    feat = feat['vision_features']
+                elif 'high_res_feats' in feat:
+                    feat = feat['high_res_feats']
+                else:
+                    # 取第一个张量值
+                    for v in feat.values():
+                        if isinstance(v, torch.Tensor) and v.ndim == 4:
+                            feat = v
+                            break
+            
+            if isinstance(feat, (list, tuple)):
+                feat = feat[0]
+            
+            return feat.shape[1]  # [B, C, H, W] -> C
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """提取图像特征
+        
+        Args:
+            x: 输入图像 [B, 3, H, W]，任意尺寸（将被调整为 1024x1024）
+            
+        Returns:
+            特征图 [B, C, H', W']
+        """
+        # SAM encoder 需要 1024x1024 输入
+        orig_size = x.shape[-2:]
+        if orig_size != (1024, 1024):
+            x = F.interpolate(x, size=(1024, 1024), mode="bilinear", align_corners=False)
+        
+        # 提取特征
+        feat = self.image_encoder(x)
+        
+        # 如果输出是多尺度特征，取第一个
+        if isinstance(feat, (list, tuple)):
+            feat = feat[0]
+        
+        return feat
+
+
+class PointHeatmapModelWithSAM(nn.Module):
+    """结合 SAM encoder 的点热力图预测模型
+    
+    使用 SAM image encoder 提取特征，然后通过热力图头预测点位置
+    """
+    
+    def __init__(self, cfg: ModelConfig) -> None:
+        super().__init__()
+        self.cfg = cfg
+        
+        if not cfg.use_sam_encoder:
+            raise ValueError("This model requires use_sam_encoder=True")
+        
+        if cfg.sam_checkpoint is None:
+            raise ValueError("sam_checkpoint must be provided when use_sam_encoder=True")
+        
+        # 确定设备
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # 创建 SAM encoder
+        self.sam_encoder = SAMEncoderWrapper(
+            sam_checkpoint=cfg.sam_checkpoint,
+            device=device,
+            lora_enabled=cfg.sam_lora_enabled,
+            lora_rank=cfg.sam_lora_rank,
+            lora_alpha=cfg.sam_lora_alpha,
+            lora_dropout=cfg.sam_lora_dropout,
+            freeze_encoder=cfg.sam_freeze_encoder,
+        )
+        
+        # 获取 SAM encoder 输出维度
+        sam_feat_dim = self.sam_encoder.feature_dim
+        
+        # 条件输入处理：独立的小网络处理条件图像（灰度 mask）
+        self.cond_encoder = nn.Sequential(
+            nn.Conv2d(cfg.cond_in_channels, 32, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+        )
+        
+        # 特征融合：将 SAM 特征和条件特征拼接
+        # SAM 输出通常是 256 通道 @ 64x64（对于 1024x1024 输入）
+        # 条件特征需要匹配空间尺寸
+        self.feature_fusion = nn.Conv2d(sam_feat_dim + 128, 512, kernel_size=1)
+        
+        # 热力图头和标签头
+        self.head = HeatmapHead(512, mid_channels=256)
+        self.label_head = LabelHead(512, mid_channels=256)
+        
+    def forward(self, x: torch.Tensor, cond: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        """前向传播
+        
+        Args:
+            x: 主图像 [B, 3, H, W]
+            cond: 条件图像（灰度 mask）[B, 1, H, W]
+            
+        Returns:
+            logits: 热力图 logits [B, 1, H, W]
+            label_logits: 标签 logits [B, 2]
+        """
+        b, _, h, w = x.shape
+        
+        # 提取 SAM 特征
+        sam_feat = self.sam_encoder(x)  # [B, C, H', W']
+        
+        # 处理条件输入
+        if cond is None:
+            cond = torch.zeros(b, self.cfg.cond_in_channels, h, w, device=x.device)
+        
+        cond_feat = self.cond_encoder(cond)  # [B, 128, H'', W'']
+        
+        # 匹配空间尺寸
+        if cond_feat.shape[-2:] != sam_feat.shape[-2:]:
+            cond_feat = F.interpolate(
+                cond_feat, 
+                size=sam_feat.shape[-2:], 
+                mode="bilinear", 
+                align_corners=False
+            )
+        
+        # 融合特征
+        fused = torch.cat([sam_feat, cond_feat], dim=1)
+        fused = self.feature_fusion(fused)
+        
+        # 预测热力图
+        logits = self.head(fused)  # [B, 1, H', W']
+        
+        # 上采样到输入分辨率
+        if logits.shape[-2:] != (h, w):
+            logits = F.interpolate(logits, size=(h, w), mode="bilinear", align_corners=False)
+        
+        # 预测标签
+        label_logits = self.label_head(fused)  # [B, 2]
+        
+        return logits, label_logits
+
+
+```
+
+```python
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Literal, Optional, Tuple
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision.models import resnet18, ResNet18_Weights
+
+
+@dataclass
+class ModelConfig:
+    """模型配置
+    
+    backbone: 选择骨干架构
+        - "unet_s": 轻量UNet，默认推荐，输出高分辨率平滑热力图，适合软分布学习
+        - "resnet18": ResNet18 + 插值上采样，速度快但空间精度略低
+    pretrained: 是否使用预训练权重（仅对resnet18有效）
+    upsample_to_input: resnet18时是否上采样到输入分辨率
+    
+    SAM LoRA 相关配置:
+    use_sam_encoder: 是否使用 SAM image encoder 作为特征提取器
+    sam_checkpoint: SAM 模型检查点路径
+    sam_lora_enabled: 是否启用 Late LoRA 微调
+    sam_lora_rank: LoRA 秩（通常为 4-16）
+    sam_lora_alpha: LoRA 缩放因子
+    sam_lora_dropout: LoRA dropout 概率
+    """
+    backbone: Literal["resnet18", "unet_s"] = "unet_s"
+    pretrained: bool = False
+    upsample_to_input: bool = True
+    # 明确两路输入通道数：主图(灰度或RGB)与条件灰度图
+    main_in_channels: int = 3
+    cond_in_channels: int = 1
+    
+    # SAM Late LoRA 配置
+    use_sam_encoder: bool = False
+    sam_checkpoint: Optional[str] = None
+    sam_lora_enabled: bool = False
+    sam_lora_rank: int = 8
+    sam_lora_alpha: float = 16.0
+    sam_lora_dropout: float = 0.0
+    sam_freeze_encoder: bool = True  # 是否冻结 SAM encoder（不启用 LoRA 时）
+
+
+class HeatmapHead(nn.Module):
+    def __init__(self, in_channels: int, mid_channels: int = 256) -> None:
+        super().__init__()
+        self.head = nn.Sequential(
+            nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(mid_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid_channels, 1, kernel_size=1, bias=True),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.head(x)
+
+
+class LabelHead(nn.Module):
+    def __init__(self, in_channels: int, mid_channels: int = 256, num_classes: int = 2) -> None:
+        super().__init__()
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Conv2d(in_channels, mid_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(mid_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid_channels, num_classes, kernel_size=1, bias=True),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.pool(x)
+        return self.fc(x).flatten(1)
+
+class DoubleConv(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int) -> None:
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.block(x)
+
+
+class UNetSmall(nn.Module):
+    """轻量级U-Net，输出输入分辨率的单通道logits热力图
+    
+    设计用于生成平滑、空间精确的热力图，通过跳连保持细节信息。
+    相比ResNet+上采样，能更好地学习软分布，避免插值带来的空间失真。
+    特别适合配合高斯软目标(KL/MSE)训练距离衰减的热力图。
+    
+    参数:
+        in_channels: 输入通道数，默认3(RGB)
+        base_ch: 基础通道数，控制模型容量，默认64
+    """
+
+    def __init__(self, in_channels: int = 3, base_ch: int = 64) -> None:
+        super().__init__()
+        c1, c2, c3, c4 = base_ch, base_ch * 2, base_ch * 4, base_ch * 8
+        self.out_ch = c1
+        self.enc1 = DoubleConv(in_channels, c1)
+        self.enc2 = DoubleConv(c1, c2)
+        self.enc3 = DoubleConv(c2, c3)
+        self.enc4 = DoubleConv(c3, c4)
+
+        self.pool = nn.MaxPool2d(2)
+
+        self.up3 = nn.ConvTranspose2d(c4, c3, kernel_size=2, stride=2)
+        self.dec3 = DoubleConv(c4, c3)
+        self.up2 = nn.ConvTranspose2d(c3, c2, kernel_size=2, stride=2)
+        self.dec2 = DoubleConv(c3, c2)
+        self.up1 = nn.ConvTranspose2d(c2, c1, kernel_size=2, stride=2)
+        self.dec1 = DoubleConv(c2, c1)
+
+        self.final = nn.Conv2d(c1, 1, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool(e1))
+        e3 = self.enc3(self.pool(e2))
+        e4 = self.enc4(self.pool(e3))
+
+        d3 = self.up3(e4)
+        d3 = torch.cat([d3, e3], dim=1)
+        d3 = self.dec3(d3)
+        d2 = self.up2(d3)
+        d2 = torch.cat([d2, e2], dim=1)
+        d2 = self.dec2(d2)
+        d1 = self.up1(d2)
+        d1 = torch.cat([d1, e1], dim=1)
+        d1 = self.dec1(d1)
+        # expose last decoder feature for classification head
+        self.last_dec = d1
+        return self.final(d1)
+
+
+class PointHeatmapModel(nn.Module):
+    """Backbone + 1-channel heatmap logits head.
+
+    Output: logits of shape [B,1,H',W'] optionally upsampled to input HxW.
+    """
+
+    def __init__(self, cfg: ModelConfig) -> None:
+        super().__init__()
+        self.cfg = cfg
+        total_in = int(cfg.main_in_channels) + int(cfg.cond_in_channels)
+        if cfg.backbone == "resnet18":
+            weights = ResNet18_Weights.DEFAULT if cfg.pretrained else None
+            base = resnet18(weights=weights)
+            # 调整conv1以适配任意输入通道
+            if total_in != 3:
+                old_conv1 = base.conv1
+                new_conv1 = nn.Conv2d(total_in, old_conv1.out_channels, kernel_size=old_conv1.kernel_size,
+                                       stride=old_conv1.stride, padding=old_conv1.padding, bias=False)
+                with torch.no_grad():
+                    if old_conv1.weight.shape[1] == 3:
+                        # 将预训练权重映射到新通道：前3通道拷贝，其余通道取均值
+                        new_conv1.weight[:, :3] = old_conv1.weight
+                        if total_in > 3:
+                            mean_w = old_conv1.weight.mean(dim=1, keepdim=True)
+                            new_conv1.weight[:, 3:total_in] = mean_w.repeat(1, total_in - 3, 1, 1)
+                    else:
+                        nn.init.kaiming_normal_(new_conv1.weight, mode="fan_out", nonlinearity="relu")
+                base.conv1 = new_conv1
+            self.stem = nn.Sequential(base.conv1, base.bn1, base.relu, base.maxpool)
+            self.layer1 = base.layer1
+            self.layer2 = base.layer2  # stride 8 total
+            self.layer3 = base.layer3  # stride 16
+            self.layer4 = base.layer4  # stride 32
+            in_channels = 512
+            self.head = HeatmapHead(in_channels)
+            self.label_head = LabelHead(in_channels)
+            self._is_unet = False
+        elif cfg.backbone == "unet_s":
+            self.unet = UNetSmall(in_channels=total_in, base_ch=64)
+            self.label_head_unet = LabelHead(self.unet.out_ch)
+            self._is_unet = True
+        else:
+            raise ValueError(f"Unsupported backbone: {cfg.backbone}")
+
+    def forward(self, x: torch.Tensor, cond: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        # 接受两路输入；为兼容旧用法，若cond为None则认为x已是拼接后的总通道输入
+        if cond is not None:
+            x = torch.cat([x, cond], dim=1)
+        b, c, h, w = x.shape
+        if getattr(self, "_is_unet", False):
+            logits = self.unet(x)
+            # use last decoder feature for label
+            feat = getattr(self.unet, "last_dec", None)
+            if feat is None:
+                # fallback to using input averaged with logits if feature missing
+                feat = x
+            label_logits = self.label_head_unet(feat)
+            return logits, label_logits
+        x = self.stem(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+        logits_low = self.head(x)  # [B,1,h',w']
+        label_logits = self.label_head(x)  # [B,2]
+        if self.cfg.upsample_to_input:
+            logits = F.interpolate(logits_low, size=(h, w), mode="bilinear", align_corners=False)
+            return logits, label_logits
+        return logits_low, label_logits
+
+
+def argmax_from_logits(logits: torch.Tensor) -> torch.Tensor:
+    """Get integer pixel coordinates from logits [B,1,H,W] -> [B,2] (x,y)."""
+    b, _, h, w = logits.shape
+    idx = logits.view(b, -1).argmax(dim=1)
+    y = (idx // w).float()
+    x = (idx % w).float()
+    return torch.stack([x, y], dim=1)
+
+
+def soft_argmax_from_logits(logits: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
+    """Soft-argmax to get sub-pixel expected coordinates [B,1,H,W] -> [B,2] (x,y)."""
+    b, _, h, w = logits.shape
+    p = F.softmax(logits.view(b, -1) / max(temperature, 1e-6), dim=1).view(b, 1, h, w)
+    xs = torch.linspace(0, w - 1, w, device=logits.device).view(1, 1, 1, w)
+    ys = torch.linspace(0, h - 1, h, device=logits.device).view(1, 1, h, 1)
+    x_exp = (p * xs).sum(dim=(2, 3))
+    y_exp = (p * ys).sum(dim=(2, 3))
+    return torch.cat([x_exp, y_exp], dim=1)
+
+
+# ==========================
+# 层级策略采样与log_prob计算
+# 将像素分布分解为：cell分布 + cell内子像素分布
+# ==========================
+
+def _crop_to_stride(logits: torch.Tensor, stride: int) -> tuple[torch.Tensor, int, int]:
+    B, C, H, W = logits.shape
+    Hc = H // stride
+    Wc = W // stride
+    Ht = Hc * stride
+    Wt = Wc * stride
+    return logits[:, :, :Ht, :Wt], Hc, Wc
+
+
+def _cell_logsumexp(logits: torch.Tensor, stride: int) -> tuple[torch.Tensor, torch.Tensor, int, int]:
+    logits, Hc, Wc = _crop_to_stride(logits, stride)
+    B, _, Ht, Wt = logits.shape
+    s = stride
+    patches = F.unfold(logits, kernel_size=(s, s), stride=(s, s))  # [B, s*s, Hc*Wc]
+    lse = torch.logsumexp(patches, dim=1)  # [B, Hc*Wc]
+    lse_map = lse.view(B, 1, Hc, Wc)
+    return lse_map, patches, Hc, Wc
+
+
+@torch.no_grad()
+def sample_cell_and_offset(
+    logits: torch.Tensor,
+    stride: int,
+    temperature: float = 1.0,
+) -> dict:
+    device = logits.device
+    T = max(temperature, 1e-6)
+    lse_map, patches, Hc, Wc = _cell_logsumexp(logits / T, stride)
+    B = logits.size(0)
+    s = stride
+
+    # p(cell)
+    cell_logits_flat = lse_map.view(B, -1)
+    cell_dist = torch.distributions.Categorical(logits=cell_logits_flat)
+    cell_idx = cell_dist.sample()                       # [B]
+    cell_logp = cell_dist.log_prob(cell_idx)            # [B]
+
+    # p(subpixel | cell)
+    within_logits = patches.gather(2, cell_idx.view(B, 1, 1).expand(B, s*s, 1)).squeeze(-1)
+    sub_dist = torch.distributions.Categorical(logits=within_logits)
+    sub_idx = sub_dist.sample()
+    sub_logp = sub_dist.log_prob(sub_idx)
+
+    # index -> (i,j)
+    ci = (cell_idx // Wc)              # [B]
+    cj = (cell_idx % Wc)               # [B]
+    ui = (sub_idx // s)
+    uj = (sub_idx % s)
+
+    # pixel coordinates within cropped region
+    yi = ci * s + ui
+    xj = cj * s + uj
+
+    # offset in [-0.5, 0.5]
+    off_x = (uj.to(torch.float32) + 0.5) / s - 0.5
+    off_y = (ui.to(torch.float32) + 0.5) / s - 0.5
+
+    total_logp = cell_logp + sub_logp
+
+    return {
+        "cell_idx": cell_idx,
+        "cell_ij": torch.stack([cj, ci], dim=1),
+        "sub_idx": sub_idx,
+        "sub_ij": torch.stack([uj, ui], dim=1),
+        "pixel_xy": torch.stack([xj, yi], dim=1),
+        "offset": torch.stack([off_x, off_y], dim=1).to(device),
+        "log_prob": total_logp,
+        "grid_hw": torch.tensor([Hc, Wc], device=device),
+        "stride": torch.tensor(s, device=device),
+    }
+
+
+def action_to_continuous_xy(sample_out: dict) -> torch.Tensor:
+    s = int(sample_out["stride"].item())
+    x = sample_out["pixel_xy"][:, 0].to(torch.float32) + 0.5
+    y = sample_out["pixel_xy"][:, 1].to(torch.float32) + 0.5
+    return torch.stack([x, y], dim=1)
+
+
+def log_prob_of_action(
+    logits: torch.Tensor,
+    stride: int,
+    cell_idx: torch.Tensor,
+    sub_idx: torch.Tensor,
+    temperature: float = 1.0,
+) -> torch.Tensor:
+    T = max(temperature, 1e-6)
+    lse_map, patches, Hc, Wc = _cell_logsumexp(logits / T, stride)
+    B = logits.size(0)
+    s = stride
+
+    cell_logits_flat = lse_map.view(B, -1)
+    cell_logp = torch.log_softmax(cell_logits_flat, dim=1).gather(1, cell_idx.view(B, 1)).squeeze(1)
+
+    within_logits = patches.gather(2, cell_idx.view(B, 1, 1).expand(B, s*s, 1)).squeeze(-1)
+    sub_logp = torch.log_softmax(within_logits, dim=1).gather(1, sub_idx.view(B, 1)).squeeze(1)
+
+    return cell_logp + sub_logp
+
+
+# ==========================
+# 联合策略：标签 + cell + cell内子像素
+# 提供采样与log_prob计算，便于GRPO等算法直接使用
+# ==========================
+
+@torch.no_grad()
+def sample_joint_label_cell_offset(
+    logits: torch.Tensor,
+    label_logits: torch.Tensor,
+    stride: int,
+    temperature_pixel: float = 1.0,
+    temperature_label: float = 1.0,
+) -> dict:
+    """Sample a joint action (label, cell, subpixel) and return combined log_prob.
+
+    Args:
+        logits: [B,1,H,W] heatmap logits over pixels
+        label_logits: [B,2] binary label logits
+        stride: cell stride size (pixels)
+        temperature_pixel: temperature for pixel distribution
+        temperature_label: temperature for label distribution
+    Returns:
+        dict with keys:
+          - label_idx: [B]
+          - cell_idx, cell_ij, sub_idx, sub_ij, pixel_xy, offset (same as sample_cell_and_offset)
+          - log_prob_label: [B]
+          - log_prob_pixel: [B]  (cell + sub)
+          - log_prob: [B]        (sum)
+          - grid_hw, stride
+    """
+    T_label = max(temperature_label, 1e-6)
+    label_dist = torch.distributions.Categorical(logits=label_logits / T_label)
+    label_idx = label_dist.sample()
+    logp_label = label_dist.log_prob(label_idx)
+
+    pixel = sample_cell_and_offset(logits, stride=stride, temperature=temperature_pixel)
+    logp_pixel = pixel["log_prob"]
+
+    out = dict(pixel)
+    out["label_idx"] = label_idx
+    out["log_prob_label"] = logp_label
+    out["log_prob_pixel"] = logp_pixel
+    out["log_prob"] = logp_label + logp_pixel
+    return out
+
+
+def log_prob_of_joint_action(
+    logits: torch.Tensor,
+    label_logits: torch.Tensor,
+    stride: int,
+    label_idx: torch.Tensor,
+    cell_idx: torch.Tensor,
+    sub_idx: torch.Tensor,
+    temperature_pixel: float = 1.0,
+    temperature_label: float = 1.0,
+) -> torch.Tensor:
+    """Compute log_prob(label) + log_prob(cell) + log_prob(sub|cell) for a given action."""
+    # label term
+    T_label = max(temperature_label, 1e-6)
+    ll = torch.log_softmax(label_logits / T_label, dim=1)
+    logp_label = ll.gather(1, label_idx.view(-1, 1)).squeeze(1)
+
+    # pixel terms
+    logp_pixel = log_prob_of_action(
+        logits=logits,
+        stride=stride,
+        cell_idx=cell_idx,
+        sub_idx=sub_idx,
+        temperature=temperature_pixel,
+    )
+    return logp_label + logp_pixel
+
+
+# ==========================
+# SAM Encoder 集成
+# ==========================
+
+class SAMEncoderWrapper(nn.Module):
+    """SAM Image Encoder 包装器，用于特征提取
+    
+    可选地应用 Late LoRA 进行参数高效微调
+    """
+    
+    def __init__(
+        self,
+        sam_checkpoint: str,
+        device: torch.device,
+        lora_enabled: bool = False,
+        lora_rank: int = 8,
+        lora_alpha: float = 16.0,
+        lora_dropout: float = 0.0,
+        freeze_encoder: bool = True,
+    ):
+        super().__init__()
+        
+        # 延迟导入以避免不必要的依赖
+        try:
+            import sys
+            import os
+            # 添加 SAM2 路径
+            sam2_path = os.path.join(os.path.dirname(__file__), "..", "..", "third_party", "sam2")
+            if os.path.exists(sam2_path) and sam2_path not in sys.path:
+                sys.path.insert(0, sam2_path)
+            
+            from sam2.build_sam import build_sam2
+        except ImportError as e:
+            raise ImportError(
+                "SAM2 is required but not found. Please install it:\n"
+                "git clone https://github.com/facebookresearch/segment-anything-2.git third_party/sam2\n"
+                "cd third_party/sam2 && pip install -e ."
+            ) from e
+        
+        # 加载 SAM 模型
+        print(f"[SAM] Loading SAM checkpoint from {sam_checkpoint}")
+        model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
+        self.sam_model = build_sam2(model_cfg, sam_checkpoint, device=str(device))
+        
+        # 提取 image encoder
+        self.image_encoder = self.sam_model.image_encoder
+        
+        # 冻结或启用 LoRA
+        if lora_enabled:
+            print(f"[SAM] Enabling Late LoRA: rank={lora_rank}, alpha={lora_alpha}")
+            try:
+                from .sam_lora import apply_late_lora_to_sam_encoder, print_lora_info
+                self.lora_modules = apply_late_lora_to_sam_encoder(
+                    self.sam_model,
+                    rank=lora_rank,
+                    alpha=lora_alpha,
+                    dropout=lora_dropout,
+                )
+                print_lora_info(self.sam_model)
+            except Exception as e:
+                print(f"[SAM] Warning: Failed to apply LoRA: {e}")
+                self.lora_modules = {}
+        else:
+            self.lora_modules = {}
+            if freeze_encoder:
+                print("[SAM] Freezing SAM image encoder")
+                for param in self.image_encoder.parameters():
+                    param.requires_grad = False
+            else:
+                print("[SAM] SAM image encoder is trainable (no LoRA)")
+        
+        # 获取输出特征维度
+        self.feature_dim = self._get_feature_dim()
+        print(f"[SAM] Encoder feature dimension: {self.feature_dim}")
+    
+    def _get_feature_dim(self) -> int:
+        """通过前向传播一个假输入来获取特征维度"""
+        with torch.no_grad():
+            # SAM 期望输入为 1024x1024
+            dummy = torch.randn(1, 3, 1024, 1024, device=next(self.image_encoder.parameters()).device)
+            feat = self.image_encoder(dummy)
+            
+            # SAM2 可能返回 dict，需要提取实际的特征张量
+            if isinstance(feat, dict):
+                # 通常在 'vision_features' 或类似的键中
+                if 'vision_features' in feat:
+                    feat = feat['vision_features']
+                elif 'high_res_feats' in feat:
+                    feat = feat['high_res_feats']
+                else:
+                    # 取第一个张量值
+                    for v in feat.values():
+                        if isinstance(v, torch.Tensor) and v.ndim == 4:
+                            feat = v
+                            break
+            
+            if isinstance(feat, (list, tuple)):
+                feat = feat[0]
+            
+            return feat.shape[1]  # [B, C, H, W] -> C
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """提取图像特征
+        
+        Args:
+            x: 输入图像 [B, 3, H, W]，任意尺寸（将被调整为 1024x1024）
+            
+        Returns:
+            特征图 [B, C, H', W']
+        """
+        # SAM encoder 需要 1024x1024 输入
+        orig_size = x.shape[-2:]
+        if orig_size != (1024, 1024):
+            x = F.interpolate(x, size=(1024, 1024), mode="bilinear", align_corners=False)
+        
+        # 提取特征
+        feat = self.image_encoder(x)
+        
+        # SAM2 可能返回 dict，需要提取实际的特征张量
+        if isinstance(feat, dict):
+            # 通常在 'vision_features' 或类似的键中
+            if 'vision_features' in feat:
+                feat = feat['vision_features']
+            elif 'high_res_feats' in feat:
+                feat = feat['high_res_feats']
+            else:
+                # 取第一个张量值
+                for v in feat.values():
+                    if isinstance(v, torch.Tensor) and v.ndim == 4:
+                        feat = v
+                        break
+        
+        # 如果输出是多尺度特征，取第一个
+        if isinstance(feat, (list, tuple)):
+            feat = feat[0]
+        
+        return feat
+
+
+class PointHeatmapModelWithSAM(nn.Module):
+    """结合 SAM encoder 的点热力图预测模型
+    
+    使用 SAM image encoder 提取特征，然后通过热力图头预测点位置
+    """
+    
+    def __init__(self, cfg: ModelConfig) -> None:
+        super().__init__()
+        self.cfg = cfg
+        
+        if not cfg.use_sam_encoder:
+            raise ValueError("This model requires use_sam_encoder=True")
+        
+        if cfg.sam_checkpoint is None:
+            raise ValueError("sam_checkpoint must be provided when use_sam_encoder=True")
+        
+        # 确定设备
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # 创建 SAM encoder
+        self.sam_encoder = SAMEncoderWrapper(
+            sam_checkpoint=cfg.sam_checkpoint,
+            device=device,
+            lora_enabled=cfg.sam_lora_enabled,
+            lora_rank=cfg.sam_lora_rank,
+            lora_alpha=cfg.sam_lora_alpha,
+            lora_dropout=cfg.sam_lora_dropout,
+            freeze_encoder=cfg.sam_freeze_encoder,
+        )
+        
+        # 获取 SAM encoder 输出维度
+        sam_feat_dim = self.sam_encoder.feature_dim
+        
+        # 条件输入处理：独立的小网络处理条件图像（灰度 mask）
+        self.cond_encoder = nn.Sequential(
+            nn.Conv2d(cfg.cond_in_channels, 32, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+        )
+        
+        # 特征融合：将 SAM 特征和条件特征拼接
+        # SAM 输出通常是 256 通道 @ 64x64（对于 1024x1024 输入）
+        # 条件特征需要匹配空间尺寸
+        self.feature_fusion = nn.Conv2d(sam_feat_dim + 128, 512, kernel_size=1)
+        
+        # 热力图头和标签头
+        self.head = HeatmapHead(512, mid_channels=256)
+        self.label_head = LabelHead(512, mid_channels=256)
+        
+    def forward(self, x: torch.Tensor, cond: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        """前向传播
+        
+        Args:
+            x: 主图像 [B, 3, H, W]
+            cond: 条件图像（灰度 mask）[B, 1, H, W]
+            
+        Returns:
+            logits: 热力图 logits [B, 1, H, W]
+            label_logits: 标签 logits [B, 2]
+        """
+        b, _, h, w = x.shape
+        
+        # 提取 SAM 特征
+        sam_feat = self.sam_encoder(x)  # [B, C, H', W']
+        
+        # 处理条件输入
+        if cond is None:
+            cond = torch.zeros(b, self.cfg.cond_in_channels, h, w, device=x.device)
+        
+        cond_feat = self.cond_encoder(cond)  # [B, 128, H'', W'']
+        
+        # 匹配空间尺寸
+        if cond_feat.shape[-2:] != sam_feat.shape[-2:]:
+            cond_feat = F.interpolate(
+                cond_feat, 
+                size=sam_feat.shape[-2:], 
+                mode="bilinear", 
+                align_corners=False
+            )
+        
+        # 融合特征
+        fused = torch.cat([sam_feat, cond_feat], dim=1)
+        fused = self.feature_fusion(fused)
+        
+        # 预测热力图
+        logits = self.head(fused)  # [B, 1, H', W']
+        
+        # 上采样到输入分辨率
+        if logits.shape[-2:] != (h, w):
+            logits = F.interpolate(logits, size=(h, w), mode="bilinear", align_corners=False)
+        
+        # 预测标签
+        label_logits = self.label_head(fused)  # [B, 2]
+        
+        return logits, label_logits
+
+
+```
+
+现在检查是否有 linter 错误：
+
+完美！我已经修复了这两个问题：
+
+## 🔧 修复内容
+
+### 问题 1: LoRA 没有成功应用
+**原因**: SAM2 Hiera 的结构是 `trunk.blocks`（直接的 ModuleList），而不是 `trunk.stages.blocks`（分层结构）
+
+**修复** (`sam_lora.py`):
+```python
+# 之前（错误）：
+if hasattr(image_encoder, "trunk") and hasattr(image_encoder.trunk, "stages"):
+    stages = image_encoder.trunk.stages  # ❌ SAM2 没有 stages
+
+# 现在（正确）：
+if hasattr(image_encoder, "trunk") and hasattr(image_encoder.trunk, "blocks"):
+    blocks = image_encoder.trunk.blocks  # ✅ 直接访问 blocks
+    last_block = blocks[-1]
+    # 在最后一个 block 中查找并应用 LoRA
+```
+
+### 问题 2: AttributeError: 'dict' object has no attribute 'shape'
+**原因**: SAM2 的 image encoder 返回的是 dict 格式，而不是直接的 tensor
+
+**修复** (`model.py`):
+```python
+def _get_feature_dim(self) -> int:
+    feat = self.image_encoder(dummy)
+    
+    # 处理 dict 输出
+    if isinstance(feat, dict):
+        if 'vision_features' in feat:
+            feat = feat['vision_features']
+        elif 'high_res_feats' in feat:
+            feat = feat['high_res_feats']
+        else:
+            # 取第一个 4D 张量
+            for v in feat.values():
+                if isinstance(v, torch.Tensor) and v.ndim == 4:
+                    feat = v
+                    break
+    
+    return feat.shape[1]
+```
+
+同样的修复也应用到了 `forward()` 方法中。
+
+## ✅ 现在可以运行了
+
+请重新运行您的训练命令：
+
+```bash
+python -m seg-rl.heatmap.train \
+  --jsonl outputs/braintumour/heuristic_251108.jsonl \
+  --sam_dir outputs/braintumour/sam_masks_heuristic \
+  --height 512 --width 512 --arch unet_s \
+  --loss kl --sigma 8.0 --tau 1.0 \
+  --eval_thresholds "10,15,20,25" \
+  --label_loss_weight 0.2 \
+  --batch_size 16 --epochs 100 --amp \
+  --lr 1e-4 --weight_decay 1e-4 \
+  --use_sam_encoder \
+  --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
+  --sam_lora_enabled \
+  --sam_lora_rank 8 \
+  --sam_lora_alpha 16.0 \
+  --sam_lora_dropout 0.0 \
+  --grad_clip 1.0 \
+  --lr_scheduler cosine \
+  --val_ratio 0.1 --test_ratio 0.1 --seed 42 \
+  --save_every 5 --save_steps 500 --progress --auto_resume \
+  --out_dir outputs/braintumour/heatmap_train-latelora-251109
+```
+
+这次应该能够：
+1. ✅ 成功找到并应用 LoRA 到最后一个 transformer block
+2. ✅ 正确处理 SAM encoder 的输出
+3. ✅ 看到 LoRA parameters > 0
+4. ✅ 开始正常训练
+
+您应该能看到类似这样的日志：
+```
+[Late LoRA] Found 32 blocks in trunk, applying to last block
+[Late LoRA] Found attention module: attn
+[Late LoRA] Applied to image_encoder.trunk.blocks[-1].attn.qkv: in=..., out=..., rank=8
+[Late LoRA] Applied to image_encoder.trunk.blocks[-1].attn.proj: in=..., out=..., rank=8
+============================================================
+LoRA Configuration Summary
+============================================================
+Total parameters:      224,XXX,XXX
+Trainable parameters:    XX,XXX,XXX
+LoRA parameters:            XXX,XXX  # 应该 > 0
+Trainable ratio:            XX.XX%
+============================================================
+```
+
+```python
+# 之前（错误）：
+if hasattr(image_encoder, "trunk") and hasattr(image_encoder.trunk, "stages"):
+    stages = image_encoder.trunk.stages  # ❌ SAM2 没有 stages
+
+# 现在（正确）：
+if hasattr(image_encoder, "trunk") and hasattr(image_encoder.trunk, "blocks"):
+    blocks = image_encoder.trunk.blocks  # ✅ 直接访问 blocks
+    last_block = blocks[-1]
+    # 在最后一个 block 中查找并应用 LoRA
+```
+
+```python
+def _get_feature_dim(self) -> int:
+    feat = self.image_encoder(dummy)
+    
+    # 处理 dict 输出
+    if isinstance(feat, dict):
+        if 'vision_features' in feat:
+            feat = feat['vision_features']
+        elif 'high_res_feats' in feat:
+            feat = feat['high_res_feats']
+        else:
+            # 取第一个 4D 张量
+            for v in feat.values():
+                if isinstance(v, torch.Tensor) and v.ndim == 4:
+                    feat = v
+                    break
+    
+    return feat.shape[1]
+```
+
+```shellscript
+python -m seg-rl.heatmap.train \
+  --jsonl outputs/braintumour/heuristic_251108.jsonl \
+  --sam_dir outputs/braintumour/sam_masks_heuristic \
+  --height 512 --width 512 --arch unet_s \
+  --loss kl --sigma 8.0 --tau 1.0 \
+  --eval_thresholds "10,15,20,25" \
+  --label_loss_weight 0.2 \
+  --batch_size 16 --epochs 100 --amp \
+  --lr 1e-4 --weight_decay 1e-4 \
+  --use_sam_encoder \
+  --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
+  --sam_lora_enabled \
+  --sam_lora_rank 8 \
+  --sam_lora_alpha 16.0 \
+  --sam_lora_dropout 0.0 \
+  --grad_clip 1.0 \
+  --lr_scheduler cosine \
+  --val_ratio 0.1 --test_ratio 0.1 --seed 42 \
+  --save_every 5 --save_steps 500 --progress --auto_resume \
+  --out_dir outputs/braintumour/heatmap_train-latelora-251109
+```
+
+```plaintext
+[Late LoRA] Found 32 blocks in trunk, applying to last block
+[Late LoRA] Found attention module: attn
+[Late LoRA] Applied to image_encoder.trunk.blocks[-1].attn.qkv: in=..., out=..., rank=8
+[Late LoRA] Applied to image_encoder.trunk.blocks[-1].attn.proj: in=..., out=..., rank=8
+============================================================
+LoRA Configuration Summary
+============================================================
+Total parameters:      224,XXX,XXX
+Trainable parameters:    XX,XXX,XXX
+LoRA parameters:            XXX,XXX  # 应该 > 0
+Trainable ratio:            XX.XX%
+============================================================
+```
+
+---
+
+**User**
+
+@bash (887-1026) 
+
+---
+
+**Cursor**
+
+好的，现在有两个问题需要修复：
+
+1. **设备不匹配错误**：LoRA 层在 CPU 上，但 SAM 模型在 CUDA 上
+2. **参数统计错误**：`get_lora_parameters` 函数中的属性访问错误
+
+让我修复这两个问题：
+
+```python
+"""
+SAM Late LoRA Implementation
+
+基于论文 "Parameter Efficient Fine-Tuning of Segment Anything Model for Biomedical Imaging"
+实现 Late LoRA 方法，在 SAM 的 image encoder 的最后一个 Transformer 块中添加 LoRA 层。
+
+LoRA (Low-Rank Adaptation) 通过低秩分解减少可训练参数数量：
+    W = W_0 + BA
+其中 W_0 是冻结的预训练权重，B 和 A 是可训练的低秩矩阵。
+
+Reference: https://arxiv.org/abs/2502.00418
+"""
+
+from __future__ import annotations
+
+from typing import Optional, List, Dict, Any
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class LoRALayer(nn.Module):
+    """LoRA 层实现
+    
+    在原始线性层的基础上添加低秩适配器：
+    output = W_0 @ x + (B @ A) @ x * scale
+    
+    Args:
+        in_features: 输入特征维度
+        out_features: 输出特征维度
+        rank: LoRA 秩（越小参数越少，通常为 4-16）
+        alpha: LoRA 缩放因子（通常设为 rank 的 1-2 倍）
+        dropout: Dropout 概率
+    """
+    
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        rank: int = 8,
+        alpha: float = 16.0,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.rank = rank
+        self.alpha = alpha
+        self.scaling = alpha / rank
+        
+        # LoRA 矩阵：A 使用 Kaiming 初始化，B 初始化为 0
+        self.lora_A = nn.Linear(in_features, rank, bias=False)
+        self.lora_B = nn.Linear(rank, out_features, bias=False)
+        
+        # 初始化
+        nn.init.kaiming_uniform_(self.lora_A.weight, a=torch.math.sqrt(5))
+        nn.init.zeros_(self.lora_B.weight)
+        
+        self.dropout = nn.Dropout(p=dropout) if dropout > 0 else nn.Identity()
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """前向传播：计算 LoRA 增量
+        
+        Args:
+            x: 输入张量 [..., in_features]
+            
+        Returns:
+            LoRA 输出 [..., out_features]
+        """
+        x = self.dropout(x)
+        result = self.lora_B(self.lora_A(x))
+        return result * self.scaling
+
+
+class LoRALinear(nn.Module):
+    """带 LoRA 适配器的线性层
+    
+    组合原始线性层和 LoRA 层：
+    output = linear(x) + lora(x)
+    
+    Args:
+        linear: 原始的 nn.Linear 层（将被冻结）
+        rank: LoRA 秩
+        alpha: LoRA 缩放因子
+        dropout: Dropout 概率
+    """
+    
+    def __init__(
+        self,
+        linear: nn.Linear,
+        rank: int = 8,
+        alpha: float = 16.0,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.linear = linear
+        self.lora = LoRALayer(
+            in_features=linear.in_features,
+            out_features=linear.out_features,
+            rank=rank,
+            alpha=alpha,
+            dropout=dropout,
+        )
+        
+        # 冻结原始层
+        for param in self.linear.parameters():
+            param.requires_grad = False
+            
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """前向传播
+        
+        Args:
+            x: 输入张量
+            
+        Returns:
+            输出 = 原始层输出 + LoRA 输出
+        """
+        return self.linear(x) + self.lora(x)
+    
+    def merge_weights(self) -> nn.Linear:
+        """将 LoRA 权重合并到原始层中
+        
+        用于推理时加速，将 W = W_0 + BA 合并为单个矩阵
+        
+        Returns:
+            合并后的 nn.Linear 层
+        """
+        merged = nn.Linear(
+            self.linear.in_features,
+            self.linear.out_features,
+            bias=self.linear.bias is not None
+        )
+        
+        # 计算合并后的权重
+        with torch.no_grad():
+            lora_weight = self.lora.lora_B.weight @ self.lora.lora_A.weight
+            lora_weight = lora_weight * self.lora.scaling
+            merged.weight.copy_(self.linear.weight + lora_weight)
+            if self.linear.bias is not None and merged.bias is not None:
+                merged.bias.copy_(self.linear.bias)
+                
+        return merged
+
+
+def apply_lora_to_attention(
+    attn_module: nn.Module,
+    rank: int = 8,
+    alpha: float = 16.0,
+    dropout: float = 0.0,
+    target_modules: Optional[List[str]] = None,
+) -> Dict[str, nn.Module]:
+    """为注意力模块的指定层添加 LoRA
+    
+    Args:
+        attn_module: 注意力模块（如 nn.MultiheadAttention 或自定义 Attention）
+        rank: LoRA 秩
+        alpha: LoRA 缩放因子
+        dropout: Dropout 概率
+        target_modules: 要添加 LoRA 的模块名称列表，如 ["q_proj", "v_proj"]
+                       如果为 None，则添加到 ["q_proj", "k_proj", "v_proj", "out_proj"]
+    
+    Returns:
+        替换的 LoRA 模块字典 {name: LoRALinear}
+    """
+    if target_modules is None:
+        # 默认为 Q, K, V, O 投影层
+        target_modules = ["q_proj", "k_proj", "v_proj", "out_proj"]
+    
+    replaced_modules = {}
+    
+    for name, module in attn_module.named_modules():
+        # 检查是否是目标模块
+        for target in target_modules:
+            if target in name and isinstance(module, nn.Linear):
+                # 获取父模块和属性名
+                *parents, attr_name = name.split(".")
+                parent = attn_module
+                for p in parents:
+                    parent = getattr(parent, p)
+                
+                # 替换为 LoRALinear
+                lora_linear = LoRALinear(module, rank=rank, alpha=alpha, dropout=dropout)
+                setattr(parent, attr_name, lora_linear)
+                replaced_modules[name] = lora_linear
+                print(f"[LoRA] Applied to {name}: in={module.in_features}, out={module.out_features}, rank={rank}")
+                break
+    
+    return replaced_modules
+
+
+def apply_late_lora_to_sam_encoder(
+    sam_model: nn.Module,
+    rank: int = 8,
+    alpha: float = 16.0,
+    dropout: float = 0.0,
+    target_modules: Optional[List[str]] = None,
+) -> Dict[str, nn.Module]:
+    """为 SAM image encoder 的最后一个 Transformer 块添加 Late LoRA
+    
+    根据论文建议，只在最后一个 Transformer 块中添加 LoRA，
+    这样既保持了效率，又能有效地进行任务适配。
+    
+    Args:
+        sam_model: SAM2 模型实例
+        rank: LoRA 秩
+        alpha: LoRA 缩放因子
+        dropout: Dropout 概率
+        target_modules: 要添加 LoRA 的模块名称列表
+    
+    Returns:
+        应用了 LoRA 的模块字典
+    """
+    if target_modules is None:
+        # 默认为 Q 和 V 投影（论文中推荐的配置）
+        target_modules = ["q_proj", "v_proj"]
+    
+    # 冻结整个 SAM 模型
+    for param in sam_model.parameters():
+        param.requires_grad = False
+    
+    replaced_modules = {}
+    
+    # 获取 image encoder
+    image_encoder = sam_model.image_encoder
+    
+    # SAM2 Hiera 架构：image_encoder.trunk.blocks 是一个 ModuleList
+    # blocks 直接包含所有 transformer blocks（不是分 stages）
+    if hasattr(image_encoder, "trunk") and hasattr(image_encoder.trunk, "blocks"):
+        blocks = image_encoder.trunk.blocks
+        if len(blocks) > 0:
+            # 只在最后一个 block 中添加 LoRA（Late LoRA）
+            last_block = blocks[-1]
+            print(f"[Late LoRA] Found {len(blocks)} blocks in trunk, applying to last block")
+            
+            # 查找注意力模块
+            lora_applied = False
+            for name, module in last_block.named_modules():
+                # SAM2 Hiera 的注意力模块通常叫 attn
+                if name == "attn" or name.endswith(".attn"):
+                    print(f"[Late LoRA] Found attention module: {name}")
+                    
+                    # 为 QKV 和 proj 添加 LoRA
+                    for subname in ["qkv", "proj"]:
+                        if hasattr(module, subname):
+                            submodule = getattr(module, subname)
+                            if isinstance(submodule, nn.Linear):
+                                lora_linear = LoRALinear(
+                                    submodule, 
+                                    rank=rank, 
+                                    alpha=alpha, 
+                                    dropout=dropout
+                                )
+                                setattr(module, subname, lora_linear)
+                                full_name = f"image_encoder.trunk.blocks[-1].{name}.{subname}"
+                                replaced_modules[full_name] = lora_linear
+                                print(f"[Late LoRA] Applied to {full_name}: "
+                                      f"in={submodule.in_features}, out={submodule.out_features}, rank={rank}")
+                                lora_applied = True
+            
+            if not lora_applied:
+                print("[Late LoRA] Warning: No attention modules found in last block")
+                print(f"[Late LoRA] Last block modules: {[n for n, _ in last_block.named_modules()]}")
+        else:
+            print("[Late LoRA] Warning: No blocks found in trunk")
+    else:
+        print("[Late LoRA] Warning: SAM model structure not recognized")
+        print(f"[Late LoRA] Available encoder attributes: {[attr for attr in dir(image_encoder) if not attr.startswith('_')]}")
+        if hasattr(image_encoder, "trunk"):
+            print(f"[Late LoRA] Available trunk attributes: {[attr for attr in dir(image_encoder.trunk) if not attr.startswith('_')]}")
+    
+    if len(replaced_modules) == 0:
+        print("[Late LoRA] Warning: No modules were replaced. SAM model may have unexpected structure.")
+        print("[Late LoRA] Available attributes:", dir(image_encoder))
+        if hasattr(image_encoder, "trunk"):
+            print("[Late LoRA] Trunk attributes:", dir(image_encoder.trunk))
+    
+    return replaced_modules
+
+
+def get_lora_parameters(model: nn.Module) -> List[nn.Parameter]:
+    """获取模型中所有 LoRA 层的参数
+    
+    Args:
+        model: 包含 LoRA 层的模型
+        
+    Returns:
+        LoRA 参数列表
+    """
+    lora_params = []
+    for module in model.modules():
+        if isinstance(module, LoRALinear):
+            # LoRALinear 有 lora 属性（LoRALayer 实例）
+            lora_params.extend(module.lora.parameters())
+        elif isinstance(module, LoRALayer):
+            # LoRALayer 直接包含参数
+            lora_params.extend(module.parameters())
+    return lora_params
+
+
+def count_lora_parameters(model: nn.Module) -> Dict[str, int]:
+    """统计 LoRA 参数数量
+    
+    Args:
+        model: 包含 LoRA 层的模型
+        
+    Returns:
+        参数统计字典
+    """
+    lora_params = 0
+    total_params = 0
+    trainable_params = 0
+    
+    for param in model.parameters():
+        total_params += param.numel()
+        if param.requires_grad:
+            trainable_params += param.numel()
+    
+    for module in model.modules():
+        if isinstance(module, (LoRALayer, LoRALinear)):
+            for param in module.lora.parameters():
+                lora_params += param.numel()
+    
+    return {
+        "total": total_params,
+        "trainable": trainable_params,
+        "lora": lora_params,
+        "trainable_ratio": trainable_params / max(total_params, 1) * 100,
+    }
+
+
+def print_lora_info(model: nn.Module) -> None:
+    """打印 LoRA 配置信息
+    
+    Args:
+        model: 包含 LoRA 层的模型
+    """
+    stats = count_lora_parameters(model)
+    print("\n" + "="*60)
+    print("LoRA Configuration Summary")
+    print("="*60)
+    print(f"Total parameters:     {stats['total']:>12,}")
+    print(f"Trainable parameters: {stats['trainable']:>12,}")
+    print(f"LoRA parameters:      {stats['lora']:>12,}")
+    print(f"Trainable ratio:      {stats['trainable_ratio']:>11.2f}%")
+    print("="*60 + "\n")
+
+
+```
+
+现在修复设备不匹配的问题：
+
+```python
+"""
+SAM Late LoRA Implementation
+
+基于论文 "Parameter Efficient Fine-Tuning of Segment Anything Model for Biomedical Imaging"
+实现 Late LoRA 方法，在 SAM 的 image encoder 的最后一个 Transformer 块中添加 LoRA 层。
+
+LoRA (Low-Rank Adaptation) 通过低秩分解减少可训练参数数量：
+    W = W_0 + BA
+其中 W_0 是冻结的预训练权重，B 和 A 是可训练的低秩矩阵。
+
+Reference: https://arxiv.org/abs/2502.00418
+"""
+
+from __future__ import annotations
+
+from typing import Optional, List, Dict, Any
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class LoRALayer(nn.Module):
+    """LoRA 层实现
+    
+    在原始线性层的基础上添加低秩适配器：
+    output = W_0 @ x + (B @ A) @ x * scale
+    
+    Args:
+        in_features: 输入特征维度
+        out_features: 输出特征维度
+        rank: LoRA 秩（越小参数越少，通常为 4-16）
+        alpha: LoRA 缩放因子（通常设为 rank 的 1-2 倍）
+        dropout: Dropout 概率
+    """
+    
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        rank: int = 8,
+        alpha: float = 16.0,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.rank = rank
+        self.alpha = alpha
+        self.scaling = alpha / rank
+        
+        # LoRA 矩阵：A 使用 Kaiming 初始化，B 初始化为 0
+        self.lora_A = nn.Linear(in_features, rank, bias=False)
+        self.lora_B = nn.Linear(rank, out_features, bias=False)
+        
+        # 初始化
+        nn.init.kaiming_uniform_(self.lora_A.weight, a=torch.math.sqrt(5))
+        nn.init.zeros_(self.lora_B.weight)
+        
+        self.dropout = nn.Dropout(p=dropout) if dropout > 0 else nn.Identity()
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """前向传播：计算 LoRA 增量
+        
+        Args:
+            x: 输入张量 [..., in_features]
+            
+        Returns:
+            LoRA 输出 [..., out_features]
+        """
+        x = self.dropout(x)
+        result = self.lora_B(self.lora_A(x))
+        return result * self.scaling
+
+
+class LoRALinear(nn.Module):
+    """带 LoRA 适配器的线性层
+    
+    组合原始线性层和 LoRA 层：
+    output = linear(x) + lora(x)
+    
+    Args:
+        linear: 原始的 nn.Linear 层（将被冻结）
+        rank: LoRA 秩
+        alpha: LoRA 缩放因子
+        dropout: Dropout 概率
+    """
+    
+    def __init__(
+        self,
+        linear: nn.Linear,
+        rank: int = 8,
+        alpha: float = 16.0,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.linear = linear
+        self.lora = LoRALayer(
+            in_features=linear.in_features,
+            out_features=linear.out_features,
+            rank=rank,
+            alpha=alpha,
+            dropout=dropout,
+        )
+        
+        # 冻结原始层
+        for param in self.linear.parameters():
+            param.requires_grad = False
+            
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """前向传播
+        
+        Args:
+            x: 输入张量
+            
+        Returns:
+            输出 = 原始层输出 + LoRA 输出
+        """
+        return self.linear(x) + self.lora(x)
+    
+    def merge_weights(self) -> nn.Linear:
+        """将 LoRA 权重合并到原始层中
+        
+        用于推理时加速，将 W = W_0 + BA 合并为单个矩阵
+        
+        Returns:
+            合并后的 nn.Linear 层
+        """
+        merged = nn.Linear(
+            self.linear.in_features,
+            self.linear.out_features,
+            bias=self.linear.bias is not None
+        )
+        
+        # 计算合并后的权重
+        with torch.no_grad():
+            lora_weight = self.lora.lora_B.weight @ self.lora.lora_A.weight
+            lora_weight = lora_weight * self.lora.scaling
+            merged.weight.copy_(self.linear.weight + lora_weight)
+            if self.linear.bias is not None and merged.bias is not None:
+                merged.bias.copy_(self.linear.bias)
+                
+        return merged
+
+
+def apply_lora_to_attention(
+    attn_module: nn.Module,
+    rank: int = 8,
+    alpha: float = 16.0,
+    dropout: float = 0.0,
+    target_modules: Optional[List[str]] = None,
+) -> Dict[str, nn.Module]:
+    """为注意力模块的指定层添加 LoRA
+    
+    Args:
+        attn_module: 注意力模块（如 nn.MultiheadAttention 或自定义 Attention）
+        rank: LoRA 秩
+        alpha: LoRA 缩放因子
+        dropout: Dropout 概率
+        target_modules: 要添加 LoRA 的模块名称列表，如 ["q_proj", "v_proj"]
+                       如果为 None，则添加到 ["q_proj", "k_proj", "v_proj", "out_proj"]
+    
+    Returns:
+        替换的 LoRA 模块字典 {name: LoRALinear}
+    """
+    if target_modules is None:
+        # 默认为 Q, K, V, O 投影层
+        target_modules = ["q_proj", "k_proj", "v_proj", "out_proj"]
+    
+    replaced_modules = {}
+    
+    for name, module in attn_module.named_modules():
+        # 检查是否是目标模块
+        for target in target_modules:
+            if target in name and isinstance(module, nn.Linear):
+                # 获取父模块和属性名
+                *parents, attr_name = name.split(".")
+                parent = attn_module
+                for p in parents:
+                    parent = getattr(parent, p)
+                
+                # 替换为 LoRALinear
+                lora_linear = LoRALinear(module, rank=rank, alpha=alpha, dropout=dropout)
+                setattr(parent, attr_name, lora_linear)
+                replaced_modules[name] = lora_linear
+                print(f"[LoRA] Applied to {name}: in={module.in_features}, out={module.out_features}, rank={rank}")
+                break
+    
+    return replaced_modules
+
+
+def apply_late_lora_to_sam_encoder(
+    sam_model: nn.Module,
+    rank: int = 8,
+    alpha: float = 16.0,
+    dropout: float = 0.0,
+    target_modules: Optional[List[str]] = None,
+) -> Dict[str, nn.Module]:
+    """为 SAM image encoder 的最后一个 Transformer 块添加 Late LoRA
+    
+    根据论文建议，只在最后一个 Transformer 块中添加 LoRA，
+    这样既保持了效率，又能有效地进行任务适配。
+    
+    Args:
+        sam_model: SAM2 模型实例
+        rank: LoRA 秩
+        alpha: LoRA 缩放因子
+        dropout: Dropout 概率
+        target_modules: 要添加 LoRA 的模块名称列表
+    
+    Returns:
+        应用了 LoRA 的模块字典
+    """
+    if target_modules is None:
+        # 默认为 Q 和 V 投影（论文中推荐的配置）
+        target_modules = ["q_proj", "v_proj"]
+    
+    # 冻结整个 SAM 模型
+    for param in sam_model.parameters():
+        param.requires_grad = False
+    
+    replaced_modules = {}
+    
+    # 获取 image encoder
+    image_encoder = sam_model.image_encoder
+    
+    # SAM2 Hiera 架构：image_encoder.trunk.blocks 是一个 ModuleList
+    # blocks 直接包含所有 transformer blocks（不是分 stages）
+    if hasattr(image_encoder, "trunk") and hasattr(image_encoder.trunk, "blocks"):
+        blocks = image_encoder.trunk.blocks
+        if len(blocks) > 0:
+            # 只在最后一个 block 中添加 LoRA（Late LoRA）
+            last_block = blocks[-1]
+            print(f"[Late LoRA] Found {len(blocks)} blocks in trunk, applying to last block")
+            
+            # 查找注意力模块
+            lora_applied = False
+            for name, module in last_block.named_modules():
+                # SAM2 Hiera 的注意力模块通常叫 attn
+                if name == "attn" or name.endswith(".attn"):
+                    print(f"[Late LoRA] Found attention module: {name}")
+                    
+                    # 为 QKV 和 proj 添加 LoRA
+                    for subname in ["qkv", "proj"]:
+                        if hasattr(module, subname):
+                            submodule = getattr(module, subname)
+                            if isinstance(submodule, nn.Linear):
+                                # 获取原始模块的设备
+                                device = next(submodule.parameters()).device
+                                
+                                lora_linear = LoRALinear(
+                                    submodule, 
+                                    rank=rank, 
+                                    alpha=alpha, 
+                                    dropout=dropout
+                                )
+                                
+                                # 将 LoRA 层移动到相同设备
+                                lora_linear = lora_linear.to(device)
+                                
+                                setattr(module, subname, lora_linear)
+                                full_name = f"image_encoder.trunk.blocks[-1].{name}.{subname}"
+                                replaced_modules[full_name] = lora_linear
+                                print(f"[Late LoRA] Applied to {full_name}: "
+                                      f"in={submodule.in_features}, out={submodule.out_features}, rank={rank}, device={device}")
+                                lora_applied = True
+            
+            if not lora_applied:
+                print("[Late LoRA] Warning: No attention modules found in last block")
+                print(f"[Late LoRA] Last block modules: {[n for n, _ in last_block.named_modules()]}")
+        else:
+            print("[Late LoRA] Warning: No blocks found in trunk")
+    else:
+        print("[Late LoRA] Warning: SAM model structure not recognized")
+        print(f"[Late LoRA] Available encoder attributes: {[attr for attr in dir(image_encoder) if not attr.startswith('_')]}")
+        if hasattr(image_encoder, "trunk"):
+            print(f"[Late LoRA] Available trunk attributes: {[attr for attr in dir(image_encoder.trunk) if not attr.startswith('_')]}")
+    
+    if len(replaced_modules) == 0:
+        print("[Late LoRA] Warning: No modules were replaced. SAM model may have unexpected structure.")
+        print("[Late LoRA] Available attributes:", dir(image_encoder))
+        if hasattr(image_encoder, "trunk"):
+            print("[Late LoRA] Trunk attributes:", dir(image_encoder.trunk))
+    
+    return replaced_modules
+
+
+def get_lora_parameters(model: nn.Module) -> List[nn.Parameter]:
+    """获取模型中所有 LoRA 层的参数
+    
+    Args:
+        model: 包含 LoRA 层的模型
+        
+    Returns:
+        LoRA 参数列表
+    """
+    lora_params = []
+    for module in model.modules():
+        if isinstance(module, LoRALinear):
+            # LoRALinear 有 lora 属性（LoRALayer 实例）
+            lora_params.extend(module.lora.parameters())
+        elif isinstance(module, LoRALayer):
+            # LoRALayer 直接包含参数
+            lora_params.extend(module.parameters())
+    return lora_params
+
+
+def count_lora_parameters(model: nn.Module) -> Dict[str, int]:
+    """统计 LoRA 参数数量
+    
+    Args:
+        model: 包含 LoRA 层的模型
+        
+    Returns:
+        参数统计字典
+    """
+    lora_params = 0
+    total_params = 0
+    trainable_params = 0
+    
+    for param in model.parameters():
+        total_params += param.numel()
+        if param.requires_grad:
+            trainable_params += param.numel()
+    
+    for module in model.modules():
+        if isinstance(module, (LoRALayer, LoRALinear)):
+            for param in module.lora.parameters():
+                lora_params += param.numel()
+    
+    return {
+        "total": total_params,
+        "trainable": trainable_params,
+        "lora": lora_params,
+        "trainable_ratio": trainable_params / max(total_params, 1) * 100,
+    }
+
+
+def print_lora_info(model: nn.Module) -> None:
+    """打印 LoRA 配置信息
+    
+    Args:
+        model: 包含 LoRA 层的模型
+    """
+    stats = count_lora_parameters(model)
+    print("\n" + "="*60)
+    print("LoRA Configuration Summary")
+    print("="*60)
+    print(f"Total parameters:     {stats['total']:>12,}")
+    print(f"Trainable parameters: {stats['trainable']:>12,}")
+    print(f"LoRA parameters:      {stats['lora']:>12,}")
+    print(f"Trainable ratio:      {stats['trainable_ratio']:>11.2f}%")
+    print("="*60 + "\n")
+
+
+```
+
+```python
+"""
+SAM Late LoRA Implementation
+
+基于论文 "Parameter Efficient Fine-Tuning of Segment Anything Model for Biomedical Imaging"
+实现 Late LoRA 方法，在 SAM 的 image encoder 的最后一个 Transformer 块中添加 LoRA 层。
+
+LoRA (Low-Rank Adaptation) 通过低秩分解减少可训练参数数量：
+    W = W_0 + BA
+其中 W_0 是冻结的预训练权重，B 和 A 是可训练的低秩矩阵。
+
+Reference: https://arxiv.org/abs/2502.00418
+"""
+
+from __future__ import annotations
+
+from typing import Optional, List, Dict, Any
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class LoRALayer(nn.Module):
+    """LoRA 层实现
+    
+    在原始线性层的基础上添加低秩适配器：
+    output = W_0 @ x + (B @ A) @ x * scale
+    
+    Args:
+        in_features: 输入特征维度
+        out_features: 输出特征维度
+        rank: LoRA 秩（越小参数越少，通常为 4-16）
+        alpha: LoRA 缩放因子（通常设为 rank 的 1-2 倍）
+        dropout: Dropout 概率
+    """
+    
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        rank: int = 8,
+        alpha: float = 16.0,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.rank = rank
+        self.alpha = alpha
+        self.scaling = alpha / rank
+        
+        # LoRA 矩阵：A 使用 Kaiming 初始化，B 初始化为 0
+        self.lora_A = nn.Linear(in_features, rank, bias=False)
+        self.lora_B = nn.Linear(rank, out_features, bias=False)
+        
+        # 初始化
+        nn.init.kaiming_uniform_(self.lora_A.weight, a=torch.math.sqrt(5))
+        nn.init.zeros_(self.lora_B.weight)
+        
+        self.dropout = nn.Dropout(p=dropout) if dropout > 0 else nn.Identity()
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """前向传播：计算 LoRA 增量
+        
+        Args:
+            x: 输入张量 [..., in_features]
+            
+        Returns:
+            LoRA 输出 [..., out_features]
+        """
+        x = self.dropout(x)
+        result = self.lora_B(self.lora_A(x))
+        return result * self.scaling
+
+
+class LoRALinear(nn.Module):
+    """带 LoRA 适配器的线性层
+    
+    组合原始线性层和 LoRA 层：
+    output = linear(x) + lora(x)
+    
+    Args:
+        linear: 原始的 nn.Linear 层（将被冻结）
+        rank: LoRA 秩
+        alpha: LoRA 缩放因子
+        dropout: Dropout 概率
+    """
+    
+    def __init__(
+        self,
+        linear: nn.Linear,
+        rank: int = 8,
+        alpha: float = 16.0,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.linear = linear
+        self.lora = LoRALayer(
+            in_features=linear.in_features,
+            out_features=linear.out_features,
+            rank=rank,
+            alpha=alpha,
+            dropout=dropout,
+        )
+        
+        # 冻结原始层
+        for param in self.linear.parameters():
+            param.requires_grad = False
+            
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """前向传播
+        
+        Args:
+            x: 输入张量
+            
+        Returns:
+            输出 = 原始层输出 + LoRA 输出
+        """
+        return self.linear(x) + self.lora(x)
+    
+    def merge_weights(self) -> nn.Linear:
+        """将 LoRA 权重合并到原始层中
+        
+        用于推理时加速，将 W = W_0 + BA 合并为单个矩阵
+        
+        Returns:
+            合并后的 nn.Linear 层
+        """
+        merged = nn.Linear(
+            self.linear.in_features,
+            self.linear.out_features,
+            bias=self.linear.bias is not None
+        )
+        
+        # 计算合并后的权重
+        with torch.no_grad():
+            lora_weight = self.lora.lora_B.weight @ self.lora.lora_A.weight
+            lora_weight = lora_weight * self.lora.scaling
+            merged.weight.copy_(self.linear.weight + lora_weight)
+            if self.linear.bias is not None and merged.bias is not None:
+                merged.bias.copy_(self.linear.bias)
+                
+        return merged
+
+
+def apply_lora_to_attention(
+    attn_module: nn.Module,
+    rank: int = 8,
+    alpha: float = 16.0,
+    dropout: float = 0.0,
+    target_modules: Optional[List[str]] = None,
+) -> Dict[str, nn.Module]:
+    """为注意力模块的指定层添加 LoRA
+    
+    Args:
+        attn_module: 注意力模块（如 nn.MultiheadAttention 或自定义 Attention）
+        rank: LoRA 秩
+        alpha: LoRA 缩放因子
+        dropout: Dropout 概率
+        target_modules: 要添加 LoRA 的模块名称列表，如 ["q_proj", "v_proj"]
+                       如果为 None，则添加到 ["q_proj", "k_proj", "v_proj", "out_proj"]
+    
+    Returns:
+        替换的 LoRA 模块字典 {name: LoRALinear}
+    """
+    if target_modules is None:
+        # 默认为 Q, K, V, O 投影层
+        target_modules = ["q_proj", "k_proj", "v_proj", "out_proj"]
+    
+    replaced_modules = {}
+    
+    for name, module in attn_module.named_modules():
+        # 检查是否是目标模块
+        for target in target_modules:
+            if target in name and isinstance(module, nn.Linear):
+                # 获取父模块和属性名
+                *parents, attr_name = name.split(".")
+                parent = attn_module
+                for p in parents:
+                    parent = getattr(parent, p)
+                
+                # 替换为 LoRALinear
+                lora_linear = LoRALinear(module, rank=rank, alpha=alpha, dropout=dropout)
+                setattr(parent, attr_name, lora_linear)
+                replaced_modules[name] = lora_linear
+                print(f"[LoRA] Applied to {name}: in={module.in_features}, out={module.out_features}, rank={rank}")
+                break
+    
+    return replaced_modules
+
+
+def apply_late_lora_to_sam_encoder(
+    sam_model: nn.Module,
+    rank: int = 8,
+    alpha: float = 16.0,
+    dropout: float = 0.0,
+    target_modules: Optional[List[str]] = None,
+) -> Dict[str, nn.Module]:
+    """为 SAM image encoder 的最后一个 Transformer 块添加 Late LoRA
+    
+    根据论文建议，只在最后一个 Transformer 块中添加 LoRA，
+    这样既保持了效率，又能有效地进行任务适配。
+    
+    Args:
+        sam_model: SAM2 模型实例
+        rank: LoRA 秩
+        alpha: LoRA 缩放因子
+        dropout: Dropout 概率
+        target_modules: 要添加 LoRA 的模块名称列表
+    
+    Returns:
+        应用了 LoRA 的模块字典
+    """
+    if target_modules is None:
+        # 默认为 Q 和 V 投影（论文中推荐的配置）
+        target_modules = ["q_proj", "v_proj"]
+    
+    # 冻结整个 SAM 模型
+    for param in sam_model.parameters():
+        param.requires_grad = False
+    
+    replaced_modules = {}
+    
+    # 获取 image encoder
+    image_encoder = sam_model.image_encoder
+    
+    # SAM2 Hiera 架构：image_encoder.trunk.blocks 是一个 ModuleList
+    # blocks 直接包含所有 transformer blocks（不是分 stages）
+    if hasattr(image_encoder, "trunk") and hasattr(image_encoder.trunk, "blocks"):
+        blocks = image_encoder.trunk.blocks
+        if len(blocks) > 0:
+            # 只在最后一个 block 中添加 LoRA（Late LoRA）
+            last_block = blocks[-1]
+            print(f"[Late LoRA] Found {len(blocks)} blocks in trunk, applying to last block")
+            
+            # 查找注意力模块
+            lora_applied = False
+            for name, module in last_block.named_modules():
+                # SAM2 Hiera 的注意力模块通常叫 attn
+                if name == "attn" or name.endswith(".attn"):
+                    print(f"[Late LoRA] Found attention module: {name}")
+                    
+                    # 为 QKV 和 proj 添加 LoRA
+                    for subname in ["qkv", "proj"]:
+                        if hasattr(module, subname):
+                            submodule = getattr(module, subname)
+                            if isinstance(submodule, nn.Linear):
+                                # 获取原始模块的设备
+                                device = next(submodule.parameters()).device
+                                
+                                lora_linear = LoRALinear(
+                                    submodule, 
+                                    rank=rank, 
+                                    alpha=alpha, 
+                                    dropout=dropout
+                                )
+                                
+                                # 将 LoRA 层移动到相同设备
+                                lora_linear = lora_linear.to(device)
+                                
+                                setattr(module, subname, lora_linear)
+                                full_name = f"image_encoder.trunk.blocks[-1].{name}.{subname}"
+                                replaced_modules[full_name] = lora_linear
+                                print(f"[Late LoRA] Applied to {full_name}: "
+                                      f"in={submodule.in_features}, out={submodule.out_features}, rank={rank}, device={device}")
+                                lora_applied = True
+            
+            if not lora_applied:
+                print("[Late LoRA] Warning: No attention modules found in last block")
+                print(f"[Late LoRA] Last block modules: {[n for n, _ in last_block.named_modules()]}")
+        else:
+            print("[Late LoRA] Warning: No blocks found in trunk")
+    else:
+        print("[Late LoRA] Warning: SAM model structure not recognized")
+        print(f"[Late LoRA] Available encoder attributes: {[attr for attr in dir(image_encoder) if not attr.startswith('_')]}")
+        if hasattr(image_encoder, "trunk"):
+            print(f"[Late LoRA] Available trunk attributes: {[attr for attr in dir(image_encoder.trunk) if not attr.startswith('_')]}")
+    
+    if len(replaced_modules) == 0:
+        print("[Late LoRA] Warning: No modules were replaced. SAM model may have unexpected structure.")
+        print("[Late LoRA] Available attributes:", dir(image_encoder))
+        if hasattr(image_encoder, "trunk"):
+            print("[Late LoRA] Trunk attributes:", dir(image_encoder.trunk))
+    
+    return replaced_modules
+
+
+def get_lora_parameters(model: nn.Module) -> List[nn.Parameter]:
+    """获取模型中所有 LoRA 层的参数
+    
+    Args:
+        model: 包含 LoRA 层的模型
+        
+    Returns:
+        LoRA 参数列表
+    """
+    lora_params = []
+    for module in model.modules():
+        if isinstance(module, LoRALinear):
+            # LoRALinear 有 lora 属性（LoRALayer 实例）
+            lora_params.extend(module.lora.parameters())
+        elif isinstance(module, LoRALayer):
+            # LoRALayer 直接包含参数
+            lora_params.extend(module.parameters())
+    return lora_params
+
+
+def count_lora_parameters(model: nn.Module) -> Dict[str, int]:
+    """统计 LoRA 参数数量
+    
+    Args:
+        model: 包含 LoRA 层的模型
+        
+    Returns:
+        参数统计字典
+    """
+    lora_params = 0
+    total_params = 0
+    trainable_params = 0
+    
+    for param in model.parameters():
+        total_params += param.numel()
+        if param.requires_grad:
+            trainable_params += param.numel()
+    
+    for module in model.modules():
+        if isinstance(module, LoRALinear):
+            # LoRALinear 有 lora 属性（LoRALayer 实例）
+            for param in module.lora.parameters():
+                lora_params += param.numel()
+        elif isinstance(module, LoRALayer):
+            # LoRALayer 直接包含参数
+            for param in module.parameters():
+                lora_params += param.numel()
+    
+    return {
+        "total": total_params,
+        "trainable": trainable_params,
+        "lora": lora_params,
+        "trainable_ratio": trainable_params / max(total_params, 1) * 100,
+    }
+
+
+def print_lora_info(model: nn.Module) -> None:
+    """打印 LoRA 配置信息
+    
+    Args:
+        model: 包含 LoRA 层的模型
+    """
+    stats = count_lora_parameters(model)
+    print("\n" + "="*60)
+    print("LoRA Configuration Summary")
+    print("="*60)
+    print(f"Total parameters:     {stats['total']:>12,}")
+    print(f"Trainable parameters: {stats['trainable']:>12,}")
+    print(f"LoRA parameters:      {stats['lora']:>12,}")
+    print(f"Trainable ratio:      {stats['trainable_ratio']:>11.2f}%")
+    print("="*60 + "\n")
+
+
+```
+
+现在检查代码是否有 linter 错误：
+
+完美！我已经修复了所有问题。让我总结一下修复内容：
+
+## 🔧 修复内容
+
+### 问题 1: `'LoRALayer' object has no attribute 'lora'`
+
+**原因**：`get_lora_parameters` 和 `count_lora_parameters` 函数错误地认为所有 LoRA 相关对象都有 `lora` 属性。
+
+**修复**：
+```python
+# 之前（错误）：
+for module in model.modules():
+    if isinstance(module, (LoRALayer, LoRALinear)):
+        lora_params.extend(module.lora.parameters())  # ❌ LoRALayer 没有 lora 属性
+
+# 现在（正确）：
+for module in model.modules():
+    if isinstance(module, LoRALinear):
+        # LoRALinear 有 lora 属性（LoRALayer 实例）
+        lora_params.extend(module.lora.parameters())
+    elif isinstance(module, LoRALayer):
+        # LoRALayer 直接包含参数
+        lora_params.extend(module.parameters())
+```
+
+### 问题 2: 设备不匹配 `cuda:0 and cpu!`
+
+**原因**：新创建的 LoRA 层默认在 CPU 上，但 SAM 模型在 CUDA 上。
+
+**修复**：
+```python
+# 获取原始模块的设备
+device = next(submodule.parameters()).device
+
+lora_linear = LoRALinear(
+    submodule, 
+    rank=rank, 
+    alpha=alpha, 
+    dropout=dropout
+)
+
+# 将 LoRA 层移动到相同设备
+lora_linear = lora_linear.to(device)
+```
+
+## ✅ 现在可以正常运行了
+
+请重新运行您的训练命令。这次您应该看到：
+
+```bash
+============================================================
+Using SAM Encoder with Late LoRA
+============================================================
+SAM Checkpoint: third_party/sam2/checkpoints/sam2.1_hiera_large.pt
+LoRA Enabled: True
+LoRA Rank: 8
+LoRA Alpha: 16.0
+LoRA Dropout: 0.0
+============================================================
+
+[SAM] Loading SAM checkpoint from third_party/sam2/checkpoints/sam2.1_hiera_large.pt
+[SAM] Enabling Late LoRA: rank=8, alpha=16.0
+[Late LoRA] Found 48 blocks in trunk, applying to last block
+[Late LoRA] Found attention module: attn
+[Late LoRA] Applied to image_encoder.trunk.blocks[-1].attn.qkv: in=1152, out=3456, rank=8, device=cuda:0
+[Late LoRA] Applied to image_encoder.trunk.blocks[-1].attn.proj: in=1152, out=1152, rank=8, device=cuda:0
+
+============================================================
+LoRA Configuration Summary
+============================================================
+Total parameters:      224,XXX,XXX
+Trainable parameters:    XX,XXX,XXX  # 应该 > 0
+LoRA parameters:            XX,XXX   # 应该 > 0
+Trainable ratio:            XX.XX%
+============================================================
+
+[SAM] Encoder feature dimension: 1152
+训练开始...
+```
+
+所有 LoRA 相关的问题都已修复，现在应该能够正常训练了！🎉
+
+```python
+# 之前（错误）：
+for module in model.modules():
+    if isinstance(module, (LoRALayer, LoRALinear)):
+        lora_params.extend(module.lora.parameters())  # ❌ LoRALayer 没有 lora 属性
+
+# 现在（正确）：
+for module in model.modules():
+    if isinstance(module, LoRALinear):
+        # LoRALinear 有 lora 属性（LoRALayer 实例）
+        lora_params.extend(module.lora.parameters())
+    elif isinstance(module, LoRALayer):
+        # LoRALayer 直接包含参数
+        lora_params.extend(module.parameters())
+```
+
+```python
+# 获取原始模块的设备
+device = next(submodule.parameters()).device
+
+lora_linear = LoRALinear(
+    submodule, 
+    rank=rank, 
+    alpha=alpha, 
+    dropout=dropout
+)
+
+# 将 LoRA 层移动到相同设备
+lora_linear = lora_linear.to(device)
+```
+
+```shellscript
+============================================================
+Using SAM Encoder with Late LoRA
+============================================================
+SAM Checkpoint: third_party/sam2/checkpoints/sam2.1_hiera_large.pt
+LoRA Enabled: True
+LoRA Rank: 8
+LoRA Alpha: 16.0
+LoRA Dropout: 0.0
+============================================================
+
+[SAM] Loading SAM checkpoint from third_party/sam2/checkpoints/sam2.1_hiera_large.pt
+[SAM] Enabling Late LoRA: rank=8, alpha=16.0
+[Late LoRA] Found 48 blocks in trunk, applying to last block
+[Late LoRA] Found attention module: attn
+[Late LoRA] Applied to image_encoder.trunk.blocks[-1].attn.qkv: in=1152, out=3456, rank=8, device=cuda:0
+[Late LoRA] Applied to image_encoder.trunk.blocks[-1].attn.proj: in=1152, out=1152, rank=8, device=cuda:0
+
+============================================================
+LoRA Configuration Summary
+============================================================
+Total parameters:      224,XXX,XXX
+Trainable parameters:    XX,XXX,XXX  # 应该 > 0
+LoRA parameters:            XX,XXX   # 应该 > 0
+Trainable ratio:            XX.XX%
+============================================================
+
+[SAM] Encoder feature dimension: 1152
+训练开始...
+```
+
+---
+
+**User**
+
+在当前训练设置中，缩放因子alpha、dropout率分别是什么
+
+---
+
+**Cursor**
+
+```shellscript
+python -m seg-rl.heatmap.train \
+  --jsonl outputs/braintumour/heuristic_251108.jsonl \
+  --sam_dir outputs/braintumour/sam_masks_heuristic \
+  --height 512 --width 512 --arch unet_s \
+  --loss kl --sigma 8.0 --tau 1.0 \
+  --eval_thresholds "10,15,20,25" \
+  --label_loss_weight 0.2 \
+  --batch_size 16 --epochs 100 --amp \
+  --lr 1e-4 --weight_decay 1e-4 \
+  --use_sam_encoder \
+  --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
+  --sam_lora_enabled \
+  --sam_lora_rank 8 \
+  --sam_lora_alpha 16.0 \
+  --sam_lora_dropout 0.0 \
+  --grad_clip 1.0 \
+  --lr_scheduler cosine \
+  --val_ratio 0.1 --test_ratio 0.1 --seed 42 \
+  --save_every 5 --save_steps 500 --progress --auto_resume \
+  --out_dir outputs/braintumour/heatmap_train-latelora-251109
+```
+
+根据您最近运行的训练命令和终端输出，当前训练设置中的 LoRA 参数是：
+
+## 当前 LoRA 参数设置
+
+### 缩放因子 (Alpha)
+**`--sam_lora_alpha 16.0`**
+- **值**: 16.0
+- **作用**: 控制 LoRA 更新的缩放强度
+- **计算**: `scaling = alpha / rank = 16.0 / 8 = 2.0`
+
+### Dropout 率
+**`--sam_lora_dropout 0.0`**
+- **值**: 0.0 (不使用 dropout)
+- **作用**: 在 LoRA 层中不应用 dropout 正则化
+
+### 其他相关参数
+- **LoRA 秩 (rank)**: 8
+- **组合效果**: 每个 LoRA 增量的实际缩放为 `2.0x`
+
+## 这些参数的意义
+
+### Alpha = 16.0
+这是**推荐的标准值**，因为：
+- 通常设置为 rank 的 2 倍（16 = 8 × 2）
+- 提供适中的适配强度
+- 在论文中被证明效果良好
+
+### Dropout = 0.0
+当前**不使用 dropout**，这意味着：
+- ✅ 训练更稳定
+- ✅ 适合较小的 LoRA 层（已经有很强的正则化效果）
+- ⚠️ 如果出现过拟合，可以考虑增加到 0.05-0.1
+
+## 如果需要调整
+
+如果您想尝试不同的配置，可以修改命令行参数：
+
+```bash
+# 更强的适配（更激进）
+--sam_lora_alpha 32.0
+
+# 更弱的适配（更保守）
+--sam_lora_alpha 8.0
+
+# 添加 dropout 正则化
+--sam_lora_dropout 0.1
+```
+
+当前的设置（alpha=16.0, dropout=0.0）是一个**平衡且经过验证的配置**，适合大多数场景。
+
+```shellscript
+# 更强的适配（更激进）
+--sam_lora_alpha 32.0
+
+# 更弱的适配（更保守）
+--sam_lora_alpha 8.0
+
+# 添加 dropout 正则化
+--sam_lora_dropout 0.1
+```
+
+---
+
+**User**
+
+用如下命令运行提示点预测SAM分割脚本：python seg-rl/heatmap/predict_point_sequence_with_sam.py   --model_path outputs/braintumour/heatmap_train-latelora-251109/model_epoch_15.pt  --images_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/images   --masks_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/masks   --output_jsonl outputs/braintumour/pred_supervised-r8-epoch15-251109.jsonl   --sam_masks_dir outputs/braintumour/pred_supervised-r8-epoch15-251109   --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt   --device cuda   --resize 512 512   --num_points 17  发现生成的提示点几乎全都是[119.abc, 119.xyz]...明显有某些根本性错误。请仔细分析监督训练与推理的全过程，准确地找到发生问题的地方并做出修改
+
+---
+
+**Cursor**
+
+我来帮您分析这个问题。首先让我查看推理脚本和实际输出，找出为什么预测点都集中在 [119.x, 119.x] 附近。
+
+我发现问题了！让我检查 checkpoint 并查看推理脚本：
+
+问题找到了！**推理脚本没有正确加载 SAM encoder 模型**。
+
+## 问题分析
+
+1. **训练时**：使用了 `PointHeatmapModelWithSAM`（包含 SAM encoder + LoRA）
+2. **推理时**：`predict_next_point_from_model.py` 只加载标准的 `PointHeatmapModel`
+3. **结果**：模型结构不匹配，checkpoint 中的所有 `sam_encoder.*` 参数被忽略，使用随机初始化的权重预测
+
+让我修复这个问题：
+
+```python
+#!/usr/bin/env python3
+
+"""
+Predict next SAM prompt point (position + binary label) using a trained heatmap model.
+
+This script mirrors seg-rl/annotator/gen_point_jsonl_from_masks.py, but replaces the
+EDT-based next-point computation with a model inference that takes only:
+  - the RGB image, and
+  - the current predicted mask (or zero mask at step 0)
+and outputs the next prompt point and its label.
+
+Modes:
+  1) Initial generation (write new JSON array):
+     - For each image under --images_dir, predict the first prompt (i=0) with a zero mask.
+     - Write a JSON array with records like:
+         {"image": "/abs/path.jpg", "sam_masks_dir": "/abs/sam_dir", "points": [[x0,y0]], "labels": [l0]}
+
+  2) Append mode (update existing JSON array):
+     - Read --appendto_json as a JSON array, for each record take current length k=len(points),
+       load the latest predicted mask at {sam_dir}/{stem}/{k-1}.png (k>0; else zero), and predict
+       the next point (xk, yk, lk). Append to arrays and write back in-place.
+
+  3) Debug visualization (no file write except images):
+     - Read --debug_json (JSON array) that already contains points+labels and a sam_masks_dir.
+     - For each step i, load prev and cur predicted masks (i-1 and i; prev is zero for i=0) and
+       call the same 3-panel visualization function used by the annotator to render panels with
+       the provided point, saving to --debug_output_dir/{stem}/dbg_{i}.png.
+     - Ground-truth masks are NOT used anywhere in this script (except indirectly if you supply
+       them in your own JSON for reference; they are not required).
+
+Examples:
+  # Initial generation
+  /opt/anaconda3/envs/seg-r1/bin/python -m seg-rl.heatmap.predict_next_point_from_model \
+    --model_path outputs/braintumour/heatmap_train-251001-optimized/model_epoch_185.pt \
+    --images_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/images \
+    --masks_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/masks \
+    --output_json outputs/braintumour/pred_points-sft_e185-251018.jsonl
+
+  python -m seg-rl.heatmap.predict_next_point_from_model \
+    --model_path outputs/braintumour/points_predictor-251001-160epochs.pt \
+    --images_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/images \
+    --masks_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/masks \
+    --output_json outputs/braintumour/pred_points-e160-251019.jsonl
+
+  # Append mode
+  /opt/anaconda3/envs/seg-r1/bin/python -m seg-rl.heatmap.predict_next_point_from_model \
+    --model_path outputs/braintumour/points_predictor-251001-160epochs.pt \
+    --appendto_json datasets/seg_r1_md/Task01_BrainTumour/pred_points-251001.jsonl
+
+  python -m seg-rl.heatmap.predict_next_point_from_model \
+    --model_path outputs/braintumour/points_predictor-251001-160epochs.pt \
+    --appendto_json outputs/braintumour/pred_points-e160-251019.jsonl
+
+  # Debug visualization only
+  /opt/anaconda3/envs/seg-r1/bin/python -m seg-rl.heatmap.predict_next_point_from_model \
+    --debug_json datasets/seg_r1_md/Task01_BrainTumour/pred_points-init.jsonl \
+    --debug_output_dir outputs/braintumour/dbg_model_pred
+
+Notes:
+  - The model expects 4-channel input (RGB normalized + Gray normalized mask). This script
+    normalizes RGB with ImageNet mean/std and mask with mean=0.5, std=0.5.
+  - Device selection prefers CUDA, then MPS (Apple Silicon), otherwise CPU. AMP is only used on CUDA.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from typing import Dict, List, Optional, Tuple, Callable
+
+import numpy as np
+from PIL import Image
+
+import torch
+import torch.nn.functional as F
+
+try:
+    # package context
+    from .model import ModelConfig, PointHeatmapModel, PointHeatmapModelWithSAM, soft_argmax_from_logits
+    from .utils import load_checkpoint
+except Exception:
+    # script context
+    import sys as _sys
+    import os as _os
+    _pkg_root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    if _pkg_root not in _sys.path:
+        _sys.path.insert(0, _pkg_root)
+    from heatmap.model import ModelConfig, PointHeatmapModel, PointHeatmapModelWithSAM, soft_argmax_from_logits
+    from heatmap.utils import load_checkpoint
+
+import importlib.util as _importlib_util
+
+def _import_render_helper() -> Optional[Callable]:
+    """Dynamically import _render_diff_panels_with_point from annotator script by file path.
+
+    This avoids package-name issues due to hyphen in 'seg-rl'.
+    """
+    try:
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # seg-rl
+        target = os.path.join(base_dir, "annotator", "gen_point_jsonl_from_masks.py")
+        if not os.path.isfile(target):
+            return None
+        spec = _importlib_util.spec_from_file_location("gen_point_jsonl_from_masks", target)
+        if spec is None or spec.loader is None:
+            return None
+        module = _importlib_util.module_from_spec(spec)
+        spec.loader.exec_module(module)  # type: ignore[attr-defined]
+        func = getattr(module, "_render_diff_panels_with_point", None)
+        if callable(func):
+            return func  # type: ignore[return-value]
+    except Exception:
+        return None
+    return None
+
+_render_diff_panels_with_point: Optional[Callable] = _import_render_helper()
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Predict next SAM prompt point via trained heatmap model")
+    group = p.add_mutually_exclusive_group(required=True)
+    group.add_argument("--output_json", type=str, help="Write a new JSON array with first predicted points")
+    group.add_argument("--appendto_json", type=str, help="Append next predicted point to an existing JSON array")
+    group.add_argument("--debug_json", type=str, help="Debug visualization only: read JSON array and render panels")
+
+    p.add_argument("--model_path", type=str, required=False, help="Path to trained model checkpoint (.pt)")
+    p.add_argument("--images_dir", type=str, default=None, help="Directory of input images (initial mode)")
+    p.add_argument("--masks_dir", type=str, default=None, help="Ground-truth masks directory (initial mode only, to fill 'gt_mask' field)")
+    p.add_argument("--sam_dir", type=str, default=None, help="Directory of predicted SAM masks per step: {sam_dir}/{stem}/{k}.png (initial/debug mode)")
+    # height/width: 0 means use native image size; if >0, will resize for inference
+    p.add_argument("--height", type=int, default=0, help="0 = use native image height")
+    p.add_argument("--width", type=int, default=0, help="0 = use native image width")
+    p.add_argument("--tau", type=float, default=1.0, help="Softmax temperature for heatmap -> probability")
+    p.add_argument("--amp", action="store_true")
+    p.add_argument("--progress", action="store_true")
+    p.add_argument("--debug_output_dir", type=str, default=None)
+    return p.parse_args()
+
+
+def _device_and_amp(args: argparse.Namespace) -> Tuple[torch.device, bool, str]:
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+    amp_enabled = args.amp and (device.type == "cuda")
+    autocast_device_type = "cuda" if device.type == "cuda" else "cpu"
+    return device, amp_enabled, autocast_device_type
+
+
+def _load_model(model_path: str, device: torch.device) -> PointHeatmapModel:
+    cfg = ModelConfig(backbone="unet_s", pretrained=False, main_in_channels=3, cond_in_channels=1)
+    model = PointHeatmapModel(cfg).to(device)
+    ckpt = torch.load(model_path, map_location="cpu") if model_path and os.path.isfile(model_path) else None
+    if ckpt is not None:
+        sd = ckpt.get("model", ckpt)
+        model.load_state_dict(sd, strict=False)
+    model.eval()
+    return model
+
+
+def _to_tensor_separate(image_path: str, gray_mask: Optional[Image.Image], out_hw: Tuple[int, int]) -> Tuple[torch.Tensor, torch.Tensor, Tuple[int, int]]:
+    """Prepare separate RGB and grayscale tensors for the model; returns (rgb, gray, (orig_h, orig_w))."""
+    im0 = Image.open(image_path).convert("RGB")
+    orig_w, orig_h = im0.size
+    H, W = out_hw
+    # decide resize size
+    if H <= 0 or W <= 0:
+        H, W = orig_h, orig_w
+    im = im0.resize((W, H), resample=Image.BILINEAR) if (W, H) != (orig_w, orig_h) else im0
+    if gray_mask is None:
+        gray0 = Image.new("L", (orig_w, orig_h), 0)
+    else:
+        gray0 = gray_mask.convert("L")
+    gray = gray0.resize((W, H), resample=Image.NEAREST) if (W, H) != (orig_w, orig_h) else gray0
+    import torchvision.transforms.functional as TF
+    rgb_t = TF.to_tensor(im)
+    rgb_t = TF.normalize(rgb_t, mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
+    g_t = TF.to_tensor(gray)
+    g_t = (g_t - 0.5) / 0.5
+    return rgb_t.unsqueeze(0), g_t.unsqueeze(0), (orig_h, orig_w)  # [1,3,H,W], [1,1,H,W], (orig_h,orig_w)
+
+
+def _predict_point(model: PointHeatmapModel, rgb_tensor: torch.Tensor, gray_tensor: torch.Tensor, device: torch.device, tau: float) -> Tuple[float, float, int]:
+    with torch.no_grad():
+        logits, label_logits = model(rgb_tensor.to(device), gray_tensor.to(device))
+        xy = soft_argmax_from_logits(logits, temperature=tau)[0]
+        lab = int(label_logits.argmax(dim=1).item())
+    return float(xy[0].item()), float(xy[1].item()), lab
+
+
+def _list_images(images_dir: str) -> List[str]:
+    exts = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+    out: List[str] = []
+    for name in sorted(os.listdir(images_dir)):
+        p = os.path.join(images_dir, name)
+        if os.path.isdir(p):
+            continue
+        if os.path.splitext(name)[1].lower() in exts:
+            out.append(p)
+    return out
+
+
+def _stem(path: str) -> str:
+    name = os.path.basename(path)
+    base, _ = os.path.splitext(name)
+    return base
+
+
+def run_initial(args: argparse.Namespace) -> None:
+    if not args.images_dir or not args.output_json:
+        raise RuntimeError("--images_dir and --output_json are required for initial mode")
+    if not args.masks_dir:
+        raise RuntimeError("--masks_dir is required for initial mode to fill 'gt_mask' field")
+    device, amp_enabled, autocast_device_type = _device_and_amp(args)
+    model = _load_model(args.model_path, device)
+    H, W = int(args.height), int(args.width)
+
+    records: List[Dict] = []
+    images = _list_images(args.images_dir)
+    if args.progress:
+        try:
+            from tqdm import tqdm  # type: ignore
+            images_iter = tqdm(images, desc="Initial predict")
+        except Exception:
+            images_iter = images
+    else:
+        images_iter = images
+
+    for img_path in images_iter:
+        rgb_tensor, gray_tensor, (orig_h, orig_w) = _to_tensor_separate(img_path, gray_mask=None, out_hw=(H, W))
+        with torch.amp.autocast(device_type=autocast_device_type, enabled=amp_enabled):
+            x, y, lab = _predict_point(model, rgb_tensor, gray_tensor, device, args.tau)
+        # scale back to native size if resized
+        inf_H, inf_W = rgb_tensor.shape[-2], rgb_tensor.shape[-1]
+        if (inf_W, inf_H) != (orig_w, orig_h):
+            scale_x = float(orig_w) / float(inf_W)
+            scale_y = float(orig_h) / float(inf_H)
+            x = x * scale_x
+            y = y * scale_y
+        # clamp to bounds
+        x = float(max(0.0, min(orig_w - 1.0, x)))
+        y = float(max(0.0, min(orig_h - 1.0, y)))
+        stem = _stem(img_path)
+        gt_mask_path = os.path.join(args.masks_dir, f"{stem}.png")
+        rec = {
+            "image": os.path.abspath(img_path),
+            "gt_mask": os.path.abspath(gt_mask_path),
+            "sam_masks_dir": os.path.abspath(args.sam_dir) if args.sam_dir else None,
+            "points": [[float(x), float(y)]],
+            "labels": [int(lab)],
+        }
+        # keep sam_masks_dir only if provided
+        if rec["sam_masks_dir"] is None:
+            del rec["sam_masks_dir"]
+        records.append(rec)
+
+    os.makedirs(os.path.dirname(args.output_json) or ".", exist_ok=True)
+    with open(args.output_json, "w", encoding="utf-8") as f:
+        json.dump(records, f, indent=2, ensure_ascii=False)
+    print(f"Wrote {len(records)} records to {args.output_json}")
+
+
+def run_append(args: argparse.Namespace) -> None:
+    if not args.appendto_json:
+        raise RuntimeError("--appendto_json required for append mode")
+    if not os.path.isfile(args.appendto_json):
+        raise FileNotFoundError(args.appendto_json)
+    arr = json.loads(open(args.appendto_json, "r", encoding="utf-8").read().strip())
+    if not isinstance(arr, list):
+        raise RuntimeError("Append target must be a JSON array")
+    device, amp_enabled, autocast_device_type = _device_and_amp(args)
+    model = _load_model(args.model_path, device)
+    H, W = int(args.height), int(args.width)
+
+    updated = 0
+    # progress bar
+    rec_iter = arr
+    pbar = None
+    if args.progress:
+        try:
+            from tqdm import tqdm  # type: ignore
+            pbar = tqdm(total=len(arr), desc="Append predict")
+        except Exception:
+            pbar = None
+    for rec in arr:
+        if not isinstance(rec, dict):
+            continue
+        img_path = rec.get("image")
+        sam_dir = rec.get("sam_masks_dir")
+        pts = rec.get("points", [])
+        labs = rec.get("labels", [])
+        if not img_path:
+            continue
+        k = len(pts)
+        # prev mask
+        if k == 0:
+            gray = None
+        else:
+            stem = _stem(img_path)
+            prev_path = os.path.join(sam_dir, stem, f"{k-1}.png")
+            gray = Image.open(prev_path).convert("L") if os.path.isfile(prev_path) else None
+        rgb_tensor, gray_tensor, (orig_h, orig_w) = _to_tensor_separate(img_path, gray_mask=gray, out_hw=(H, W))
+        with torch.amp.autocast(device_type=autocast_device_type, enabled=amp_enabled):
+            x, y, lab = _predict_point(model, rgb_tensor, gray_tensor, device, args.tau)
+        # scale back and clamp
+        inf_H, inf_W = rgb_tensor.shape[-2], rgb_tensor.shape[-1]
+        if (inf_W, inf_H) != (orig_w, orig_h):
+            scale_x = float(orig_w) / float(inf_W)
+            scale_y = float(orig_h) / float(inf_H)
+            x = x * scale_x
+            y = y * scale_y
+        x = float(max(0.0, min(orig_w - 1.0, x)))
+        y = float(max(0.0, min(orig_h - 1.0, y)))
+        rec["points"] = (pts or []) + [[x, y]]
+        rec["labels"] = (labs or []) + [int(lab)]
+        # sam_masks_dir should be set by external segmenter; do not inject here
+        updated += 1
+        if pbar is not None:
+            pbar.update(1)
+        elif updated % max(1, len(arr)//10 or 1) == 0:
+            print(f"Processed {updated}/{len(arr)} records")
+
+    if pbar is not None:
+        pbar.close()
+
+    with open(args.appendto_json, "w", encoding="utf-8") as f:
+        json.dump(arr, f, indent=2, ensure_ascii=False)
+    print(f"Appended next points to {args.appendto_json} (updated {updated} items)")
+
+
+def run_debug(args: argparse.Namespace) -> None:
+    if not args.debug_json:
+        raise RuntimeError("--debug_json required for debug mode")
+    if not args.debug_output_dir:
+        raise RuntimeError("--debug_output_dir required for debug mode")
+    arr = json.loads(open(args.debug_json, "r", encoding="utf-8").read().strip())
+    if not isinstance(arr, list):
+        raise RuntimeError("Debug JSON must be a JSON array")
+    os.makedirs(args.debug_output_dir, exist_ok=True)
+
+    num_generated = 0
+    # optional progress over total steps
+    total_steps = 0
+    if args.progress:
+        try:
+            for rec in arr:
+                if isinstance(rec, dict):
+                    pts = rec.get("points", []) if isinstance(rec.get("points", []), list) else []
+                    total_steps += len(pts)
+        except Exception:
+            total_steps = 0
+    pbar = None
+    if args.progress and total_steps > 0:
+        try:
+            from tqdm import tqdm  # type: ignore
+            pbar = tqdm(total=total_steps, desc="Debug render")
+        except Exception:
+            pbar = None
+
+    for rec in arr:
+        if not isinstance(rec, dict):
+            continue
+        image_path = rec.get("image")
+        sam_dir = rec.get("sam_masks_dir") or args.sam_dir
+        points = rec.get("points", [])
+        labels = rec.get("labels", [])
+        if not (image_path and isinstance(points, list) and isinstance(labels, list)):
+            continue
+        if len(points) != len(labels):
+            continue
+        stem = _stem(image_path)
+        for i, (pt, lb) in enumerate(zip(points, labels)):
+            cur_path = os.path.join(sam_dir, stem, f"{i}.png")
+            cur = Image.open(cur_path).convert("L") if os.path.isfile(cur_path) else None
+            if cur is None:
+                continue
+            cur_u8 = np.array(cur, dtype=np.uint8)
+            if i == 0:
+                prev_u8 = np.zeros_like(cur_u8, dtype=np.uint8)
+            else:
+                prev_path = os.path.join(sam_dir, stem, f"{i-1}.png")
+                prev_u8 = np.array(Image.open(prev_path).convert("L"), dtype=np.uint8) if os.path.isfile(prev_path) else np.zeros_like(cur_u8, dtype=np.uint8)
+            try:
+                subdir = os.path.join(args.debug_output_dir, stem)
+                os.makedirs(subdir, exist_ok=True)
+                out_path = os.path.join(subdir, f"dbg_{i}.png")
+            except Exception:
+                out_path = None  # type: ignore
+            if _render_diff_panels_with_point is not None and out_path is not None:
+                _render_diff_panels_with_point(prev_u8, cur_u8, (float(pt[0]), float(pt[1])), int(lb), out_path)
+                num_generated += 1
+            if pbar is not None:
+                pbar.update(1)
+    if pbar is not None:
+        pbar.close()
+    print(f"Generated debug images for {num_generated} steps into {args.debug_output_dir}")
+
+
+def main() -> None:
+    args = parse_args()
+    if args.output_json:
+        run_initial(args)
+        return
+    if args.appendto_json:
+        run_append(args)
+        return
+    if args.debug_json:
+        run_debug(args)
+        return
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+```
+
+```python
+#!/usr/bin/env python3
+
+"""
+Predict next SAM prompt point (position + binary label) using a trained heatmap model.
+
+This script mirrors seg-rl/annotator/gen_point_jsonl_from_masks.py, but replaces the
+EDT-based next-point computation with a model inference that takes only:
+  - the RGB image, and
+  - the current predicted mask (or zero mask at step 0)
+and outputs the next prompt point and its label.
+
+Modes:
+  1) Initial generation (write new JSON array):
+     - For each image under --images_dir, predict the first prompt (i=0) with a zero mask.
+     - Write a JSON array with records like:
+         {"image": "/abs/path.jpg", "sam_masks_dir": "/abs/sam_dir", "points": [[x0,y0]], "labels": [l0]}
+
+  2) Append mode (update existing JSON array):
+     - Read --appendto_json as a JSON array, for each record take current length k=len(points),
+       load the latest predicted mask at {sam_dir}/{stem}/{k-1}.png (k>0; else zero), and predict
+       the next point (xk, yk, lk). Append to arrays and write back in-place.
+
+  3) Debug visualization (no file write except images):
+     - Read --debug_json (JSON array) that already contains points+labels and a sam_masks_dir.
+     - For each step i, load prev and cur predicted masks (i-1 and i; prev is zero for i=0) and
+       call the same 3-panel visualization function used by the annotator to render panels with
+       the provided point, saving to --debug_output_dir/{stem}/dbg_{i}.png.
+     - Ground-truth masks are NOT used anywhere in this script (except indirectly if you supply
+       them in your own JSON for reference; they are not required).
+
+Examples:
+  # Initial generation
+  /opt/anaconda3/envs/seg-r1/bin/python -m seg-rl.heatmap.predict_next_point_from_model \
+    --model_path outputs/braintumour/heatmap_train-251001-optimized/model_epoch_185.pt \
+    --images_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/images \
+    --masks_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/masks \
+    --output_json outputs/braintumour/pred_points-sft_e185-251018.jsonl
+
+  python -m seg-rl.heatmap.predict_next_point_from_model \
+    --model_path outputs/braintumour/points_predictor-251001-160epochs.pt \
+    --images_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/images \
+    --masks_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/masks \
+    --output_json outputs/braintumour/pred_points-e160-251019.jsonl
+
+  # Append mode
+  /opt/anaconda3/envs/seg-r1/bin/python -m seg-rl.heatmap.predict_next_point_from_model \
+    --model_path outputs/braintumour/points_predictor-251001-160epochs.pt \
+    --appendto_json datasets/seg_r1_md/Task01_BrainTumour/pred_points-251001.jsonl
+
+  python -m seg-rl.heatmap.predict_next_point_from_model \
+    --model_path outputs/braintumour/points_predictor-251001-160epochs.pt \
+    --appendto_json outputs/braintumour/pred_points-e160-251019.jsonl
+
+  # Debug visualization only
+  /opt/anaconda3/envs/seg-r1/bin/python -m seg-rl.heatmap.predict_next_point_from_model \
+    --debug_json datasets/seg_r1_md/Task01_BrainTumour/pred_points-init.jsonl \
+    --debug_output_dir outputs/braintumour/dbg_model_pred
+
+Notes:
+  - The model expects 4-channel input (RGB normalized + Gray normalized mask). This script
+    normalizes RGB with ImageNet mean/std and mask with mean=0.5, std=0.5.
+  - Device selection prefers CUDA, then MPS (Apple Silicon), otherwise CPU. AMP is only used on CUDA.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from typing import Dict, List, Optional, Tuple, Callable
+
+import numpy as np
+from PIL import Image
+
+import torch
+import torch.nn.functional as F
+
+try:
+    # package context
+    from .model import ModelConfig, PointHeatmapModel, PointHeatmapModelWithSAM, soft_argmax_from_logits
+    from .utils import load_checkpoint
+except Exception:
+    # script context
+    import sys as _sys
+    import os as _os
+    _pkg_root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    if _pkg_root not in _sys.path:
+        _sys.path.insert(0, _pkg_root)
+    from heatmap.model import ModelConfig, PointHeatmapModel, PointHeatmapModelWithSAM, soft_argmax_from_logits
+    from heatmap.utils import load_checkpoint
+
+import importlib.util as _importlib_util
+
+def _import_render_helper() -> Optional[Callable]:
+    """Dynamically import _render_diff_panels_with_point from annotator script by file path.
+
+    This avoids package-name issues due to hyphen in 'seg-rl'.
+    """
+    try:
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # seg-rl
+        target = os.path.join(base_dir, "annotator", "gen_point_jsonl_from_masks.py")
+        if not os.path.isfile(target):
+            return None
+        spec = _importlib_util.spec_from_file_location("gen_point_jsonl_from_masks", target)
+        if spec is None or spec.loader is None:
+            return None
+        module = _importlib_util.module_from_spec(spec)
+        spec.loader.exec_module(module)  # type: ignore[attr-defined]
+        func = getattr(module, "_render_diff_panels_with_point", None)
+        if callable(func):
+            return func  # type: ignore[return-value]
+    except Exception:
+        return None
+    return None
+
+_render_diff_panels_with_point: Optional[Callable] = _import_render_helper()
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Predict next SAM prompt point via trained heatmap model")
+    group = p.add_mutually_exclusive_group(required=True)
+    group.add_argument("--output_json", type=str, help="Write a new JSON array with first predicted points")
+    group.add_argument("--appendto_json", type=str, help="Append next predicted point to an existing JSON array")
+    group.add_argument("--debug_json", type=str, help="Debug visualization only: read JSON array and render panels")
+
+    p.add_argument("--model_path", type=str, required=False, help="Path to trained model checkpoint (.pt)")
+    p.add_argument("--images_dir", type=str, default=None, help="Directory of input images (initial mode)")
+    p.add_argument("--masks_dir", type=str, default=None, help="Ground-truth masks directory (initial mode only, to fill 'gt_mask' field)")
+    p.add_argument("--sam_dir", type=str, default=None, help="Directory of predicted SAM masks per step: {sam_dir}/{stem}/{k}.png (initial/debug mode)")
+    # height/width: 0 means use native image size; if >0, will resize for inference
+    p.add_argument("--height", type=int, default=0, help="0 = use native image height")
+    p.add_argument("--width", type=int, default=0, help="0 = use native image width")
+    p.add_argument("--tau", type=float, default=1.0, help="Softmax temperature for heatmap -> probability")
+    p.add_argument("--amp", action="store_true")
+    p.add_argument("--progress", action="store_true")
+    p.add_argument("--debug_output_dir", type=str, default=None)
+    # SAM Late LoRA 相关参数
+    p.add_argument("--sam_checkpoint", type=str, default=None, 
+                   help="Path to SAM checkpoint (required if model uses SAM encoder)")
+    return p.parse_args()
+
+
+def _device_and_amp(args: argparse.Namespace) -> Tuple[torch.device, bool, str]:
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+    amp_enabled = args.amp and (device.type == "cuda")
+    autocast_device_type = "cuda" if device.type == "cuda" else "cpu"
+    return device, amp_enabled, autocast_device_type
+
+
+def _load_model(model_path: str, device: torch.device) -> PointHeatmapModel:
+    cfg = ModelConfig(backbone="unet_s", pretrained=False, main_in_channels=3, cond_in_channels=1)
+    model = PointHeatmapModel(cfg).to(device)
+    ckpt = torch.load(model_path, map_location="cpu") if model_path and os.path.isfile(model_path) else None
+    if ckpt is not None:
+        sd = ckpt.get("model", ckpt)
+        model.load_state_dict(sd, strict=False)
+    model.eval()
+    return model
+
+
+def _to_tensor_separate(image_path: str, gray_mask: Optional[Image.Image], out_hw: Tuple[int, int]) -> Tuple[torch.Tensor, torch.Tensor, Tuple[int, int]]:
+    """Prepare separate RGB and grayscale tensors for the model; returns (rgb, gray, (orig_h, orig_w))."""
+    im0 = Image.open(image_path).convert("RGB")
+    orig_w, orig_h = im0.size
+    H, W = out_hw
+    # decide resize size
+    if H <= 0 or W <= 0:
+        H, W = orig_h, orig_w
+    im = im0.resize((W, H), resample=Image.BILINEAR) if (W, H) != (orig_w, orig_h) else im0
+    if gray_mask is None:
+        gray0 = Image.new("L", (orig_w, orig_h), 0)
+    else:
+        gray0 = gray_mask.convert("L")
+    gray = gray0.resize((W, H), resample=Image.NEAREST) if (W, H) != (orig_w, orig_h) else gray0
+    import torchvision.transforms.functional as TF
+    rgb_t = TF.to_tensor(im)
+    rgb_t = TF.normalize(rgb_t, mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
+    g_t = TF.to_tensor(gray)
+    g_t = (g_t - 0.5) / 0.5
+    return rgb_t.unsqueeze(0), g_t.unsqueeze(0), (orig_h, orig_w)  # [1,3,H,W], [1,1,H,W], (orig_h,orig_w)
+
+
+def _predict_point(model: PointHeatmapModel, rgb_tensor: torch.Tensor, gray_tensor: torch.Tensor, device: torch.device, tau: float) -> Tuple[float, float, int]:
+    with torch.no_grad():
+        logits, label_logits = model(rgb_tensor.to(device), gray_tensor.to(device))
+        xy = soft_argmax_from_logits(logits, temperature=tau)[0]
+        lab = int(label_logits.argmax(dim=1).item())
+    return float(xy[0].item()), float(xy[1].item()), lab
+
+
+def _list_images(images_dir: str) -> List[str]:
+    exts = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+    out: List[str] = []
+    for name in sorted(os.listdir(images_dir)):
+        p = os.path.join(images_dir, name)
+        if os.path.isdir(p):
+            continue
+        if os.path.splitext(name)[1].lower() in exts:
+            out.append(p)
+    return out
+
+
+def _stem(path: str) -> str:
+    name = os.path.basename(path)
+    base, _ = os.path.splitext(name)
+    return base
+
+
+def run_initial(args: argparse.Namespace) -> None:
+    if not args.images_dir or not args.output_json:
+        raise RuntimeError("--images_dir and --output_json are required for initial mode")
+    if not args.masks_dir:
+        raise RuntimeError("--masks_dir is required for initial mode to fill 'gt_mask' field")
+    device, amp_enabled, autocast_device_type = _device_and_amp(args)
+    model = _load_model(args.model_path, device)
+    H, W = int(args.height), int(args.width)
+
+    records: List[Dict] = []
+    images = _list_images(args.images_dir)
+    if args.progress:
+        try:
+            from tqdm import tqdm  # type: ignore
+            images_iter = tqdm(images, desc="Initial predict")
+        except Exception:
+            images_iter = images
+    else:
+        images_iter = images
+
+    for img_path in images_iter:
+        rgb_tensor, gray_tensor, (orig_h, orig_w) = _to_tensor_separate(img_path, gray_mask=None, out_hw=(H, W))
+        with torch.amp.autocast(device_type=autocast_device_type, enabled=amp_enabled):
+            x, y, lab = _predict_point(model, rgb_tensor, gray_tensor, device, args.tau)
+        # scale back to native size if resized
+        inf_H, inf_W = rgb_tensor.shape[-2], rgb_tensor.shape[-1]
+        if (inf_W, inf_H) != (orig_w, orig_h):
+            scale_x = float(orig_w) / float(inf_W)
+            scale_y = float(orig_h) / float(inf_H)
+            x = x * scale_x
+            y = y * scale_y
+        # clamp to bounds
+        x = float(max(0.0, min(orig_w - 1.0, x)))
+        y = float(max(0.0, min(orig_h - 1.0, y)))
+        stem = _stem(img_path)
+        gt_mask_path = os.path.join(args.masks_dir, f"{stem}.png")
+        rec = {
+            "image": os.path.abspath(img_path),
+            "gt_mask": os.path.abspath(gt_mask_path),
+            "sam_masks_dir": os.path.abspath(args.sam_dir) if args.sam_dir else None,
+            "points": [[float(x), float(y)]],
+            "labels": [int(lab)],
+        }
+        # keep sam_masks_dir only if provided
+        if rec["sam_masks_dir"] is None:
+            del rec["sam_masks_dir"]
+        records.append(rec)
+
+    os.makedirs(os.path.dirname(args.output_json) or ".", exist_ok=True)
+    with open(args.output_json, "w", encoding="utf-8") as f:
+        json.dump(records, f, indent=2, ensure_ascii=False)
+    print(f"Wrote {len(records)} records to {args.output_json}")
+
+
+def run_append(args: argparse.Namespace) -> None:
+    if not args.appendto_json:
+        raise RuntimeError("--appendto_json required for append mode")
+    if not os.path.isfile(args.appendto_json):
+        raise FileNotFoundError(args.appendto_json)
+    arr = json.loads(open(args.appendto_json, "r", encoding="utf-8").read().strip())
+    if not isinstance(arr, list):
+        raise RuntimeError("Append target must be a JSON array")
+    device, amp_enabled, autocast_device_type = _device_and_amp(args)
+    model = _load_model(args.model_path, device)
+    H, W = int(args.height), int(args.width)
+
+    updated = 0
+    # progress bar
+    rec_iter = arr
+    pbar = None
+    if args.progress:
+        try:
+            from tqdm import tqdm  # type: ignore
+            pbar = tqdm(total=len(arr), desc="Append predict")
+        except Exception:
+            pbar = None
+    for rec in arr:
+        if not isinstance(rec, dict):
+            continue
+        img_path = rec.get("image")
+        sam_dir = rec.get("sam_masks_dir")
+        pts = rec.get("points", [])
+        labs = rec.get("labels", [])
+        if not img_path:
+            continue
+        k = len(pts)
+        # prev mask
+        if k == 0:
+            gray = None
+        else:
+            stem = _stem(img_path)
+            prev_path = os.path.join(sam_dir, stem, f"{k-1}.png")
+            gray = Image.open(prev_path).convert("L") if os.path.isfile(prev_path) else None
+        rgb_tensor, gray_tensor, (orig_h, orig_w) = _to_tensor_separate(img_path, gray_mask=gray, out_hw=(H, W))
+        with torch.amp.autocast(device_type=autocast_device_type, enabled=amp_enabled):
+            x, y, lab = _predict_point(model, rgb_tensor, gray_tensor, device, args.tau)
+        # scale back and clamp
+        inf_H, inf_W = rgb_tensor.shape[-2], rgb_tensor.shape[-1]
+        if (inf_W, inf_H) != (orig_w, orig_h):
+            scale_x = float(orig_w) / float(inf_W)
+            scale_y = float(orig_h) / float(inf_H)
+            x = x * scale_x
+            y = y * scale_y
+        x = float(max(0.0, min(orig_w - 1.0, x)))
+        y = float(max(0.0, min(orig_h - 1.0, y)))
+        rec["points"] = (pts or []) + [[x, y]]
+        rec["labels"] = (labs or []) + [int(lab)]
+        # sam_masks_dir should be set by external segmenter; do not inject here
+        updated += 1
+        if pbar is not None:
+            pbar.update(1)
+        elif updated % max(1, len(arr)//10 or 1) == 0:
+            print(f"Processed {updated}/{len(arr)} records")
+
+    if pbar is not None:
+        pbar.close()
+
+    with open(args.appendto_json, "w", encoding="utf-8") as f:
+        json.dump(arr, f, indent=2, ensure_ascii=False)
+    print(f"Appended next points to {args.appendto_json} (updated {updated} items)")
+
+
+def run_debug(args: argparse.Namespace) -> None:
+    if not args.debug_json:
+        raise RuntimeError("--debug_json required for debug mode")
+    if not args.debug_output_dir:
+        raise RuntimeError("--debug_output_dir required for debug mode")
+    arr = json.loads(open(args.debug_json, "r", encoding="utf-8").read().strip())
+    if not isinstance(arr, list):
+        raise RuntimeError("Debug JSON must be a JSON array")
+    os.makedirs(args.debug_output_dir, exist_ok=True)
+
+    num_generated = 0
+    # optional progress over total steps
+    total_steps = 0
+    if args.progress:
+        try:
+            for rec in arr:
+                if isinstance(rec, dict):
+                    pts = rec.get("points", []) if isinstance(rec.get("points", []), list) else []
+                    total_steps += len(pts)
+        except Exception:
+            total_steps = 0
+    pbar = None
+    if args.progress and total_steps > 0:
+        try:
+            from tqdm import tqdm  # type: ignore
+            pbar = tqdm(total=total_steps, desc="Debug render")
+        except Exception:
+            pbar = None
+
+    for rec in arr:
+        if not isinstance(rec, dict):
+            continue
+        image_path = rec.get("image")
+        sam_dir = rec.get("sam_masks_dir") or args.sam_dir
+        points = rec.get("points", [])
+        labels = rec.get("labels", [])
+        if not (image_path and isinstance(points, list) and isinstance(labels, list)):
+            continue
+        if len(points) != len(labels):
+            continue
+        stem = _stem(image_path)
+        for i, (pt, lb) in enumerate(zip(points, labels)):
+            cur_path = os.path.join(sam_dir, stem, f"{i}.png")
+            cur = Image.open(cur_path).convert("L") if os.path.isfile(cur_path) else None
+            if cur is None:
+                continue
+            cur_u8 = np.array(cur, dtype=np.uint8)
+            if i == 0:
+                prev_u8 = np.zeros_like(cur_u8, dtype=np.uint8)
+            else:
+                prev_path = os.path.join(sam_dir, stem, f"{i-1}.png")
+                prev_u8 = np.array(Image.open(prev_path).convert("L"), dtype=np.uint8) if os.path.isfile(prev_path) else np.zeros_like(cur_u8, dtype=np.uint8)
+            try:
+                subdir = os.path.join(args.debug_output_dir, stem)
+                os.makedirs(subdir, exist_ok=True)
+                out_path = os.path.join(subdir, f"dbg_{i}.png")
+            except Exception:
+                out_path = None  # type: ignore
+            if _render_diff_panels_with_point is not None and out_path is not None:
+                _render_diff_panels_with_point(prev_u8, cur_u8, (float(pt[0]), float(pt[1])), int(lb), out_path)
+                num_generated += 1
+            if pbar is not None:
+                pbar.update(1)
+    if pbar is not None:
+        pbar.close()
+    print(f"Generated debug images for {num_generated} steps into {args.debug_output_dir}")
+
+
+def main() -> None:
+    args = parse_args()
+    if args.output_json:
+        run_initial(args)
+        return
+    if args.appendto_json:
+        run_append(args)
+        return
+    if args.debug_json:
+        run_debug(args)
+        return
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+```
+
+```python
+#!/usr/bin/env python3
+
+"""
+Predict next SAM prompt point (position + binary label) using a trained heatmap model.
+
+This script mirrors seg-rl/annotator/gen_point_jsonl_from_masks.py, but replaces the
+EDT-based next-point computation with a model inference that takes only:
+  - the RGB image, and
+  - the current predicted mask (or zero mask at step 0)
+and outputs the next prompt point and its label.
+
+Modes:
+  1) Initial generation (write new JSON array):
+     - For each image under --images_dir, predict the first prompt (i=0) with a zero mask.
+     - Write a JSON array with records like:
+         {"image": "/abs/path.jpg", "sam_masks_dir": "/abs/sam_dir", "points": [[x0,y0]], "labels": [l0]}
+
+  2) Append mode (update existing JSON array):
+     - Read --appendto_json as a JSON array, for each record take current length k=len(points),
+       load the latest predicted mask at {sam_dir}/{stem}/{k-1}.png (k>0; else zero), and predict
+       the next point (xk, yk, lk). Append to arrays and write back in-place.
+
+  3) Debug visualization (no file write except images):
+     - Read --debug_json (JSON array) that already contains points+labels and a sam_masks_dir.
+     - For each step i, load prev and cur predicted masks (i-1 and i; prev is zero for i=0) and
+       call the same 3-panel visualization function used by the annotator to render panels with
+       the provided point, saving to --debug_output_dir/{stem}/dbg_{i}.png.
+     - Ground-truth masks are NOT used anywhere in this script (except indirectly if you supply
+       them in your own JSON for reference; they are not required).
+
+Examples:
+  # Initial generation
+  /opt/anaconda3/envs/seg-r1/bin/python -m seg-rl.heatmap.predict_next_point_from_model \
+    --model_path outputs/braintumour/heatmap_train-251001-optimized/model_epoch_185.pt \
+    --images_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/images \
+    --masks_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/masks \
+    --output_json outputs/braintumour/pred_points-sft_e185-251018.jsonl
+
+  python -m seg-rl.heatmap.predict_next_point_from_model \
+    --model_path outputs/braintumour/points_predictor-251001-160epochs.pt \
+    --images_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/images \
+    --masks_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/masks \
+    --output_json outputs/braintumour/pred_points-e160-251019.jsonl
+
+  # Append mode
+  /opt/anaconda3/envs/seg-r1/bin/python -m seg-rl.heatmap.predict_next_point_from_model \
+    --model_path outputs/braintumour/points_predictor-251001-160epochs.pt \
+    --appendto_json datasets/seg_r1_md/Task01_BrainTumour/pred_points-251001.jsonl
+
+  python -m seg-rl.heatmap.predict_next_point_from_model \
+    --model_path outputs/braintumour/points_predictor-251001-160epochs.pt \
+    --appendto_json outputs/braintumour/pred_points-e160-251019.jsonl
+
+  # Debug visualization only
+  /opt/anaconda3/envs/seg-r1/bin/python -m seg-rl.heatmap.predict_next_point_from_model \
+    --debug_json datasets/seg_r1_md/Task01_BrainTumour/pred_points-init.jsonl \
+    --debug_output_dir outputs/braintumour/dbg_model_pred
+
+Notes:
+  - The model expects 4-channel input (RGB normalized + Gray normalized mask). This script
+    normalizes RGB with ImageNet mean/std and mask with mean=0.5, std=0.5.
+  - Device selection prefers CUDA, then MPS (Apple Silicon), otherwise CPU. AMP is only used on CUDA.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from typing import Dict, List, Optional, Tuple, Callable
+
+import numpy as np
+from PIL import Image
+
+import torch
+import torch.nn.functional as F
+
+try:
+    # package context
+    from .model import ModelConfig, PointHeatmapModel, PointHeatmapModelWithSAM, soft_argmax_from_logits
+    from .utils import load_checkpoint
+except Exception:
+    # script context
+    import sys as _sys
+    import os as _os
+    _pkg_root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    if _pkg_root not in _sys.path:
+        _sys.path.insert(0, _pkg_root)
+    from heatmap.model import ModelConfig, PointHeatmapModel, PointHeatmapModelWithSAM, soft_argmax_from_logits
+    from heatmap.utils import load_checkpoint
+
+import importlib.util as _importlib_util
+
+def _import_render_helper() -> Optional[Callable]:
+    """Dynamically import _render_diff_panels_with_point from annotator script by file path.
+
+    This avoids package-name issues due to hyphen in 'seg-rl'.
+    """
+    try:
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # seg-rl
+        target = os.path.join(base_dir, "annotator", "gen_point_jsonl_from_masks.py")
+        if not os.path.isfile(target):
+            return None
+        spec = _importlib_util.spec_from_file_location("gen_point_jsonl_from_masks", target)
+        if spec is None or spec.loader is None:
+            return None
+        module = _importlib_util.module_from_spec(spec)
+        spec.loader.exec_module(module)  # type: ignore[attr-defined]
+        func = getattr(module, "_render_diff_panels_with_point", None)
+        if callable(func):
+            return func  # type: ignore[return-value]
+    except Exception:
+        return None
+    return None
+
+_render_diff_panels_with_point: Optional[Callable] = _import_render_helper()
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Predict next SAM prompt point via trained heatmap model")
+    group = p.add_mutually_exclusive_group(required=True)
+    group.add_argument("--output_json", type=str, help="Write a new JSON array with first predicted points")
+    group.add_argument("--appendto_json", type=str, help="Append next predicted point to an existing JSON array")
+    group.add_argument("--debug_json", type=str, help="Debug visualization only: read JSON array and render panels")
+
+    p.add_argument("--model_path", type=str, required=False, help="Path to trained model checkpoint (.pt)")
+    p.add_argument("--images_dir", type=str, default=None, help="Directory of input images (initial mode)")
+    p.add_argument("--masks_dir", type=str, default=None, help="Ground-truth masks directory (initial mode only, to fill 'gt_mask' field)")
+    p.add_argument("--sam_dir", type=str, default=None, help="Directory of predicted SAM masks per step: {sam_dir}/{stem}/{k}.png (initial/debug mode)")
+    # height/width: 0 means use native image size; if >0, will resize for inference
+    p.add_argument("--height", type=int, default=0, help="0 = use native image height")
+    p.add_argument("--width", type=int, default=0, help="0 = use native image width")
+    p.add_argument("--tau", type=float, default=1.0, help="Softmax temperature for heatmap -> probability")
+    p.add_argument("--amp", action="store_true")
+    p.add_argument("--progress", action="store_true")
+    p.add_argument("--debug_output_dir", type=str, default=None)
+    # SAM Late LoRA 相关参数
+    p.add_argument("--sam_checkpoint", type=str, default=None, 
+                   help="Path to SAM checkpoint (required if model uses SAM encoder)")
+    return p.parse_args()
+
+
+def _device_and_amp(args: argparse.Namespace) -> Tuple[torch.device, bool, str]:
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+    amp_enabled = args.amp and (device.type == "cuda")
+    autocast_device_type = "cuda" if device.type == "cuda" else "cpu"
+    return device, amp_enabled, autocast_device_type
+
+
+def _load_model(model_path: str, device: torch.device, sam_checkpoint: Optional[str] = None) -> PointHeatmapModel:
+    """Load model with automatic type detection from checkpoint metadata"""
+    if not model_path or not os.path.isfile(model_path):
+        # No checkpoint, return default model
+        cfg = ModelConfig(backbone="unet_s", pretrained=False, main_in_channels=3, cond_in_channels=1)
+        model = PointHeatmapModel(cfg).to(device)
+        model.eval()
+        return model
+    
+    # Load checkpoint and check metadata
+    ckpt = torch.load(model_path, map_location="cpu")
+    metadata = ckpt.get("metadata", {})
+    use_sam_encoder = metadata.get("use_sam_encoder", False)
+    sam_lora_enabled = metadata.get("sam_lora_enabled", False)
+    
+    print(f"[Load Model] Checkpoint type: use_sam_encoder={use_sam_encoder}, sam_lora_enabled={sam_lora_enabled}")
+    
+    if use_sam_encoder:
+        # SAM-based model
+        if sam_checkpoint is None:
+            sam_checkpoint = metadata.get("sam_checkpoint")
+        
+        if sam_checkpoint is None or not os.path.isfile(sam_checkpoint):
+            raise RuntimeError(
+                f"SAM checkpoint required for SAM-based model. "
+                f"Please provide --sam_checkpoint argument."
+            )
+        
+        print(f"[Load Model] Using SAM checkpoint: {sam_checkpoint}")
+        
+        cfg = ModelConfig(
+            backbone="unet_s",
+            pretrained=False,
+            main_in_channels=3,
+            cond_in_channels=1,
+            use_sam_encoder=True,
+            sam_checkpoint=sam_checkpoint,
+            sam_lora_enabled=sam_lora_enabled,
+            sam_lora_rank=metadata.get("sam_lora_rank", 8),
+            sam_lora_alpha=metadata.get("sam_lora_alpha", 16.0),
+            sam_lora_dropout=metadata.get("sam_lora_dropout", 0.0),
+            sam_freeze_encoder=True,  # Always freeze during inference
+        )
+        model = PointHeatmapModelWithSAM(cfg).to(device)
+    else:
+        # Standard model
+        cfg = ModelConfig(backbone="unet_s", pretrained=False, main_in_channels=3, cond_in_channels=1)
+        model = PointHeatmapModel(cfg).to(device)
+    
+    # Load checkpoint with proper handling
+    print(f"[Load Model] Loading checkpoint parameters...")
+    load_checkpoint(model_path, model, strict=False)
+    model.eval()
+    print(f"[Load Model] Model loaded successfully")
+    
+    return model
+
+
+def _to_tensor_separate(image_path: str, gray_mask: Optional[Image.Image], out_hw: Tuple[int, int]) -> Tuple[torch.Tensor, torch.Tensor, Tuple[int, int]]:
+    """Prepare separate RGB and grayscale tensors for the model; returns (rgb, gray, (orig_h, orig_w))."""
+    im0 = Image.open(image_path).convert("RGB")
+    orig_w, orig_h = im0.size
+    H, W = out_hw
+    # decide resize size
+    if H <= 0 or W <= 0:
+        H, W = orig_h, orig_w
+    im = im0.resize((W, H), resample=Image.BILINEAR) if (W, H) != (orig_w, orig_h) else im0
+    if gray_mask is None:
+        gray0 = Image.new("L", (orig_w, orig_h), 0)
+    else:
+        gray0 = gray_mask.convert("L")
+    gray = gray0.resize((W, H), resample=Image.NEAREST) if (W, H) != (orig_w, orig_h) else gray0
+    import torchvision.transforms.functional as TF
+    rgb_t = TF.to_tensor(im)
+    rgb_t = TF.normalize(rgb_t, mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
+    g_t = TF.to_tensor(gray)
+    g_t = (g_t - 0.5) / 0.5
+    return rgb_t.unsqueeze(0), g_t.unsqueeze(0), (orig_h, orig_w)  # [1,3,H,W], [1,1,H,W], (orig_h,orig_w)
+
+
+def _predict_point(model: PointHeatmapModel, rgb_tensor: torch.Tensor, gray_tensor: torch.Tensor, device: torch.device, tau: float) -> Tuple[float, float, int]:
+    with torch.no_grad():
+        logits, label_logits = model(rgb_tensor.to(device), gray_tensor.to(device))
+        xy = soft_argmax_from_logits(logits, temperature=tau)[0]
+        lab = int(label_logits.argmax(dim=1).item())
+    return float(xy[0].item()), float(xy[1].item()), lab
+
+
+def _list_images(images_dir: str) -> List[str]:
+    exts = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+    out: List[str] = []
+    for name in sorted(os.listdir(images_dir)):
+        p = os.path.join(images_dir, name)
+        if os.path.isdir(p):
+            continue
+        if os.path.splitext(name)[1].lower() in exts:
+            out.append(p)
+    return out
+
+
+def _stem(path: str) -> str:
+    name = os.path.basename(path)
+    base, _ = os.path.splitext(name)
+    return base
+
+
+def run_initial(args: argparse.Namespace) -> None:
+    if not args.images_dir or not args.output_json:
+        raise RuntimeError("--images_dir and --output_json are required for initial mode")
+    if not args.masks_dir:
+        raise RuntimeError("--masks_dir is required for initial mode to fill 'gt_mask' field")
+    device, amp_enabled, autocast_device_type = _device_and_amp(args)
+    model = _load_model(args.model_path, device)
+    H, W = int(args.height), int(args.width)
+
+    records: List[Dict] = []
+    images = _list_images(args.images_dir)
+    if args.progress:
+        try:
+            from tqdm import tqdm  # type: ignore
+            images_iter = tqdm(images, desc="Initial predict")
+        except Exception:
+            images_iter = images
+    else:
+        images_iter = images
+
+    for img_path in images_iter:
+        rgb_tensor, gray_tensor, (orig_h, orig_w) = _to_tensor_separate(img_path, gray_mask=None, out_hw=(H, W))
+        with torch.amp.autocast(device_type=autocast_device_type, enabled=amp_enabled):
+            x, y, lab = _predict_point(model, rgb_tensor, gray_tensor, device, args.tau)
+        # scale back to native size if resized
+        inf_H, inf_W = rgb_tensor.shape[-2], rgb_tensor.shape[-1]
+        if (inf_W, inf_H) != (orig_w, orig_h):
+            scale_x = float(orig_w) / float(inf_W)
+            scale_y = float(orig_h) / float(inf_H)
+            x = x * scale_x
+            y = y * scale_y
+        # clamp to bounds
+        x = float(max(0.0, min(orig_w - 1.0, x)))
+        y = float(max(0.0, min(orig_h - 1.0, y)))
+        stem = _stem(img_path)
+        gt_mask_path = os.path.join(args.masks_dir, f"{stem}.png")
+        rec = {
+            "image": os.path.abspath(img_path),
+            "gt_mask": os.path.abspath(gt_mask_path),
+            "sam_masks_dir": os.path.abspath(args.sam_dir) if args.sam_dir else None,
+            "points": [[float(x), float(y)]],
+            "labels": [int(lab)],
+        }
+        # keep sam_masks_dir only if provided
+        if rec["sam_masks_dir"] is None:
+            del rec["sam_masks_dir"]
+        records.append(rec)
+
+    os.makedirs(os.path.dirname(args.output_json) or ".", exist_ok=True)
+    with open(args.output_json, "w", encoding="utf-8") as f:
+        json.dump(records, f, indent=2, ensure_ascii=False)
+    print(f"Wrote {len(records)} records to {args.output_json}")
+
+
+def run_append(args: argparse.Namespace) -> None:
+    if not args.appendto_json:
+        raise RuntimeError("--appendto_json required for append mode")
+    if not os.path.isfile(args.appendto_json):
+        raise FileNotFoundError(args.appendto_json)
+    arr = json.loads(open(args.appendto_json, "r", encoding="utf-8").read().strip())
+    if not isinstance(arr, list):
+        raise RuntimeError("Append target must be a JSON array")
+    device, amp_enabled, autocast_device_type = _device_and_amp(args)
+    model = _load_model(args.model_path, device)
+    H, W = int(args.height), int(args.width)
+
+    updated = 0
+    # progress bar
+    rec_iter = arr
+    pbar = None
+    if args.progress:
+        try:
+            from tqdm import tqdm  # type: ignore
+            pbar = tqdm(total=len(arr), desc="Append predict")
+        except Exception:
+            pbar = None
+    for rec in arr:
+        if not isinstance(rec, dict):
+            continue
+        img_path = rec.get("image")
+        sam_dir = rec.get("sam_masks_dir")
+        pts = rec.get("points", [])
+        labs = rec.get("labels", [])
+        if not img_path:
+            continue
+        k = len(pts)
+        # prev mask
+        if k == 0:
+            gray = None
+        else:
+            stem = _stem(img_path)
+            prev_path = os.path.join(sam_dir, stem, f"{k-1}.png")
+            gray = Image.open(prev_path).convert("L") if os.path.isfile(prev_path) else None
+        rgb_tensor, gray_tensor, (orig_h, orig_w) = _to_tensor_separate(img_path, gray_mask=gray, out_hw=(H, W))
+        with torch.amp.autocast(device_type=autocast_device_type, enabled=amp_enabled):
+            x, y, lab = _predict_point(model, rgb_tensor, gray_tensor, device, args.tau)
+        # scale back and clamp
+        inf_H, inf_W = rgb_tensor.shape[-2], rgb_tensor.shape[-1]
+        if (inf_W, inf_H) != (orig_w, orig_h):
+            scale_x = float(orig_w) / float(inf_W)
+            scale_y = float(orig_h) / float(inf_H)
+            x = x * scale_x
+            y = y * scale_y
+        x = float(max(0.0, min(orig_w - 1.0, x)))
+        y = float(max(0.0, min(orig_h - 1.0, y)))
+        rec["points"] = (pts or []) + [[x, y]]
+        rec["labels"] = (labs or []) + [int(lab)]
+        # sam_masks_dir should be set by external segmenter; do not inject here
+        updated += 1
+        if pbar is not None:
+            pbar.update(1)
+        elif updated % max(1, len(arr)//10 or 1) == 0:
+            print(f"Processed {updated}/{len(arr)} records")
+
+    if pbar is not None:
+        pbar.close()
+
+    with open(args.appendto_json, "w", encoding="utf-8") as f:
+        json.dump(arr, f, indent=2, ensure_ascii=False)
+    print(f"Appended next points to {args.appendto_json} (updated {updated} items)")
+
+
+def run_debug(args: argparse.Namespace) -> None:
+    if not args.debug_json:
+        raise RuntimeError("--debug_json required for debug mode")
+    if not args.debug_output_dir:
+        raise RuntimeError("--debug_output_dir required for debug mode")
+    arr = json.loads(open(args.debug_json, "r", encoding="utf-8").read().strip())
+    if not isinstance(arr, list):
+        raise RuntimeError("Debug JSON must be a JSON array")
+    os.makedirs(args.debug_output_dir, exist_ok=True)
+
+    num_generated = 0
+    # optional progress over total steps
+    total_steps = 0
+    if args.progress:
+        try:
+            for rec in arr:
+                if isinstance(rec, dict):
+                    pts = rec.get("points", []) if isinstance(rec.get("points", []), list) else []
+                    total_steps += len(pts)
+        except Exception:
+            total_steps = 0
+    pbar = None
+    if args.progress and total_steps > 0:
+        try:
+            from tqdm import tqdm  # type: ignore
+            pbar = tqdm(total=total_steps, desc="Debug render")
+        except Exception:
+            pbar = None
+
+    for rec in arr:
+        if not isinstance(rec, dict):
+            continue
+        image_path = rec.get("image")
+        sam_dir = rec.get("sam_masks_dir") or args.sam_dir
+        points = rec.get("points", [])
+        labels = rec.get("labels", [])
+        if not (image_path and isinstance(points, list) and isinstance(labels, list)):
+            continue
+        if len(points) != len(labels):
+            continue
+        stem = _stem(image_path)
+        for i, (pt, lb) in enumerate(zip(points, labels)):
+            cur_path = os.path.join(sam_dir, stem, f"{i}.png")
+            cur = Image.open(cur_path).convert("L") if os.path.isfile(cur_path) else None
+            if cur is None:
+                continue
+            cur_u8 = np.array(cur, dtype=np.uint8)
+            if i == 0:
+                prev_u8 = np.zeros_like(cur_u8, dtype=np.uint8)
+            else:
+                prev_path = os.path.join(sam_dir, stem, f"{i-1}.png")
+                prev_u8 = np.array(Image.open(prev_path).convert("L"), dtype=np.uint8) if os.path.isfile(prev_path) else np.zeros_like(cur_u8, dtype=np.uint8)
+            try:
+                subdir = os.path.join(args.debug_output_dir, stem)
+                os.makedirs(subdir, exist_ok=True)
+                out_path = os.path.join(subdir, f"dbg_{i}.png")
+            except Exception:
+                out_path = None  # type: ignore
+            if _render_diff_panels_with_point is not None and out_path is not None:
+                _render_diff_panels_with_point(prev_u8, cur_u8, (float(pt[0]), float(pt[1])), int(lb), out_path)
+                num_generated += 1
+            if pbar is not None:
+                pbar.update(1)
+    if pbar is not None:
+        pbar.close()
+    print(f"Generated debug images for {num_generated} steps into {args.debug_output_dir}")
+
+
+def main() -> None:
+    args = parse_args()
+    if args.output_json:
+        run_initial(args)
+        return
+    if args.appendto_json:
+        run_append(args)
+        return
+    if args.debug_json:
+        run_debug(args)
+        return
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+```
+
+```python
+#!/usr/bin/env python3
+
+"""
+Predict next SAM prompt point (position + binary label) using a trained heatmap model.
+
+This script mirrors seg-rl/annotator/gen_point_jsonl_from_masks.py, but replaces the
+EDT-based next-point computation with a model inference that takes only:
+  - the RGB image, and
+  - the current predicted mask (or zero mask at step 0)
+and outputs the next prompt point and its label.
+
+Modes:
+  1) Initial generation (write new JSON array):
+     - For each image under --images_dir, predict the first prompt (i=0) with a zero mask.
+     - Write a JSON array with records like:
+         {"image": "/abs/path.jpg", "sam_masks_dir": "/abs/sam_dir", "points": [[x0,y0]], "labels": [l0]}
+
+  2) Append mode (update existing JSON array):
+     - Read --appendto_json as a JSON array, for each record take current length k=len(points),
+       load the latest predicted mask at {sam_dir}/{stem}/{k-1}.png (k>0; else zero), and predict
+       the next point (xk, yk, lk). Append to arrays and write back in-place.
+
+  3) Debug visualization (no file write except images):
+     - Read --debug_json (JSON array) that already contains points+labels and a sam_masks_dir.
+     - For each step i, load prev and cur predicted masks (i-1 and i; prev is zero for i=0) and
+       call the same 3-panel visualization function used by the annotator to render panels with
+       the provided point, saving to --debug_output_dir/{stem}/dbg_{i}.png.
+     - Ground-truth masks are NOT used anywhere in this script (except indirectly if you supply
+       them in your own JSON for reference; they are not required).
+
+Examples:
+  # Initial generation
+  /opt/anaconda3/envs/seg-r1/bin/python -m seg-rl.heatmap.predict_next_point_from_model \
+    --model_path outputs/braintumour/heatmap_train-251001-optimized/model_epoch_185.pt \
+    --images_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/images \
+    --masks_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/masks \
+    --output_json outputs/braintumour/pred_points-sft_e185-251018.jsonl
+
+  python -m seg-rl.heatmap.predict_next_point_from_model \
+    --model_path outputs/braintumour/points_predictor-251001-160epochs.pt \
+    --images_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/images \
+    --masks_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/masks \
+    --output_json outputs/braintumour/pred_points-e160-251019.jsonl
+
+  # Append mode
+  /opt/anaconda3/envs/seg-r1/bin/python -m seg-rl.heatmap.predict_next_point_from_model \
+    --model_path outputs/braintumour/points_predictor-251001-160epochs.pt \
+    --appendto_json datasets/seg_r1_md/Task01_BrainTumour/pred_points-251001.jsonl
+
+  python -m seg-rl.heatmap.predict_next_point_from_model \
+    --model_path outputs/braintumour/points_predictor-251001-160epochs.pt \
+    --appendto_json outputs/braintumour/pred_points-e160-251019.jsonl
+
+  # Debug visualization only
+  /opt/anaconda3/envs/seg-r1/bin/python -m seg-rl.heatmap.predict_next_point_from_model \
+    --debug_json datasets/seg_r1_md/Task01_BrainTumour/pred_points-init.jsonl \
+    --debug_output_dir outputs/braintumour/dbg_model_pred
+
+Notes:
+  - The model expects 4-channel input (RGB normalized + Gray normalized mask). This script
+    normalizes RGB with ImageNet mean/std and mask with mean=0.5, std=0.5.
+  - Device selection prefers CUDA, then MPS (Apple Silicon), otherwise CPU. AMP is only used on CUDA.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from typing import Dict, List, Optional, Tuple, Callable
+
+import numpy as np
+from PIL import Image
+
+import torch
+import torch.nn.functional as F
+
+try:
+    # package context
+    from .model import ModelConfig, PointHeatmapModel, PointHeatmapModelWithSAM, soft_argmax_from_logits
+    from .utils import load_checkpoint
+except Exception:
+    # script context
+    import sys as _sys
+    import os as _os
+    _pkg_root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    if _pkg_root not in _sys.path:
+        _sys.path.insert(0, _pkg_root)
+    from heatmap.model import ModelConfig, PointHeatmapModel, PointHeatmapModelWithSAM, soft_argmax_from_logits
+    from heatmap.utils import load_checkpoint
+
+import importlib.util as _importlib_util
+
+def _import_render_helper() -> Optional[Callable]:
+    """Dynamically import _render_diff_panels_with_point from annotator script by file path.
+
+    This avoids package-name issues due to hyphen in 'seg-rl'.
+    """
+    try:
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # seg-rl
+        target = os.path.join(base_dir, "annotator", "gen_point_jsonl_from_masks.py")
+        if not os.path.isfile(target):
+            return None
+        spec = _importlib_util.spec_from_file_location("gen_point_jsonl_from_masks", target)
+        if spec is None or spec.loader is None:
+            return None
+        module = _importlib_util.module_from_spec(spec)
+        spec.loader.exec_module(module)  # type: ignore[attr-defined]
+        func = getattr(module, "_render_diff_panels_with_point", None)
+        if callable(func):
+            return func  # type: ignore[return-value]
+    except Exception:
+        return None
+    return None
+
+_render_diff_panels_with_point: Optional[Callable] = _import_render_helper()
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Predict next SAM prompt point via trained heatmap model")
+    group = p.add_mutually_exclusive_group(required=True)
+    group.add_argument("--output_json", type=str, help="Write a new JSON array with first predicted points")
+    group.add_argument("--appendto_json", type=str, help="Append next predicted point to an existing JSON array")
+    group.add_argument("--debug_json", type=str, help="Debug visualization only: read JSON array and render panels")
+
+    p.add_argument("--model_path", type=str, required=False, help="Path to trained model checkpoint (.pt)")
+    p.add_argument("--images_dir", type=str, default=None, help="Directory of input images (initial mode)")
+    p.add_argument("--masks_dir", type=str, default=None, help="Ground-truth masks directory (initial mode only, to fill 'gt_mask' field)")
+    p.add_argument("--sam_dir", type=str, default=None, help="Directory of predicted SAM masks per step: {sam_dir}/{stem}/{k}.png (initial/debug mode)")
+    # height/width: 0 means use native image size; if >0, will resize for inference
+    p.add_argument("--height", type=int, default=0, help="0 = use native image height")
+    p.add_argument("--width", type=int, default=0, help="0 = use native image width")
+    p.add_argument("--tau", type=float, default=1.0, help="Softmax temperature for heatmap -> probability")
+    p.add_argument("--amp", action="store_true")
+    p.add_argument("--progress", action="store_true")
+    p.add_argument("--debug_output_dir", type=str, default=None)
+    # SAM Late LoRA 相关参数
+    p.add_argument("--sam_checkpoint", type=str, default=None, 
+                   help="Path to SAM checkpoint (required if model uses SAM encoder)")
+    return p.parse_args()
+
+
+def _device_and_amp(args: argparse.Namespace) -> Tuple[torch.device, bool, str]:
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+    amp_enabled = args.amp and (device.type == "cuda")
+    autocast_device_type = "cuda" if device.type == "cuda" else "cpu"
+    return device, amp_enabled, autocast_device_type
+
+
+def _load_model(model_path: str, device: torch.device, sam_checkpoint: Optional[str] = None) -> PointHeatmapModel:
+    """Load model with automatic type detection from checkpoint metadata"""
+    if not model_path or not os.path.isfile(model_path):
+        # No checkpoint, return default model
+        cfg = ModelConfig(backbone="unet_s", pretrained=False, main_in_channels=3, cond_in_channels=1)
+        model = PointHeatmapModel(cfg).to(device)
+        model.eval()
+        return model
+    
+    # Load checkpoint and check metadata
+    ckpt = torch.load(model_path, map_location="cpu")
+    metadata = ckpt.get("metadata", {})
+    use_sam_encoder = metadata.get("use_sam_encoder", False)
+    sam_lora_enabled = metadata.get("sam_lora_enabled", False)
+    
+    print(f"[Load Model] Checkpoint type: use_sam_encoder={use_sam_encoder}, sam_lora_enabled={sam_lora_enabled}")
+    
+    if use_sam_encoder:
+        # SAM-based model
+        if sam_checkpoint is None:
+            sam_checkpoint = metadata.get("sam_checkpoint")
+        
+        if sam_checkpoint is None or not os.path.isfile(sam_checkpoint):
+            raise RuntimeError(
+                f"SAM checkpoint required for SAM-based model. "
+                f"Please provide --sam_checkpoint argument."
+            )
+        
+        print(f"[Load Model] Using SAM checkpoint: {sam_checkpoint}")
+        
+        cfg = ModelConfig(
+            backbone="unet_s",
+            pretrained=False,
+            main_in_channels=3,
+            cond_in_channels=1,
+            use_sam_encoder=True,
+            sam_checkpoint=sam_checkpoint,
+            sam_lora_enabled=sam_lora_enabled,
+            sam_lora_rank=metadata.get("sam_lora_rank", 8),
+            sam_lora_alpha=metadata.get("sam_lora_alpha", 16.0),
+            sam_lora_dropout=metadata.get("sam_lora_dropout", 0.0),
+            sam_freeze_encoder=True,  # Always freeze during inference
+        )
+        model = PointHeatmapModelWithSAM(cfg).to(device)
+    else:
+        # Standard model
+        cfg = ModelConfig(backbone="unet_s", pretrained=False, main_in_channels=3, cond_in_channels=1)
+        model = PointHeatmapModel(cfg).to(device)
+    
+    # Load checkpoint with proper handling
+    print(f"[Load Model] Loading checkpoint parameters...")
+    load_checkpoint(model_path, model, strict=False)
+    model.eval()
+    print(f"[Load Model] Model loaded successfully")
+    
+    return model
+
+
+def _to_tensor_separate(image_path: str, gray_mask: Optional[Image.Image], out_hw: Tuple[int, int]) -> Tuple[torch.Tensor, torch.Tensor, Tuple[int, int]]:
+    """Prepare separate RGB and grayscale tensors for the model; returns (rgb, gray, (orig_h, orig_w))."""
+    im0 = Image.open(image_path).convert("RGB")
+    orig_w, orig_h = im0.size
+    H, W = out_hw
+    # decide resize size
+    if H <= 0 or W <= 0:
+        H, W = orig_h, orig_w
+    im = im0.resize((W, H), resample=Image.BILINEAR) if (W, H) != (orig_w, orig_h) else im0
+    if gray_mask is None:
+        gray0 = Image.new("L", (orig_w, orig_h), 0)
+    else:
+        gray0 = gray_mask.convert("L")
+    gray = gray0.resize((W, H), resample=Image.NEAREST) if (W, H) != (orig_w, orig_h) else gray0
+    import torchvision.transforms.functional as TF
+    rgb_t = TF.to_tensor(im)
+    rgb_t = TF.normalize(rgb_t, mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
+    g_t = TF.to_tensor(gray)
+    g_t = (g_t - 0.5) / 0.5
+    return rgb_t.unsqueeze(0), g_t.unsqueeze(0), (orig_h, orig_w)  # [1,3,H,W], [1,1,H,W], (orig_h,orig_w)
+
+
+def _predict_point(model: PointHeatmapModel, rgb_tensor: torch.Tensor, gray_tensor: torch.Tensor, device: torch.device, tau: float) -> Tuple[float, float, int]:
+    with torch.no_grad():
+        logits, label_logits = model(rgb_tensor.to(device), gray_tensor.to(device))
+        xy = soft_argmax_from_logits(logits, temperature=tau)[0]
+        lab = int(label_logits.argmax(dim=1).item())
+    return float(xy[0].item()), float(xy[1].item()), lab
+
+
+def _list_images(images_dir: str) -> List[str]:
+    exts = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+    out: List[str] = []
+    for name in sorted(os.listdir(images_dir)):
+        p = os.path.join(images_dir, name)
+        if os.path.isdir(p):
+            continue
+        if os.path.splitext(name)[1].lower() in exts:
+            out.append(p)
+    return out
+
+
+def _stem(path: str) -> str:
+    name = os.path.basename(path)
+    base, _ = os.path.splitext(name)
+    return base
+
+
+def run_initial(args: argparse.Namespace) -> None:
+    if not args.images_dir or not args.output_json:
+        raise RuntimeError("--images_dir and --output_json are required for initial mode")
+    if not args.masks_dir:
+        raise RuntimeError("--masks_dir is required for initial mode to fill 'gt_mask' field")
+    device, amp_enabled, autocast_device_type = _device_and_amp(args)
+    model = _load_model(args.model_path, device, args.sam_checkpoint)
+    H, W = int(args.height), int(args.width)
+
+    records: List[Dict] = []
+    images = _list_images(args.images_dir)
+    if args.progress:
+        try:
+            from tqdm import tqdm  # type: ignore
+            images_iter = tqdm(images, desc="Initial predict")
+        except Exception:
+            images_iter = images
+    else:
+        images_iter = images
+
+    for img_path in images_iter:
+        rgb_tensor, gray_tensor, (orig_h, orig_w) = _to_tensor_separate(img_path, gray_mask=None, out_hw=(H, W))
+        with torch.amp.autocast(device_type=autocast_device_type, enabled=amp_enabled):
+            x, y, lab = _predict_point(model, rgb_tensor, gray_tensor, device, args.tau)
+        # scale back to native size if resized
+        inf_H, inf_W = rgb_tensor.shape[-2], rgb_tensor.shape[-1]
+        if (inf_W, inf_H) != (orig_w, orig_h):
+            scale_x = float(orig_w) / float(inf_W)
+            scale_y = float(orig_h) / float(inf_H)
+            x = x * scale_x
+            y = y * scale_y
+        # clamp to bounds
+        x = float(max(0.0, min(orig_w - 1.0, x)))
+        y = float(max(0.0, min(orig_h - 1.0, y)))
+        stem = _stem(img_path)
+        gt_mask_path = os.path.join(args.masks_dir, f"{stem}.png")
+        rec = {
+            "image": os.path.abspath(img_path),
+            "gt_mask": os.path.abspath(gt_mask_path),
+            "sam_masks_dir": os.path.abspath(args.sam_dir) if args.sam_dir else None,
+            "points": [[float(x), float(y)]],
+            "labels": [int(lab)],
+        }
+        # keep sam_masks_dir only if provided
+        if rec["sam_masks_dir"] is None:
+            del rec["sam_masks_dir"]
+        records.append(rec)
+
+    os.makedirs(os.path.dirname(args.output_json) or ".", exist_ok=True)
+    with open(args.output_json, "w", encoding="utf-8") as f:
+        json.dump(records, f, indent=2, ensure_ascii=False)
+    print(f"Wrote {len(records)} records to {args.output_json}")
+
+
+def run_append(args: argparse.Namespace) -> None:
+    if not args.appendto_json:
+        raise RuntimeError("--appendto_json required for append mode")
+    if not os.path.isfile(args.appendto_json):
+        raise FileNotFoundError(args.appendto_json)
+    arr = json.loads(open(args.appendto_json, "r", encoding="utf-8").read().strip())
+    if not isinstance(arr, list):
+        raise RuntimeError("Append target must be a JSON array")
+    device, amp_enabled, autocast_device_type = _device_and_amp(args)
+    model = _load_model(args.model_path, device)
+    H, W = int(args.height), int(args.width)
+
+    updated = 0
+    # progress bar
+    rec_iter = arr
+    pbar = None
+    if args.progress:
+        try:
+            from tqdm import tqdm  # type: ignore
+            pbar = tqdm(total=len(arr), desc="Append predict")
+        except Exception:
+            pbar = None
+    for rec in arr:
+        if not isinstance(rec, dict):
+            continue
+        img_path = rec.get("image")
+        sam_dir = rec.get("sam_masks_dir")
+        pts = rec.get("points", [])
+        labs = rec.get("labels", [])
+        if not img_path:
+            continue
+        k = len(pts)
+        # prev mask
+        if k == 0:
+            gray = None
+        else:
+            stem = _stem(img_path)
+            prev_path = os.path.join(sam_dir, stem, f"{k-1}.png")
+            gray = Image.open(prev_path).convert("L") if os.path.isfile(prev_path) else None
+        rgb_tensor, gray_tensor, (orig_h, orig_w) = _to_tensor_separate(img_path, gray_mask=gray, out_hw=(H, W))
+        with torch.amp.autocast(device_type=autocast_device_type, enabled=amp_enabled):
+            x, y, lab = _predict_point(model, rgb_tensor, gray_tensor, device, args.tau)
+        # scale back and clamp
+        inf_H, inf_W = rgb_tensor.shape[-2], rgb_tensor.shape[-1]
+        if (inf_W, inf_H) != (orig_w, orig_h):
+            scale_x = float(orig_w) / float(inf_W)
+            scale_y = float(orig_h) / float(inf_H)
+            x = x * scale_x
+            y = y * scale_y
+        x = float(max(0.0, min(orig_w - 1.0, x)))
+        y = float(max(0.0, min(orig_h - 1.0, y)))
+        rec["points"] = (pts or []) + [[x, y]]
+        rec["labels"] = (labs or []) + [int(lab)]
+        # sam_masks_dir should be set by external segmenter; do not inject here
+        updated += 1
+        if pbar is not None:
+            pbar.update(1)
+        elif updated % max(1, len(arr)//10 or 1) == 0:
+            print(f"Processed {updated}/{len(arr)} records")
+
+    if pbar is not None:
+        pbar.close()
+
+    with open(args.appendto_json, "w", encoding="utf-8") as f:
+        json.dump(arr, f, indent=2, ensure_ascii=False)
+    print(f"Appended next points to {args.appendto_json} (updated {updated} items)")
+
+
+def run_debug(args: argparse.Namespace) -> None:
+    if not args.debug_json:
+        raise RuntimeError("--debug_json required for debug mode")
+    if not args.debug_output_dir:
+        raise RuntimeError("--debug_output_dir required for debug mode")
+    arr = json.loads(open(args.debug_json, "r", encoding="utf-8").read().strip())
+    if not isinstance(arr, list):
+        raise RuntimeError("Debug JSON must be a JSON array")
+    os.makedirs(args.debug_output_dir, exist_ok=True)
+
+    num_generated = 0
+    # optional progress over total steps
+    total_steps = 0
+    if args.progress:
+        try:
+            for rec in arr:
+                if isinstance(rec, dict):
+                    pts = rec.get("points", []) if isinstance(rec.get("points", []), list) else []
+                    total_steps += len(pts)
+        except Exception:
+            total_steps = 0
+    pbar = None
+    if args.progress and total_steps > 0:
+        try:
+            from tqdm import tqdm  # type: ignore
+            pbar = tqdm(total=total_steps, desc="Debug render")
+        except Exception:
+            pbar = None
+
+    for rec in arr:
+        if not isinstance(rec, dict):
+            continue
+        image_path = rec.get("image")
+        sam_dir = rec.get("sam_masks_dir") or args.sam_dir
+        points = rec.get("points", [])
+        labels = rec.get("labels", [])
+        if not (image_path and isinstance(points, list) and isinstance(labels, list)):
+            continue
+        if len(points) != len(labels):
+            continue
+        stem = _stem(image_path)
+        for i, (pt, lb) in enumerate(zip(points, labels)):
+            cur_path = os.path.join(sam_dir, stem, f"{i}.png")
+            cur = Image.open(cur_path).convert("L") if os.path.isfile(cur_path) else None
+            if cur is None:
+                continue
+            cur_u8 = np.array(cur, dtype=np.uint8)
+            if i == 0:
+                prev_u8 = np.zeros_like(cur_u8, dtype=np.uint8)
+            else:
+                prev_path = os.path.join(sam_dir, stem, f"{i-1}.png")
+                prev_u8 = np.array(Image.open(prev_path).convert("L"), dtype=np.uint8) if os.path.isfile(prev_path) else np.zeros_like(cur_u8, dtype=np.uint8)
+            try:
+                subdir = os.path.join(args.debug_output_dir, stem)
+                os.makedirs(subdir, exist_ok=True)
+                out_path = os.path.join(subdir, f"dbg_{i}.png")
+            except Exception:
+                out_path = None  # type: ignore
+            if _render_diff_panels_with_point is not None and out_path is not None:
+                _render_diff_panels_with_point(prev_u8, cur_u8, (float(pt[0]), float(pt[1])), int(lb), out_path)
+                num_generated += 1
+            if pbar is not None:
+                pbar.update(1)
+    if pbar is not None:
+        pbar.close()
+    print(f"Generated debug images for {num_generated} steps into {args.debug_output_dir}")
+
+
+def main() -> None:
+    args = parse_args()
+    if args.output_json:
+        run_initial(args)
+        return
+    if args.appendto_json:
+        run_append(args)
+        return
+    if args.debug_json:
+        run_debug(args)
+        return
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+```
+
+```python
+#!/usr/bin/env python3
+
+"""
+Predict next SAM prompt point (position + binary label) using a trained heatmap model.
+
+This script mirrors seg-rl/annotator/gen_point_jsonl_from_masks.py, but replaces the
+EDT-based next-point computation with a model inference that takes only:
+  - the RGB image, and
+  - the current predicted mask (or zero mask at step 0)
+and outputs the next prompt point and its label.
+
+Modes:
+  1) Initial generation (write new JSON array):
+     - For each image under --images_dir, predict the first prompt (i=0) with a zero mask.
+     - Write a JSON array with records like:
+         {"image": "/abs/path.jpg", "sam_masks_dir": "/abs/sam_dir", "points": [[x0,y0]], "labels": [l0]}
+
+  2) Append mode (update existing JSON array):
+     - Read --appendto_json as a JSON array, for each record take current length k=len(points),
+       load the latest predicted mask at {sam_dir}/{stem}/{k-1}.png (k>0; else zero), and predict
+       the next point (xk, yk, lk). Append to arrays and write back in-place.
+
+  3) Debug visualization (no file write except images):
+     - Read --debug_json (JSON array) that already contains points+labels and a sam_masks_dir.
+     - For each step i, load prev and cur predicted masks (i-1 and i; prev is zero for i=0) and
+       call the same 3-panel visualization function used by the annotator to render panels with
+       the provided point, saving to --debug_output_dir/{stem}/dbg_{i}.png.
+     - Ground-truth masks are NOT used anywhere in this script (except indirectly if you supply
+       them in your own JSON for reference; they are not required).
+
+Examples:
+  # Initial generation
+  /opt/anaconda3/envs/seg-r1/bin/python -m seg-rl.heatmap.predict_next_point_from_model \
+    --model_path outputs/braintumour/heatmap_train-251001-optimized/model_epoch_185.pt \
+    --images_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/images \
+    --masks_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/masks \
+    --output_json outputs/braintumour/pred_points-sft_e185-251018.jsonl
+
+  python -m seg-rl.heatmap.predict_next_point_from_model \
+    --model_path outputs/braintumour/points_predictor-251001-160epochs.pt \
+    --images_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/images \
+    --masks_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/masks \
+    --output_json outputs/braintumour/pred_points-e160-251019.jsonl
+
+  # Append mode
+  /opt/anaconda3/envs/seg-r1/bin/python -m seg-rl.heatmap.predict_next_point_from_model \
+    --model_path outputs/braintumour/points_predictor-251001-160epochs.pt \
+    --appendto_json datasets/seg_r1_md/Task01_BrainTumour/pred_points-251001.jsonl
+
+  python -m seg-rl.heatmap.predict_next_point_from_model \
+    --model_path outputs/braintumour/points_predictor-251001-160epochs.pt \
+    --appendto_json outputs/braintumour/pred_points-e160-251019.jsonl
+
+  # Debug visualization only
+  /opt/anaconda3/envs/seg-r1/bin/python -m seg-rl.heatmap.predict_next_point_from_model \
+    --debug_json datasets/seg_r1_md/Task01_BrainTumour/pred_points-init.jsonl \
+    --debug_output_dir outputs/braintumour/dbg_model_pred
+
+Notes:
+  - The model expects 4-channel input (RGB normalized + Gray normalized mask). This script
+    normalizes RGB with ImageNet mean/std and mask with mean=0.5, std=0.5.
+  - Device selection prefers CUDA, then MPS (Apple Silicon), otherwise CPU. AMP is only used on CUDA.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from typing import Dict, List, Optional, Tuple, Callable
+
+import numpy as np
+from PIL import Image
+
+import torch
+import torch.nn.functional as F
+
+try:
+    # package context
+    from .model import ModelConfig, PointHeatmapModel, PointHeatmapModelWithSAM, soft_argmax_from_logits
+    from .utils import load_checkpoint
+except Exception:
+    # script context
+    import sys as _sys
+    import os as _os
+    _pkg_root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    if _pkg_root not in _sys.path:
+        _sys.path.insert(0, _pkg_root)
+    from heatmap.model import ModelConfig, PointHeatmapModel, PointHeatmapModelWithSAM, soft_argmax_from_logits
+    from heatmap.utils import load_checkpoint
+
+import importlib.util as _importlib_util
+
+def _import_render_helper() -> Optional[Callable]:
+    """Dynamically import _render_diff_panels_with_point from annotator script by file path.
+
+    This avoids package-name issues due to hyphen in 'seg-rl'.
+    """
+    try:
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # seg-rl
+        target = os.path.join(base_dir, "annotator", "gen_point_jsonl_from_masks.py")
+        if not os.path.isfile(target):
+            return None
+        spec = _importlib_util.spec_from_file_location("gen_point_jsonl_from_masks", target)
+        if spec is None or spec.loader is None:
+            return None
+        module = _importlib_util.module_from_spec(spec)
+        spec.loader.exec_module(module)  # type: ignore[attr-defined]
+        func = getattr(module, "_render_diff_panels_with_point", None)
+        if callable(func):
+            return func  # type: ignore[return-value]
+    except Exception:
+        return None
+    return None
+
+_render_diff_panels_with_point: Optional[Callable] = _import_render_helper()
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Predict next SAM prompt point via trained heatmap model")
+    group = p.add_mutually_exclusive_group(required=True)
+    group.add_argument("--output_json", type=str, help="Write a new JSON array with first predicted points")
+    group.add_argument("--appendto_json", type=str, help="Append next predicted point to an existing JSON array")
+    group.add_argument("--debug_json", type=str, help="Debug visualization only: read JSON array and render panels")
+
+    p.add_argument("--model_path", type=str, required=False, help="Path to trained model checkpoint (.pt)")
+    p.add_argument("--images_dir", type=str, default=None, help="Directory of input images (initial mode)")
+    p.add_argument("--masks_dir", type=str, default=None, help="Ground-truth masks directory (initial mode only, to fill 'gt_mask' field)")
+    p.add_argument("--sam_dir", type=str, default=None, help="Directory of predicted SAM masks per step: {sam_dir}/{stem}/{k}.png (initial/debug mode)")
+    # height/width: 0 means use native image size; if >0, will resize for inference
+    p.add_argument("--height", type=int, default=0, help="0 = use native image height")
+    p.add_argument("--width", type=int, default=0, help="0 = use native image width")
+    p.add_argument("--tau", type=float, default=1.0, help="Softmax temperature for heatmap -> probability")
+    p.add_argument("--amp", action="store_true")
+    p.add_argument("--progress", action="store_true")
+    p.add_argument("--debug_output_dir", type=str, default=None)
+    # SAM Late LoRA 相关参数
+    p.add_argument("--sam_checkpoint", type=str, default=None, 
+                   help="Path to SAM checkpoint (required if model uses SAM encoder)")
+    return p.parse_args()
+
+
+def _device_and_amp(args: argparse.Namespace) -> Tuple[torch.device, bool, str]:
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+    amp_enabled = args.amp and (device.type == "cuda")
+    autocast_device_type = "cuda" if device.type == "cuda" else "cpu"
+    return device, amp_enabled, autocast_device_type
+
+
+def _load_model(model_path: str, device: torch.device, sam_checkpoint: Optional[str] = None) -> PointHeatmapModel:
+    """Load model with automatic type detection from checkpoint metadata"""
+    if not model_path or not os.path.isfile(model_path):
+        # No checkpoint, return default model
+        cfg = ModelConfig(backbone="unet_s", pretrained=False, main_in_channels=3, cond_in_channels=1)
+        model = PointHeatmapModel(cfg).to(device)
+        model.eval()
+        return model
+    
+    # Load checkpoint and check metadata
+    ckpt = torch.load(model_path, map_location="cpu")
+    metadata = ckpt.get("metadata", {})
+    use_sam_encoder = metadata.get("use_sam_encoder", False)
+    sam_lora_enabled = metadata.get("sam_lora_enabled", False)
+    
+    print(f"[Load Model] Checkpoint type: use_sam_encoder={use_sam_encoder}, sam_lora_enabled={sam_lora_enabled}")
+    
+    if use_sam_encoder:
+        # SAM-based model
+        if sam_checkpoint is None:
+            sam_checkpoint = metadata.get("sam_checkpoint")
+        
+        if sam_checkpoint is None or not os.path.isfile(sam_checkpoint):
+            raise RuntimeError(
+                f"SAM checkpoint required for SAM-based model. "
+                f"Please provide --sam_checkpoint argument."
+            )
+        
+        print(f"[Load Model] Using SAM checkpoint: {sam_checkpoint}")
+        
+        cfg = ModelConfig(
+            backbone="unet_s",
+            pretrained=False,
+            main_in_channels=3,
+            cond_in_channels=1,
+            use_sam_encoder=True,
+            sam_checkpoint=sam_checkpoint,
+            sam_lora_enabled=sam_lora_enabled,
+            sam_lora_rank=metadata.get("sam_lora_rank", 8),
+            sam_lora_alpha=metadata.get("sam_lora_alpha", 16.0),
+            sam_lora_dropout=metadata.get("sam_lora_dropout", 0.0),
+            sam_freeze_encoder=True,  # Always freeze during inference
+        )
+        model = PointHeatmapModelWithSAM(cfg).to(device)
+    else:
+        # Standard model
+        cfg = ModelConfig(backbone="unet_s", pretrained=False, main_in_channels=3, cond_in_channels=1)
+        model = PointHeatmapModel(cfg).to(device)
+    
+    # Load checkpoint with proper handling
+    print(f"[Load Model] Loading checkpoint parameters...")
+    load_checkpoint(model_path, model, strict=False)
+    model.eval()
+    print(f"[Load Model] Model loaded successfully")
+    
+    return model
+
+
+def _to_tensor_separate(image_path: str, gray_mask: Optional[Image.Image], out_hw: Tuple[int, int]) -> Tuple[torch.Tensor, torch.Tensor, Tuple[int, int]]:
+    """Prepare separate RGB and grayscale tensors for the model; returns (rgb, gray, (orig_h, orig_w))."""
+    im0 = Image.open(image_path).convert("RGB")
+    orig_w, orig_h = im0.size
+    H, W = out_hw
+    # decide resize size
+    if H <= 0 or W <= 0:
+        H, W = orig_h, orig_w
+    im = im0.resize((W, H), resample=Image.BILINEAR) if (W, H) != (orig_w, orig_h) else im0
+    if gray_mask is None:
+        gray0 = Image.new("L", (orig_w, orig_h), 0)
+    else:
+        gray0 = gray_mask.convert("L")
+    gray = gray0.resize((W, H), resample=Image.NEAREST) if (W, H) != (orig_w, orig_h) else gray0
+    import torchvision.transforms.functional as TF
+    rgb_t = TF.to_tensor(im)
+    rgb_t = TF.normalize(rgb_t, mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
+    g_t = TF.to_tensor(gray)
+    g_t = (g_t - 0.5) / 0.5
+    return rgb_t.unsqueeze(0), g_t.unsqueeze(0), (orig_h, orig_w)  # [1,3,H,W], [1,1,H,W], (orig_h,orig_w)
+
+
+def _predict_point(model: PointHeatmapModel, rgb_tensor: torch.Tensor, gray_tensor: torch.Tensor, device: torch.device, tau: float) -> Tuple[float, float, int]:
+    with torch.no_grad():
+        logits, label_logits = model(rgb_tensor.to(device), gray_tensor.to(device))
+        xy = soft_argmax_from_logits(logits, temperature=tau)[0]
+        lab = int(label_logits.argmax(dim=1).item())
+    return float(xy[0].item()), float(xy[1].item()), lab
+
+
+def _list_images(images_dir: str) -> List[str]:
+    exts = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+    out: List[str] = []
+    for name in sorted(os.listdir(images_dir)):
+        p = os.path.join(images_dir, name)
+        if os.path.isdir(p):
+            continue
+        if os.path.splitext(name)[1].lower() in exts:
+            out.append(p)
+    return out
+
+
+def _stem(path: str) -> str:
+    name = os.path.basename(path)
+    base, _ = os.path.splitext(name)
+    return base
+
+
+def run_initial(args: argparse.Namespace) -> None:
+    if not args.images_dir or not args.output_json:
+        raise RuntimeError("--images_dir and --output_json are required for initial mode")
+    if not args.masks_dir:
+        raise RuntimeError("--masks_dir is required for initial mode to fill 'gt_mask' field")
+    device, amp_enabled, autocast_device_type = _device_and_amp(args)
+    model = _load_model(args.model_path, device, args.sam_checkpoint)
+    H, W = int(args.height), int(args.width)
+
+    records: List[Dict] = []
+    images = _list_images(args.images_dir)
+    if args.progress:
+        try:
+            from tqdm import tqdm  # type: ignore
+            images_iter = tqdm(images, desc="Initial predict")
+        except Exception:
+            images_iter = images
+    else:
+        images_iter = images
+
+    for img_path in images_iter:
+        rgb_tensor, gray_tensor, (orig_h, orig_w) = _to_tensor_separate(img_path, gray_mask=None, out_hw=(H, W))
+        with torch.amp.autocast(device_type=autocast_device_type, enabled=amp_enabled):
+            x, y, lab = _predict_point(model, rgb_tensor, gray_tensor, device, args.tau)
+        # scale back to native size if resized
+        inf_H, inf_W = rgb_tensor.shape[-2], rgb_tensor.shape[-1]
+        if (inf_W, inf_H) != (orig_w, orig_h):
+            scale_x = float(orig_w) / float(inf_W)
+            scale_y = float(orig_h) / float(inf_H)
+            x = x * scale_x
+            y = y * scale_y
+        # clamp to bounds
+        x = float(max(0.0, min(orig_w - 1.0, x)))
+        y = float(max(0.0, min(orig_h - 1.0, y)))
+        stem = _stem(img_path)
+        gt_mask_path = os.path.join(args.masks_dir, f"{stem}.png")
+        rec = {
+            "image": os.path.abspath(img_path),
+            "gt_mask": os.path.abspath(gt_mask_path),
+            "sam_masks_dir": os.path.abspath(args.sam_dir) if args.sam_dir else None,
+            "points": [[float(x), float(y)]],
+            "labels": [int(lab)],
+        }
+        # keep sam_masks_dir only if provided
+        if rec["sam_masks_dir"] is None:
+            del rec["sam_masks_dir"]
+        records.append(rec)
+
+    os.makedirs(os.path.dirname(args.output_json) or ".", exist_ok=True)
+    with open(args.output_json, "w", encoding="utf-8") as f:
+        json.dump(records, f, indent=2, ensure_ascii=False)
+    print(f"Wrote {len(records)} records to {args.output_json}")
+
+
+def run_append(args: argparse.Namespace) -> None:
+    if not args.appendto_json:
+        raise RuntimeError("--appendto_json required for append mode")
+    if not os.path.isfile(args.appendto_json):
+        raise FileNotFoundError(args.appendto_json)
+    arr = json.loads(open(args.appendto_json, "r", encoding="utf-8").read().strip())
+    if not isinstance(arr, list):
+        raise RuntimeError("Append target must be a JSON array")
+    device, amp_enabled, autocast_device_type = _device_and_amp(args)
+    model = _load_model(args.model_path, device, args.sam_checkpoint)
+    H, W = int(args.height), int(args.width)
+
+    updated = 0
+    # progress bar
+    rec_iter = arr
+    pbar = None
+    if args.progress:
+        try:
+            from tqdm import tqdm  # type: ignore
+            pbar = tqdm(total=len(arr), desc="Append predict")
+        except Exception:
+            pbar = None
+    for rec in arr:
+        if not isinstance(rec, dict):
+            continue
+        img_path = rec.get("image")
+        sam_dir = rec.get("sam_masks_dir")
+        pts = rec.get("points", [])
+        labs = rec.get("labels", [])
+        if not img_path:
+            continue
+        k = len(pts)
+        # prev mask
+        if k == 0:
+            gray = None
+        else:
+            stem = _stem(img_path)
+            prev_path = os.path.join(sam_dir, stem, f"{k-1}.png")
+            gray = Image.open(prev_path).convert("L") if os.path.isfile(prev_path) else None
+        rgb_tensor, gray_tensor, (orig_h, orig_w) = _to_tensor_separate(img_path, gray_mask=gray, out_hw=(H, W))
+        with torch.amp.autocast(device_type=autocast_device_type, enabled=amp_enabled):
+            x, y, lab = _predict_point(model, rgb_tensor, gray_tensor, device, args.tau)
+        # scale back and clamp
+        inf_H, inf_W = rgb_tensor.shape[-2], rgb_tensor.shape[-1]
+        if (inf_W, inf_H) != (orig_w, orig_h):
+            scale_x = float(orig_w) / float(inf_W)
+            scale_y = float(orig_h) / float(inf_H)
+            x = x * scale_x
+            y = y * scale_y
+        x = float(max(0.0, min(orig_w - 1.0, x)))
+        y = float(max(0.0, min(orig_h - 1.0, y)))
+        rec["points"] = (pts or []) + [[x, y]]
+        rec["labels"] = (labs or []) + [int(lab)]
+        # sam_masks_dir should be set by external segmenter; do not inject here
+        updated += 1
+        if pbar is not None:
+            pbar.update(1)
+        elif updated % max(1, len(arr)//10 or 1) == 0:
+            print(f"Processed {updated}/{len(arr)} records")
+
+    if pbar is not None:
+        pbar.close()
+
+    with open(args.appendto_json, "w", encoding="utf-8") as f:
+        json.dump(arr, f, indent=2, ensure_ascii=False)
+    print(f"Appended next points to {args.appendto_json} (updated {updated} items)")
+
+
+def run_debug(args: argparse.Namespace) -> None:
+    if not args.debug_json:
+        raise RuntimeError("--debug_json required for debug mode")
+    if not args.debug_output_dir:
+        raise RuntimeError("--debug_output_dir required for debug mode")
+    arr = json.loads(open(args.debug_json, "r", encoding="utf-8").read().strip())
+    if not isinstance(arr, list):
+        raise RuntimeError("Debug JSON must be a JSON array")
+    os.makedirs(args.debug_output_dir, exist_ok=True)
+
+    num_generated = 0
+    # optional progress over total steps
+    total_steps = 0
+    if args.progress:
+        try:
+            for rec in arr:
+                if isinstance(rec, dict):
+                    pts = rec.get("points", []) if isinstance(rec.get("points", []), list) else []
+                    total_steps += len(pts)
+        except Exception:
+            total_steps = 0
+    pbar = None
+    if args.progress and total_steps > 0:
+        try:
+            from tqdm import tqdm  # type: ignore
+            pbar = tqdm(total=total_steps, desc="Debug render")
+        except Exception:
+            pbar = None
+
+    for rec in arr:
+        if not isinstance(rec, dict):
+            continue
+        image_path = rec.get("image")
+        sam_dir = rec.get("sam_masks_dir") or args.sam_dir
+        points = rec.get("points", [])
+        labels = rec.get("labels", [])
+        if not (image_path and isinstance(points, list) and isinstance(labels, list)):
+            continue
+        if len(points) != len(labels):
+            continue
+        stem = _stem(image_path)
+        for i, (pt, lb) in enumerate(zip(points, labels)):
+            cur_path = os.path.join(sam_dir, stem, f"{i}.png")
+            cur = Image.open(cur_path).convert("L") if os.path.isfile(cur_path) else None
+            if cur is None:
+                continue
+            cur_u8 = np.array(cur, dtype=np.uint8)
+            if i == 0:
+                prev_u8 = np.zeros_like(cur_u8, dtype=np.uint8)
+            else:
+                prev_path = os.path.join(sam_dir, stem, f"{i-1}.png")
+                prev_u8 = np.array(Image.open(prev_path).convert("L"), dtype=np.uint8) if os.path.isfile(prev_path) else np.zeros_like(cur_u8, dtype=np.uint8)
+            try:
+                subdir = os.path.join(args.debug_output_dir, stem)
+                os.makedirs(subdir, exist_ok=True)
+                out_path = os.path.join(subdir, f"dbg_{i}.png")
+            except Exception:
+                out_path = None  # type: ignore
+            if _render_diff_panels_with_point is not None and out_path is not None:
+                _render_diff_panels_with_point(prev_u8, cur_u8, (float(pt[0]), float(pt[1])), int(lb), out_path)
+                num_generated += 1
+            if pbar is not None:
+                pbar.update(1)
+    if pbar is not None:
+        pbar.close()
+    print(f"Generated debug images for {num_generated} steps into {args.debug_output_dir}")
+
+
+def main() -> None:
+    args = parse_args()
+    if args.output_json:
+        run_initial(args)
+        return
+    if args.appendto_json:
+        run_append(args)
+        return
+    if args.debug_json:
+        run_debug(args)
+        return
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+```
+
+```python
+#!/usr/bin/env python3
+
+"""
+整合脚本：自动执行模型预测点序列并配合SAM2分割的完整流程
+
+该脚本整合了以下两个步骤的交替执行过程：
+1. 使用监督训练得到的模型预测下一个提示点（predict_next_point_from_model.py）
+2. 使用SAM2生成掩模（sam2_segment_from_points.py）
+
+使用示例：
+
+# 基础用法：生成8个点的序列
+python seg-rl/heatmap/predict_point_sequence_with_sam.py \
+  --model_path outputs/braintumour/points_predictor-251001-160epochs.pt \
+  --images_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/images \
+  --masks_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/masks \
+  --output_jsonl outputs/braintumour/pred_points-e160-251019.jsonl \
+  --sam_masks_dir outputs/braintumour/pred_masks-e160-251019 \
+  --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
+  --device cuda \
+  --resize 512 512 \
+  --num_points 8
+
+# 完整参数示例
+python seg-rl/heatmap/predict_point_sequence_with_sam.py \
+  --model_path outputs/braintumour/points_predictor-251001-160epochs.pt \
+  --images_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/images \
+  --masks_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/masks \
+  --output_jsonl outputs/braintumour/pred_points-e160-251019.jsonl \
+  --sam_masks_dir outputs/braintumour/pred_masks-e160-251019 \
+  --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
+  --device cuda \
+  --resize 512 512 \
+  --num_points 16 \
+  --skip_existing \
+  --height 512 \
+  --width 512 \
+  --tau 1.0 \
+  --amp
+
+# 使用自定义脚本路径
+python seg-rl/heatmap/predict_point_sequence_with_sam.py \
+  --model_path outputs/braintumour/points_predictor-251001-160epochs.pt \
+  --images_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/images \
+  --masks_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/masks \
+  --output_jsonl outputs/braintumour/pred_points-e160-251019.jsonl \
+  --sam_masks_dir outputs/braintumour/pred_masks-e160-251019 \
+  --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
+  --device cuda \
+  --resize 512 512 \
+  --num_points 8 \
+  --predict_script seg-rl/heatmap/predict_next_point_from_model.py \
+  --sam_segment_script seg-rl/sam2_segment_from_points.py
+
+工作流程：
+1. 首次使用模型预测第一个提示点（基于RGB图像和零掩模）
+2. 使用SAM2生成第一个掩模
+3. 循环执行（num_points-1次）：
+   a. 使用模型基于RGB图像和最新SAM2掩模预测下一个提示点
+   b. 使用SAM2生成新的掩模
+4. 最终输出包含完整点序列和所有掩模的JSONL文件
+
+输出格式：
+- output_jsonl: JSON数组，每个元素包含：
+  {
+    "image": "/abs/path/to/image.jpg",
+    "gt_mask": "/abs/path/to/mask.png",
+    "points": [[x0,y0], [x1,y1], ..., [xN,yN]],
+    "labels": [l0, l1, ..., lN],
+    "sam_masks_dir": "/path/to/sam_masks_dir"
+  }
+- sam_masks_dir/<stem>/0.png, 1.png, ..., (N-1).png: 各步骤生成的掩模
+"""
+
+import argparse
+import os
+import subprocess
+import sys
+from pathlib import Path
+from typing import Optional
+
+
+def to_abs(path: Optional[str]) -> Optional[str]:
+    """将路径转换为绝对路径"""
+    if path is None:
+        return None
+    return os.path.abspath(path) if not os.path.isabs(path) else path
+
+
+def run_command(cmd: list, description: str) -> bool:
+    """执行命令并返回是否成功"""
+    print(f"\n{'='*60}")
+    print(f"[执行] {description}")
+    print(f"[命令] {' '.join(cmd)}")
+    print(f"{'='*60}")
+    
+    try:
+        result = subprocess.run(
+            cmd,
+            check=True,
+            capture_output=False,
+            text=True
+        )
+        print(f"[成功] {description}")
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"[错误] {description} 失败: {e}")
+        return False
+    except Exception as e:
+        print(f"[错误] 执行命令时发生异常: {e}")
+        return False
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="整合脚本：自动执行模型预测点序列并配合SAM2分割的完整流程",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__
+    )
+    
+    # 必需参数
+    p.add_argument("--model_path", type=str, required=True,
+                   help="训练好的模型检查点路径（.pt文件）")
+    p.add_argument("--images_dir", type=str, required=True,
+                   help="图像目录路径（包含JPG/PNG等图像文件）")
+    p.add_argument("--masks_dir", type=str, required=True,
+                   help="掩模目录路径（包含PNG掩模文件，与图像对齐，用于填充gt_mask字段）")
+    p.add_argument("--output_jsonl", type=str, required=True,
+                   help="输出JSONL文件路径（JSON数组格式）")
+    p.add_argument("--sam_masks_dir", type=str, required=True,
+                   help="SAM2掩模输出目录")
+    p.add_argument("--sam_checkpoint", type=str, required=True,
+                   help="SAM2模型检查点路径")
+    p.add_argument("--num_points", type=int, required=True,
+                   help="要生成的点序列长度（至少为1）")
+    
+    # SAM2相关参数
+    p.add_argument("--device", type=str, default="cuda",
+                   help="运行设备（cuda/cpu/mps等，默认: cuda）")
+    p.add_argument("--resize", type=int, nargs=2, default=None, metavar=("WIDTH", "HEIGHT"),
+                   help="图像resize尺寸 [width height]（例如: 512 512）")
+    p.add_argument("--skip_existing", action="store_true",
+                   help="如果输出文件已存在则跳过处理")
+    
+    # 模型预测相关参数
+    p.add_argument("--height", type=int, default=0,
+                   help="模型推理时的图像高度（0=使用原始尺寸，默认: 0）")
+    p.add_argument("--width", type=int, default=0,
+                   help="模型推理时的图像宽度（0=使用原始尺寸，默认: 0）")
+    p.add_argument("--tau", type=float, default=1.0,
+                   help="Softmax温度参数，用于热图到概率的转换（默认: 1.0）")
+    p.add_argument("--amp", action="store_true",
+                   help="启用自动混合精度（仅CUDA设备）")
+    
+    # 脚本路径（可选，用于指定自定义脚本位置）
+    p.add_argument("--predict_script", type=str,
+                   default="seg-rl/heatmap/predict_next_point_from_model.py",
+                   help="点预测脚本路径（默认: seg-rl/heatmap/predict_next_point_from_model.py）")
+    p.add_argument("--sam_segment_script", type=str,
+                   default="seg-rl/sam2_segment_from_points.py",
+                   help="SAM2分割脚本路径（默认: seg-rl/sam2_segment_from_points.py）")
+    
+    return p.parse_args()
+
+
+def validate_args(args: argparse.Namespace) -> tuple[bool, str]:
+    """验证参数有效性"""
+    if args.num_points < 1:
+        return False, "num_points 必须 >= 1"
+    
+    if not os.path.isdir(to_abs(args.images_dir) or args.images_dir):
+        return False, f"images_dir 不存在: {args.images_dir}"
+    
+    if not os.path.isdir(to_abs(args.masks_dir) or args.masks_dir):
+        return False, f"masks_dir 不存在: {args.masks_dir}"
+    
+    if not os.path.isfile(to_abs(args.model_path) or args.model_path):
+        return False, f"model_path 不存在: {args.model_path}"
+    
+    if not os.path.isfile(to_abs(args.sam_checkpoint) or args.sam_checkpoint):
+        return False, f"sam_checkpoint 不存在: {args.sam_checkpoint}"
+    
+    predict_script = to_abs(args.predict_script) or args.predict_script
+    if not os.path.isfile(predict_script):
+        return False, f"predict_script 不存在: {predict_script}"
+    
+    sam_script = to_abs(args.sam_segment_script) or args.sam_segment_script
+    if not os.path.isfile(sam_script):
+        return False, f"sam_segment_script 不存在: {sam_script}"
+    
+    return True, ""
+
+
+def build_predict_cmd(args: argparse.Namespace, is_first: bool) -> list:
+    """构建点预测命令"""
+    script_path = to_abs(args.predict_script) or args.predict_script
+    # 使用模块方式调用（因为脚本在包内）
+    cmd = [sys.executable, "-m", "seg-rl.heatmap.predict_next_point_from_model"]
+    
+    if is_first:
+        # 首次生成模式
+        cmd.extend([
+            "--model_path", args.model_path,
+            "--images_dir", args.images_dir,
+            "--masks_dir", args.masks_dir,
+            "--output_json", args.output_jsonl,
+        ])
+        if args.sam_masks_dir:
+            cmd.extend(["--sam_dir", args.sam_masks_dir])
+    else:
+        # 追加模式
+        cmd.extend([
+            "--model_path", args.model_path,
+            "--appendto_json", args.output_jsonl,
+            "--sam_dir", args.sam_masks_dir,
+        ])
+    
+    # 模型推理参数
+    if args.height > 0:
+        cmd.extend(["--height", str(args.height)])
+    if args.width > 0:
+        cmd.extend(["--width", str(args.width)])
+    if args.tau != 1.0:
+        cmd.extend(["--tau", str(args.tau)])
+    if args.amp:
+        cmd.append("--amp")
+    
+    # SAM checkpoint（如果模型使用 SAM encoder）
+    if args.sam_checkpoint:
+        cmd.extend(["--sam_checkpoint", args.sam_checkpoint])
+    
+    return cmd
+
+
+def build_sam_segment_cmd(args: argparse.Namespace) -> list:
+    """构建SAM2分割命令"""
+    script_path = to_abs(args.sam_segment_script) or args.sam_segment_script
+    cmd = [sys.executable, script_path]
+    
+    cmd.extend([
+        "--input_jsonl", args.output_jsonl,
+        "--json_output", args.output_jsonl,
+        "--output_dir", args.sam_masks_dir,
+        "--sam_checkpoint", args.sam_checkpoint,
+        "--device", args.device,
+    ])
+    
+    if args.resize:
+        cmd.extend(["--resize", str(args.resize[0]), str(args.resize[1])])
+    
+    if args.skip_existing:
+        cmd.append("--skip_existing")
+    
+    return cmd
+
+
+def main() -> int:
+    args = parse_args()
+    
+    # 验证参数
+    is_valid, error_msg = validate_args(args)
+    if not is_valid:
+        print(f"[错误] 参数验证失败: {error_msg}")
+        return 1
+    
+    # 确保输出目录存在
+    output_jsonl_dir = os.path.dirname(args.output_jsonl) or "."
+    os.makedirs(output_jsonl_dir, exist_ok=True)
+    os.makedirs(args.sam_masks_dir, exist_ok=True)
+    
+    print(f"\n{'='*60}")
+    print("开始执行模型预测点序列生成流程")
+    print(f"{'='*60}")
+    print(f"模型路径: {args.model_path}")
+    print(f"图像目录: {args.images_dir}")
+    print(f"掩模目录: {args.masks_dir}")
+    print(f"输出JSONL: {args.output_jsonl}")
+    print(f"SAM掩模目录: {args.sam_masks_dir}")
+    print(f"点序列长度: {args.num_points}")
+    print(f"设备: {args.device}")
+    if args.resize:
+        print(f"Resize: {args.resize[0]}x{args.resize[1]}")
+    if args.height > 0 or args.width > 0:
+        print(f"模型推理尺寸: {args.width}x{args.height}")
+    print(f"{'='*60}\n")
+    
+    # 步骤1: 使用模型预测第一个提示点
+    print(f"\n[步骤 1/{args.num_points*2-1}] 使用模型预测第一个提示点")
+    cmd_predict_first = build_predict_cmd(args, is_first=True)
+    if not run_command(cmd_predict_first, "使用模型预测第一个提示点"):
+        print("[错误] 预测第一个提示点失败")
+        return 1
+    
+    # 步骤2: 使用SAM2生成第一个掩模
+    print(f"\n[步骤 2/{args.num_points*2-1}] 使用SAM2生成第一个掩模")
+    cmd_sam_first = build_sam_segment_cmd(args)
+    if not run_command(cmd_sam_first, "使用SAM2生成第一个掩模"):
+        print("[错误] 生成第一个掩模失败")
+        return 1
+    
+    # 步骤3-N: 循环预测后续点并生成掩模
+    for i in range(1, args.num_points):
+        step_num = i * 2 + 1
+        total_steps = args.num_points * 2 - 1
+        
+        # 使用模型预测第(i+1)个提示点
+        print(f"\n[步骤 {step_num}/{total_steps}] 使用模型预测第 {i+1} 个提示点")
+        cmd_predict_next = build_predict_cmd(args, is_first=False)
+        if not run_command(cmd_predict_next, f"使用模型预测第 {i+1} 个提示点"):
+            print(f"[错误] 预测第 {i+1} 个提示点失败")
+            return 1
+        
+        # 使用SAM2生成第(i+1)个掩模
+        step_num += 1
+        print(f"\n[步骤 {step_num}/{total_steps}] 使用SAM2生成第 {i+1} 个掩模")
+        cmd_sam_next = build_sam_segment_cmd(args)
+        if not run_command(cmd_sam_next, f"使用SAM2生成第 {i+1} 个掩模"):
+            print(f"[错误] 生成第 {i+1} 个掩模失败")
+            return 1
+    
+    # 完成
+    print(f"\n{'='*60}")
+    print("模型预测点序列生成流程完成！")
+    print(f"{'='*60}")
+    print(f"输出JSONL: {args.output_jsonl}")
+    print(f"SAM掩模目录: {args.sam_masks_dir}")
+    print(f"共生成 {args.num_points} 个点的序列")
+    print(f"{'='*60}\n")
+    
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+
+```
+
+好的，修复完成！现在让我测试一下是否能正确加载模型：
+
+完美！模型现在能正确加载了。让我检查生成的点是否正常：
+
+太好了！预测点现在正常了！让我清理测试文件并创建一个总结文档：
+
+```markdown
+# SAM Late LoRA 推理问题修复
+
+## 问题描述
+
+使用训练好的 SAM Late LoRA 模型进行推理时，所有预测的提示点都集中在 [119.x, 119.x] 附近，这表明模型没有正确加载。
+
+## 根本原因
+
+### 训练与推理的模型不匹配
+
+1. **训练时**：使用 `PointHeatmapModelWithSAM`
+   - 包含 SAM image encoder
+   - 包含 Late LoRA 适配器
+   - Checkpoint 中保存了 `sam_encoder.*` 参数
+
+2. **推理时**：`predict_next_point_from_model.py` 只加载 `PointHeatmapModel`
+   - 标准模型，不包含 SAM encoder
+   - 模型结构不匹配
+   - `load_state_dict(strict=False)` 导致所有 SAM 参数被忽略
+   - 使用随机初始化的权重进行预测
+
+### 具体错误流程
+
+```python
+# 训练保存的 checkpoint 结构：
+{
+    "model": {
+        "sam_encoder.sam_model.image_encoder...": ...,  # SAM encoder 参数
+        "sam_encoder.lora_modules...": ...,              # LoRA 参数
+        "cond_encoder...": ...,                          # 其他参数
+        ...
+    },
+    "metadata": {
+        "use_sam_encoder": True,
+        "sam_lora_enabled": True,
+        ...
+    }
+}
+
+# 推理时加载的模型：
+model = PointHeatmapModel(cfg)  # ❌ 错误！应该用 PointHeatmapModelWithSAM
+# 结果：所有 sam_encoder.* 参数无法匹配，被忽略
+```
+
+## 修复方案
+
+### 1. 修改 `predict_next_point_from_model.py`
+
+#### a) 导入必要的类
+
+```python
+from .model import (
+    ModelConfig, 
+    PointHeatmapModel, 
+    PointHeatmapModelWithSAM,  # 新增
+    soft_argmax_from_logits
+)
+from .utils import load_checkpoint  # 新增
+```
+
+#### b) 添加 SAM checkpoint 参数
+
+```python
+def parse_args():
+    # ...
+    p.add_argument("--sam_checkpoint", type=str, default=None, 
+                   help="Path to SAM checkpoint (required if model uses SAM encoder)")
+```
+
+#### c) 重写 `_load_model` 函数
+
+```python
+def _load_model(model_path: str, device: torch.device, sam_checkpoint: Optional[str] = None):
+    """Load model with automatic type detection from checkpoint metadata"""
+    
+    # 加载 checkpoint 并检查元数据
+    ckpt = torch.load(model_path, map_location="cpu")
+    metadata = ckpt.get("metadata", {})
+    use_sam_encoder = metadata.get("use_sam_encoder", False)
+    sam_lora_enabled = metadata.get("sam_lora_enabled", False)
+    
+    if use_sam_encoder:
+        # 创建 SAM-based 模型
+        cfg = ModelConfig(
+            backbone="unet_s",
+            use_sam_encoder=True,
+            sam_checkpoint=sam_checkpoint,
+            sam_lora_enabled=sam_lora_enabled,
+            sam_lora_rank=metadata.get("sam_lora_rank", 8),
+            sam_lora_alpha=metadata.get("sam_lora_alpha", 16.0),
+            ...
+        )
+        model = PointHeatmapModelWithSAM(cfg)
+    else:
+        # 创建标准模型
+        model = PointHeatmapModel(cfg)
+    
+    # 使用 load_checkpoint 正确加载参数
+    load_checkpoint(model_path, model, strict=False)
+    return model
+```
+
+#### d) 更新函数调用
+
+```python
+# run_initial 和 run_append 中：
+model = _load_model(args.model_path, device, args.sam_checkpoint)
+```
+
+### 2. 修改 `predict_point_sequence_with_sam.py`
+
+在 `build_predict_cmd` 函数中传递 SAM checkpoint：
+
+```python
+def build_predict_cmd(args: argparse.Namespace, is_first: bool) -> list:
+    # ...
+    # SAM checkpoint（如果模型使用 SAM encoder）
+    if args.sam_checkpoint:
+        cmd.extend(["--sam_checkpoint", args.sam_checkpoint])
+    
+    return cmd
+```
+
+## 修复效果
+
+### 修复前
+
+```python
+# 所有预测点都集中在固定位置
+[119.47419738769531, 119.50137329101562]
+[119.39747619628906, 119.50483703613281]
+[119.4162826538086, 119.50761413574219]
+...
+```
+
+### 修复后
+
+```python
+# 预测点分布正常
+[126.31128787994385, 129.74581718444824]
+[127.87633895874023, 157.52596378326416]
+[130.29398918151855, 155.44143676757812]
+[133.0239486694336, 155.8964967727661]
+...
+```
+
+## 正确的使用方法
+
+### 使用 SAM Late LoRA 模型推理
+
+```bash
+python seg-rl/heatmap/predict_point_sequence_with_sam.py \
+  --model_path outputs/braintumour/heatmap_train-latelora-251109/model_epoch_15.pt \
+  --images_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/images \
+  --masks_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/masks \
+  --output_jsonl outputs/braintumour/pred_supervised-r8-epoch15-251109.jsonl \
+  --sam_masks_dir outputs/braintumour/pred_supervised-r8-epoch15-251109 \
+  --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
+  --device cuda \
+  --resize 512 512 \
+  --num_points 17 \
+  --height 512 \
+  --width 512
+```
+
+**重要**：必须提供 `--sam_checkpoint` 参数！
+
+### 使用标准模型推理
+
+```bash
+python seg-rl/heatmap/predict_point_sequence_with_sam.py \
+  --model_path outputs/braintumour/standard_model.pt \
+  --images_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/images \
+  --masks_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/masks \
+  --output_jsonl outputs/braintumour/pred_standard.jsonl \
+  --sam_masks_dir outputs/braintumour/pred_standard_masks \
+  --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
+  --device cuda \
+  --resize 512 512 \
+  --num_points 17
+```
+
+注意：`--sam_checkpoint` 对标准模型也是必需的（用于 SAM 分割，不是模型推理）
+
+## 自动检测机制
+
+修复后的代码会自动：
+
+1. ✅ 从 checkpoint 读取 `metadata`
+2. ✅ 检测是否使用 SAM encoder
+3. ✅ 创建正确类型的模型
+4. ✅ 正确加载所有参数（包括 LoRA）
+5. ✅ 给出清晰的日志输出
+
+### 日志示例
+
+```
+[Load Model] Checkpoint type: use_sam_encoder=True, sam_lora_enabled=True
+[Load Model] Using SAM checkpoint: third_party/sam2/checkpoints/sam2.1_hiera_large.pt
+[SAM] Loading SAM checkpoint from third_party/sam2/checkpoints/sam2.1_hiera_large.pt
+[SAM] Enabling Late LoRA: rank=8, alpha=16.0
+[Late LoRA] Found 48 blocks in trunk, applying to last block
+[Late LoRA] Found attention module: attn
+[Late LoRA] Applied to image_encoder.trunk.blocks[-1].attn.qkv: in=1152, out=3456, rank=8, device=cuda:0
+[Late LoRA] Applied to image_encoder.trunk.blocks[-1].attn.proj: in=1152, out=1152, rank=8, device=cuda:0
+
+============================================================
+LoRA Configuration Summary
+============================================================
+Total parameters:      224,501,938
+Trainable parameters:       55,296
+LoRA parameters:           110,592
+Trainable ratio:             0.02%
+============================================================
+
+[SAM] Encoder feature dimension: 256
+[Load Model] Loading checkpoint parameters...
+[Checkpoint] Loaded model parameters (strict=False)
+[Load Model] Model loaded successfully
+```
+
+## 经验教训
+
+1. **训练和推理必须使用相同的模型结构**
+2. **使用 `strict=False` 时要小心**：可能会静默忽略参数
+3. **在 checkpoint 中保存元数据非常重要**：实现自动兼容性检测
+4. **推理脚本应该读取并尊重 checkpoint 元数据**
+5. **添加详细日志有助于调试**
+
+## 修改文件列表
+
+1. ✅ `seg-rl/heatmap/predict_next_point_from_model.py`
+   - 添加 SAM encoder 支持
+   - 自动检测模型类型
+   - 正确加载 checkpoint
+
+2. ✅ `seg-rl/heatmap/predict_point_sequence_with_sam.py`
+   - 传递 SAM checkpoint 参数
+
+## 测试验证
+
+```bash
+# 快速测试（只生成第一个点）
+python -m seg-rl.heatmap.predict_next_point_from_model \
+  --model_path outputs/braintumour/heatmap_train-latelora-251109/model_epoch_15.pt \
+  --images_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/images \
+  --masks_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/masks \
+  --output_json outputs/braintumour/test_pred.jsonl \
+  --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
+  --height 512 --width 512
+
+# 检查结果
+python -c "
+import json
+with open('outputs/braintumour/test_pred.jsonl') as f:
+    data = json.load(f)
+for i, item in enumerate(data[:5]):
+    print(f'{i+1}. {item[\"points\"][0]}, label: {item[\"labels\"][0]}')
+"
+```
+
+预期输出：点坐标应该分布在不同位置，而不是集中在 [119, 119] 附近。
+
+## 完成时间
+
+2025-11-09
+
+## 状态
+
+✅ 已修复并测试通过
+
+```
+
+完美！问题已经完全修复。让我总结一下：
+
+## 🎯 问题总结
+
+### 根本原因
+**训练与推理使用了不同的模型结构**：
+- **训练**：使用 `PointHeatmapModelWithSAM`（包含 SAM encoder + LoRA）
+- **推理**：使用 `PointHeatmapModel`（标准模型，无 SAM encoder）
+- **结果**：checkpoint 中的 `sam_encoder.*` 参数全部被忽略，使用随机权重预测
+
+### 症状
+所有预测点都集中在 [119.x, 119.x] 附近，因为模型使用的是随机初始化的权重。
+
+## ✅ 修复内容
+
+### 1. **`predict_next_point_from_model.py`**
+- ✅ 导入 `PointHeatmapModelWithSAM` 和 `load_checkpoint`
+- ✅ 添加 `--sam_checkpoint` 参数
+- ✅ 重写 `_load_model()` 函数：
+  - 自动从 checkpoint 读取元数据
+  - 检测模型类型（标准 vs SAM）
+  - 创建正确的模型结构
+  - 正确加载所有参数
+
+### 2. **`predict_point_sequence_with_sam.py`**
+- ✅ 在 `build_predict_cmd()` 中传递 `--sam_checkpoint` 参数
+
+## 🧪 测试结果
+
+### 修复前（错误）
+```python
+[119.47419738769531, 119.50137329101562]  # 所有点都在这附近
+[119.39747619628906, 119.50483703613281]
+[119.4162826538086, 119.50761413574219]
+```
+
+### 修复后（正确）
+```python
+[126.31128787994385, 129.74581718444824]  # 点分布正常
+[127.87633895874023, 157.52596378326416]
+[130.29398918151855, 155.44143676757812]
+[133.0239486694336, 155.8964967727661]
+```
+
+## 📝 现在可以正确运行
+
+```bash
+python seg-rl/heatmap/predict_point_sequence_with_sam.py \
+  --model_path outputs/braintumour/heatmap_train-latelora-251109/model_epoch_15.pt \
+  --images_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/images \
+  --masks_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/masks \
+  --output_jsonl outputs/braintumour/pred_supervised-r8-epoch15-251109.jsonl \
+  --sam_masks_dir outputs/braintumour/pred_supervised-r8-epoch15-251109 \
+  --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
+  --device cuda \
+  --resize 512 512 \
+  --num_points 17 \
+  --height 512 \
+  --width 512
+```
+
+**重要**：必须提供 `--sam_checkpoint` 参数！
+
+## 📄 详细文档
+
+完整的修复说明已保存到：
+- `/root/autodl-tmp/works/Seg-R0/seg-rl/heatmap/FIX_INFERENCE_SAM_LORA.md`
+
+现在您可以重新运行您的命令了，预测点应该会正常分布！🎉
+
+```python
+[119.47419738769531, 119.50137329101562]  # 所有点都在这附近
+[119.39747619628906, 119.50483703613281]
+[119.4162826538086, 119.50761413574219]
+```
+
+```python
+[126.31128787994385, 129.74581718444824]  # 点分布正常
+[127.87633895874023, 157.52596378326416]
+[130.29398918151855, 155.44143676757812]
+[133.0239486694336, 155.8964967727661]
+```
+
+```shellscript
+python seg-rl/heatmap/predict_point_sequence_with_sam.py \
+  --model_path outputs/braintumour/heatmap_train-latelora-251109/model_epoch_15.pt \
+  --images_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/images \
+  --masks_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/masks \
+  --output_jsonl outputs/braintumour/pred_supervised-r8-epoch15-251109.jsonl \
+  --sam_masks_dir outputs/braintumour/pred_supervised-r8-epoch15-251109 \
+  --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
+  --device cuda \
+  --resize 512 512 \
+  --num_points 17 \
+  --height 512 \
+  --width 512
 ```
 

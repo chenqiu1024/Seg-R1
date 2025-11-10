@@ -225,6 +225,10 @@ def build_predict_cmd(args: argparse.Namespace, is_first: bool) -> list:
     if args.amp:
         cmd.append("--amp")
     
+    # SAM checkpoint（如果模型使用 SAM encoder）
+    if args.sam_checkpoint:
+        cmd.extend(["--sam_checkpoint", args.sam_checkpoint])
+    
     return cmd
 
 

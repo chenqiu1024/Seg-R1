@@ -86,7 +86,29 @@ python -m seg-rl.heatmap.train \
   --sam_lora_dropout 0.0 \
   --out_dir outputs/braintumour/sam_lora_train
 ```
-
+My sample:
+```
+python -m seg-rl.heatmap.train \
+  --jsonl outputs/braintumour/heuristic_251108.jsonl \
+  --sam_dir outputs/braintumour/sam_masks_heuristic \
+  --height 512 --width 512 --arch unet_s \
+  --loss kl --sigma 8.0 --tau 1.0 \
+  --eval_thresholds "10,15,20,25" \
+  --label_loss_weight 0.2 \
+  --batch_size 16 --epochs 100 --amp \
+  --lr 1e-4 --weight_decay 1e-4 \
+  --use_sam_encoder \
+  --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
+  --sam_lora_enabled \
+  --sam_lora_rank 8 \
+  --sam_lora_alpha 16.0 \
+  --sam_lora_dropout 0.0 \
+  --grad_clip 1.0 \
+  --lr_scheduler cosine \
+  --val_ratio 0.1 --test_ratio 0.1 --seed 42 \
+  --save_every 5 --save_steps 500 --progress --auto_resume \
+  --out_dir outputs/braintumour/heatmap_train-latelora-251109
+```
 ### 4. LoRA 参数调优
 
 可以为 LoRA 参数使用独立的学习率：

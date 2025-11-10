@@ -77,7 +77,8 @@ import torch.nn.functional as F
 
 try:
     # package context
-    from .model import ModelConfig, PointHeatmapModel, soft_argmax_from_logits
+    from .model import ModelConfig, PointHeatmapModel, PointHeatmapModelWithSAM, soft_argmax_from_logits
+    from .utils import load_checkpoint
 except Exception:
     # script context
     import sys as _sys
@@ -85,7 +86,8 @@ except Exception:
     _pkg_root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
     if _pkg_root not in _sys.path:
         _sys.path.insert(0, _pkg_root)
-    from heatmap.model import ModelConfig, PointHeatmapModel, soft_argmax_from_logits
+    from heatmap.model import ModelConfig, PointHeatmapModel, PointHeatmapModelWithSAM, soft_argmax_from_logits
+    from heatmap.utils import load_checkpoint
 
 import importlib.util as _importlib_util
 
@@ -132,6 +134,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--amp", action="store_true")
     p.add_argument("--progress", action="store_true")
     p.add_argument("--debug_output_dir", type=str, default=None)
+    # SAM Late LoRA 相关参数
+    p.add_argument("--sam_checkpoint", type=str, default=None, 
+                   help="Path to SAM checkpoint (required if model uses SAM encoder)")
     return p.parse_args()
 
 
@@ -147,14 +152,61 @@ def _device_and_amp(args: argparse.Namespace) -> Tuple[torch.device, bool, str]:
     return device, amp_enabled, autocast_device_type
 
 
-def _load_model(model_path: str, device: torch.device) -> PointHeatmapModel:
-    cfg = ModelConfig(backbone="unet_s", pretrained=False, main_in_channels=3, cond_in_channels=1)
-    model = PointHeatmapModel(cfg).to(device)
-    ckpt = torch.load(model_path, map_location="cpu") if model_path and os.path.isfile(model_path) else None
-    if ckpt is not None:
-        sd = ckpt.get("model", ckpt)
-        model.load_state_dict(sd, strict=False)
+def _load_model(model_path: str, device: torch.device, sam_checkpoint: Optional[str] = None) -> PointHeatmapModel:
+    """Load model with automatic type detection from checkpoint metadata"""
+    if not model_path or not os.path.isfile(model_path):
+        # No checkpoint, return default model
+        cfg = ModelConfig(backbone="unet_s", pretrained=False, main_in_channels=3, cond_in_channels=1)
+        model = PointHeatmapModel(cfg).to(device)
+        model.eval()
+        return model
+    
+    # Load checkpoint and check metadata
+    ckpt = torch.load(model_path, map_location="cpu")
+    metadata = ckpt.get("metadata", {})
+    use_sam_encoder = metadata.get("use_sam_encoder", False)
+    sam_lora_enabled = metadata.get("sam_lora_enabled", False)
+    
+    print(f"[Load Model] Checkpoint type: use_sam_encoder={use_sam_encoder}, sam_lora_enabled={sam_lora_enabled}")
+    
+    if use_sam_encoder:
+        # SAM-based model
+        if sam_checkpoint is None:
+            sam_checkpoint = metadata.get("sam_checkpoint")
+        
+        if sam_checkpoint is None or not os.path.isfile(sam_checkpoint):
+            raise RuntimeError(
+                f"SAM checkpoint required for SAM-based model. "
+                f"Please provide --sam_checkpoint argument."
+            )
+        
+        print(f"[Load Model] Using SAM checkpoint: {sam_checkpoint}")
+        
+        cfg = ModelConfig(
+            backbone="unet_s",
+            pretrained=False,
+            main_in_channels=3,
+            cond_in_channels=1,
+            use_sam_encoder=True,
+            sam_checkpoint=sam_checkpoint,
+            sam_lora_enabled=sam_lora_enabled,
+            sam_lora_rank=metadata.get("sam_lora_rank", 8),
+            sam_lora_alpha=metadata.get("sam_lora_alpha", 16.0),
+            sam_lora_dropout=metadata.get("sam_lora_dropout", 0.0),
+            sam_freeze_encoder=True,  # Always freeze during inference
+        )
+        model = PointHeatmapModelWithSAM(cfg).to(device)
+    else:
+        # Standard model
+        cfg = ModelConfig(backbone="unet_s", pretrained=False, main_in_channels=3, cond_in_channels=1)
+        model = PointHeatmapModel(cfg).to(device)
+    
+    # Load checkpoint with proper handling
+    print(f"[Load Model] Loading checkpoint parameters...")
+    load_checkpoint(model_path, model, strict=False)
     model.eval()
+    print(f"[Load Model] Model loaded successfully")
+    
     return model
 
 
@@ -212,7 +264,7 @@ def run_initial(args: argparse.Namespace) -> None:
     if not args.masks_dir:
         raise RuntimeError("--masks_dir is required for initial mode to fill 'gt_mask' field")
     device, amp_enabled, autocast_device_type = _device_and_amp(args)
-    model = _load_model(args.model_path, device)
+    model = _load_model(args.model_path, device, args.sam_checkpoint)
     H, W = int(args.height), int(args.width)
 
     records: List[Dict] = []
@@ -269,7 +321,7 @@ def run_append(args: argparse.Namespace) -> None:
     if not isinstance(arr, list):
         raise RuntimeError("Append target must be a JSON array")
     device, amp_enabled, autocast_device_type = _device_and_amp(args)
-    model = _load_model(args.model_path, device)
+    model = _load_model(args.model_path, device, args.sam_checkpoint)
     H, W = int(args.height), int(args.width)
 
     updated = 0

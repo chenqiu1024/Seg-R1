@@ -221,61 +221,57 @@ def apply_late_lora_to_sam_encoder(
     # 获取 image encoder
     image_encoder = sam_model.image_encoder
     
-    # SAM2 使用 Hiera 架构，blocks 在 image_encoder.trunk.stages 中
-    # 最后一个 stage 包含最后的 transformer blocks
-    if hasattr(image_encoder, "trunk") and hasattr(image_encoder.trunk, "stages"):
-        stages = image_encoder.trunk.stages
-        if len(stages) > 0:
-            last_stage = stages[-1]
+    # SAM2 Hiera 架构：image_encoder.trunk.blocks 是一个 ModuleList
+    # blocks 直接包含所有 transformer blocks（不是分 stages）
+    if hasattr(image_encoder, "trunk") and hasattr(image_encoder.trunk, "blocks"):
+        blocks = image_encoder.trunk.blocks
+        if len(blocks) > 0:
+            # 只在最后一个 block 中添加 LoRA（Late LoRA）
+            last_block = blocks[-1]
+            print(f"[Late LoRA] Found {len(blocks)} blocks in trunk, applying to last block")
             
-            # 在最后一个 stage 的所有 blocks 中添加 LoRA
-            # 或者只在最后一个 block 中添加（取决于论文的具体实现）
-            if hasattr(last_stage, "blocks") and len(last_stage.blocks) > 0:
-                # 只在最后一个 block 中添加 LoRA（Late LoRA）
-                last_block = last_stage.blocks[-1]
-                
-                # 查找注意力模块
-                for name, module in last_block.named_modules():
-                    # SAM2 Hiera 的注意力模块通常叫 attn
-                    if "attn" in name and hasattr(module, "qkv"):
-                        # Hiera 使用融合的 QKV 投影
-                        print(f"[Late LoRA] Found attention module: {name}")
-                        
-                        # 为 QKV 和 proj 添加 LoRA
-                        for subname, submodule in module.named_children():
-                            if isinstance(submodule, nn.Linear) and subname in ["qkv", "proj"]:
+            # 查找注意力模块
+            lora_applied = False
+            for name, module in last_block.named_modules():
+                # SAM2 Hiera 的注意力模块通常叫 attn
+                if name == "attn" or name.endswith(".attn"):
+                    print(f"[Late LoRA] Found attention module: {name}")
+                    
+                    # 为 QKV 和 proj 添加 LoRA
+                    for subname in ["qkv", "proj"]:
+                        if hasattr(module, subname):
+                            submodule = getattr(module, subname)
+                            if isinstance(submodule, nn.Linear):
+                                # 获取原始模块的设备
+                                device = next(submodule.parameters()).device
+                                
                                 lora_linear = LoRALinear(
                                     submodule, 
                                     rank=rank, 
                                     alpha=alpha, 
                                     dropout=dropout
                                 )
+                                
+                                # 将 LoRA 层移动到相同设备
+                                lora_linear = lora_linear.to(device)
+                                
                                 setattr(module, subname, lora_linear)
-                                full_name = f"image_encoder.trunk.stages[-1].blocks[-1].{name}.{subname}"
+                                full_name = f"image_encoder.trunk.blocks[-1].{name}.{subname}"
                                 replaced_modules[full_name] = lora_linear
                                 print(f"[Late LoRA] Applied to {full_name}: "
-                                      f"in={submodule.in_features}, out={submodule.out_features}, rank={rank}")
-            else:
-                print("[Late LoRA] Warning: No blocks found in last stage")
+                                      f"in={submodule.in_features}, out={submodule.out_features}, rank={rank}, device={device}")
+                                lora_applied = True
+            
+            if not lora_applied:
+                print("[Late LoRA] Warning: No attention modules found in last block")
+                print(f"[Late LoRA] Last block modules: {[n for n, _ in last_block.named_modules()]}")
+        else:
+            print("[Late LoRA] Warning: No blocks found in trunk")
     else:
-        print("[Late LoRA] Warning: SAM model structure not recognized, trying alternative path")
-        
-        # 备用方案：直接查找 encoder 中的 blocks
-        if hasattr(image_encoder, "blocks"):
-            blocks = image_encoder.blocks
-            if len(blocks) > 0:
-                last_block = blocks[-1]
-                for name, module in last_block.named_modules():
-                    if hasattr(module, "qkv") and isinstance(module.qkv, nn.Linear):
-                        lora_linear = LoRALinear(
-                            module.qkv,
-                            rank=rank,
-                            alpha=alpha,
-                            dropout=dropout
-                        )
-                        module.qkv = lora_linear
-                        replaced_modules[f"image_encoder.blocks[-1].{name}.qkv"] = lora_linear
-                        print(f"[Late LoRA] Applied to blocks[-1].{name}.qkv")
+        print("[Late LoRA] Warning: SAM model structure not recognized")
+        print(f"[Late LoRA] Available encoder attributes: {[attr for attr in dir(image_encoder) if not attr.startswith('_')]}")
+        if hasattr(image_encoder, "trunk"):
+            print(f"[Late LoRA] Available trunk attributes: {[attr for attr in dir(image_encoder.trunk) if not attr.startswith('_')]}")
     
     if len(replaced_modules) == 0:
         print("[Late LoRA] Warning: No modules were replaced. SAM model may have unexpected structure.")
@@ -297,8 +293,12 @@ def get_lora_parameters(model: nn.Module) -> List[nn.Parameter]:
     """
     lora_params = []
     for module in model.modules():
-        if isinstance(module, (LoRALayer, LoRALinear)):
+        if isinstance(module, LoRALinear):
+            # LoRALinear 有 lora 属性（LoRALayer 实例）
             lora_params.extend(module.lora.parameters())
+        elif isinstance(module, LoRALayer):
+            # LoRALayer 直接包含参数
+            lora_params.extend(module.parameters())
     return lora_params
 
 
@@ -321,8 +321,13 @@ def count_lora_parameters(model: nn.Module) -> Dict[str, int]:
             trainable_params += param.numel()
     
     for module in model.modules():
-        if isinstance(module, (LoRALayer, LoRALinear)):
+        if isinstance(module, LoRALinear):
+            # LoRALinear 有 lora 属性（LoRALayer 实例）
             for param in module.lora.parameters():
+                lora_params += param.numel()
+        elif isinstance(module, LoRALayer):
+            # LoRALayer 直接包含参数
+            for param in module.parameters():
                 lora_params += param.numel()
     
     return {

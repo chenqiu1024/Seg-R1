@@ -491,8 +491,24 @@ class SAMEncoderWrapper(nn.Module):
             # SAM 期望输入为 1024x1024
             dummy = torch.randn(1, 3, 1024, 1024, device=next(self.image_encoder.parameters()).device)
             feat = self.image_encoder(dummy)
+            
+            # SAM2 可能返回 dict，需要提取实际的特征张量
+            if isinstance(feat, dict):
+                # 通常在 'vision_features' 或类似的键中
+                if 'vision_features' in feat:
+                    feat = feat['vision_features']
+                elif 'high_res_feats' in feat:
+                    feat = feat['high_res_feats']
+                else:
+                    # 取第一个张量值
+                    for v in feat.values():
+                        if isinstance(v, torch.Tensor) and v.ndim == 4:
+                            feat = v
+                            break
+            
             if isinstance(feat, (list, tuple)):
                 feat = feat[0]
+            
             return feat.shape[1]  # [B, C, H, W] -> C
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -511,6 +527,20 @@ class SAMEncoderWrapper(nn.Module):
         
         # 提取特征
         feat = self.image_encoder(x)
+        
+        # SAM2 可能返回 dict，需要提取实际的特征张量
+        if isinstance(feat, dict):
+            # 通常在 'vision_features' 或类似的键中
+            if 'vision_features' in feat:
+                feat = feat['vision_features']
+            elif 'high_res_feats' in feat:
+                feat = feat['high_res_feats']
+            else:
+                # 取第一个张量值
+                for v in feat.values():
+                    if isinstance(v, torch.Tensor) and v.ndim == 4:
+                        feat = v
+                        break
         
         # 如果输出是多尺度特征，取第一个
         if isinstance(feat, (list, tuple)):
