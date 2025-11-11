@@ -25,9 +25,10 @@ def save_checkpoint(
     path: str, 
     model: nn.Module, 
     optimizer: torch.optim.Optimizer, 
-    scaler: torch.cuda.amp.GradScaler, 
+    scaler: torch.cuda.amp.GradScaler,
     epoch: int, 
     step: int,
+    scheduler: torch.optim.lr_scheduler._LRScheduler | None = None,
     metadata: Dict | None = None,
 ) -> None:
     """保存 checkpoint，包含模型元数据
@@ -39,6 +40,7 @@ def save_checkpoint(
         scaler: GradScaler
         epoch: 当前 epoch
         step: 当前步数
+        scheduler: 学习率调度器（可选）
         metadata: 模型元数据，如 {"use_sam_encoder": True, "sam_lora_enabled": True, ...}
     """
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -67,6 +69,7 @@ def save_checkpoint(
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "scaler": scaler.state_dict() if scaler is not None else None,
+        "scheduler": scheduler.state_dict() if scheduler is not None else None,
         "epoch": epoch,
         "step": step,
         "metadata": metadata,
@@ -79,6 +82,7 @@ def load_checkpoint(
     model: nn.Module, 
     optimizer: torch.optim.Optimizer | None = None, 
     scaler: torch.cuda.amp.GradScaler | None = None,
+    scheduler: torch.optim.lr_scheduler._LRScheduler | None = None,
     strict: bool = True,
 ) -> Checkpoint:
     """加载 checkpoint，支持向后兼容
@@ -88,6 +92,7 @@ def load_checkpoint(
         model: 目标模型
         optimizer: 优化器（可选）
         scaler: GradScaler（可选）
+        scheduler: 学习率调度器（可选）
         strict: 是否严格匹配模型参数
         
     Returns:
@@ -146,6 +151,16 @@ def load_checkpoint(
             print("[Checkpoint] Loaded scaler state")
         except Exception as e:
             print(f"[Warning] Failed to load scaler state: {e}")
+    
+    # 加载调度器状态
+    if scheduler is not None and "scheduler" in ckpt and ckpt["scheduler"] is not None:
+        try:
+            scheduler.load_state_dict(ckpt["scheduler"])
+            print("[Checkpoint] Loaded scheduler state")
+        except Exception as e:
+            print(f"[Warning] Failed to load scheduler state: {e}")
+    elif scheduler is not None and "scheduler" not in ckpt:
+        print("[Info] Checkpoint does not contain scheduler state (backward compatibility)")
     
     return Checkpoint(
         model=ckpt.get("model", {}), 

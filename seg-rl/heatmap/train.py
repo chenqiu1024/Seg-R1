@@ -334,7 +334,7 @@ def main() -> None:
     tried_auto = False
     if args.resume and os.path.isfile(args.resume):
         from .utils import load_checkpoint
-        ckpt = load_checkpoint(args.resume, model, optimizer, scaler)
+        ckpt = load_checkpoint(args.resume, model, optimizer, scaler, scheduler)
         start_epoch = ckpt.epoch
         global_step = ckpt.step
         print(f"[Resume] Loaded checkpoint from {args.resume} (epoch={start_epoch}, step={global_step})")
@@ -343,7 +343,7 @@ def main() -> None:
         if os.path.isfile(auto_path):
             tried_auto = True
             from .utils import load_checkpoint
-            ckpt = load_checkpoint(auto_path, model, optimizer, scaler)
+            ckpt = load_checkpoint(auto_path, model, optimizer, scaler, scheduler)
             start_epoch = ckpt.epoch
             global_step = ckpt.step
             print(f"[Auto-Resume] Loaded checkpoint from {auto_path} (epoch={start_epoch}, step={global_step})")
@@ -550,10 +550,10 @@ def main() -> None:
             # Periodic checkpoint
             if args.save_steps > 0 and (global_step % args.save_steps == 0):
                 save_path = os.path.join(args.out_dir, f"step_{global_step}.pt")
-                save_checkpoint(save_path, model, optimizer, scaler, epoch=epoch + 1, step=global_step)
+                save_checkpoint(save_path, model, optimizer, scaler, epoch=epoch + 1, step=global_step, scheduler=scheduler)
                 # also update last.pt symlink-like copy
                 last_path = os.path.join(args.out_dir, "last.pt")
-                save_checkpoint(last_path, model, optimizer, scaler, epoch=epoch + 1, step=global_step)
+                save_checkpoint(last_path, model, optimizer, scaler, epoch=epoch + 1, step=global_step, scheduler=scheduler)
 
             # Progress output
             if _tqdm is not None:
@@ -591,9 +591,9 @@ def main() -> None:
         # Save epoch checkpoint and update last.pt
         if ((epoch + 1) % max(1, args.save_every)) == 0:
             save_path = os.path.join(args.out_dir, f"model_epoch_{epoch+1}.pt")
-            save_checkpoint(save_path, model, optimizer, scaler, epoch=epoch+1, step=global_step)
+            save_checkpoint(save_path, model, optimizer, scaler, epoch=epoch+1, step=global_step, scheduler=scheduler)
         last_path = os.path.join(args.out_dir, "last.pt")
-        save_checkpoint(last_path, model, optimizer, scaler, epoch=epoch+1, step=global_step)
+        save_checkpoint(last_path, model, optimizer, scaler, epoch=epoch+1, step=global_step, scheduler=scheduler)
 
 
 if __name__ == "__main__":
