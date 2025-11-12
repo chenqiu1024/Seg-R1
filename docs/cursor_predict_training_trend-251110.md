@@ -1,5 +1,5 @@
 # 估计训练损失和PCK收敛情况
-_Exported on 11/10/2025 at 21:36:56 PST from Cursor (2.0.69)_
+_Exported on 11/11/2025 at 22:23:07 PST from Cursor (2.0.69)_
 
 ---
 
@@ -43596,5 +43596,625 @@ python seg-rl/heatmap/train.py \
   --warmup_epochs 3 \
   --epochs 100 \
   # ... 其他参数保持不变
+```
+
+---
+
+**User**
+
+实际收敛结果并没有你预计的那么好：@bash (769-804) 
+
+---
+
+**Cursor**
+
+
+分析实际训练结果，重新评估收敛情况：
+
+
+
+分析实际训练结果，重新评估收敛情况：
+
+
+
+## 实际结果分析
+
+### 实际收敛情况（Epoch 45-50）
+
+| Epoch | Train Loss | Val PCK@20.0 | 趋势 |
+|-------|------------|--------------|------|
+| 45 | 1.2002 | 0.2829 | - |
+| 46 | 1.1856 | 0.2936 | ↑ |
+| 47 | 1.1837 | 0.2555 | ↓ |
+| 48 | 1.1708 | 0.2755 | ↑ |
+| 49 | 1.1620 | 0.2498 | ↓ |
+| 50 | 1.1468 | 0.2917 | ↑ |
+
+### 与预测的对比
+
+| 指标 | 我的预测 | 实际结果 | 偏差 |
+|------|---------|---------|------|
+| Loss | 1.10-1.15 | 1.1468 | 接近 |
+| PCK@20.0 | 0.42-0.48 | 0.2917 | 低约40% |
+
+## 问题诊断
+
+### 关键问题：未使用学习率调度器
+
+从训练配置看到：
+```json
+"lr_scheduler": "none",  // ❌ 没有使用学习率调度器
+"lr": 0.0001,            // 固定学习率，50个epoch都是1e-4
+```
+
+影响：
+1. 固定学习率在后期可能过大，导致震荡
+2. PCK@20.0 在 0.25-0.29 之间震荡，无明显提升
+3. Loss 虽下降，但 PCK 未同步提升，可能存在过拟合或优化不充分
+
+### 其他可能因素
+
+1. 模型容量：UNet-S 可能偏小
+2. Conv-LoRA 配置：rank=8 可能不足
+3. 数据质量：训练数据可能有限或标注不一致
+
+## 改进建议
+
+### 方案1：启用学习率调度器（推荐）
+
+```bash
+# 从当前checkpoint继续训练，启用warmup_cosine调度器
+python seg-rl/heatmap/train.py \
+  --resume outputs/braintumour/peft-conv_lora-251110a/model_epoch_50.pt \
+  --lr_scheduler warmup_cosine \
+  --warmup_epochs 3 \
+  --epochs 80 \
+  --lr 1e-4 \
+  --weight_decay 1e-4 \
+  # ... 其他参数保持不变
+```
+
+预期效果：
+- 学习率从 1e-4 逐步衰减，后期更精细优化
+- 可能提升 PCK@20.0 到 0.35-0.40
+
+### 方案2：降低学习率继续训练
+
+```bash
+# 使用更小的学习率进行精细调优
+python seg-rl/heatmap/train.py \
+  --resume outputs/braintumour/peft-conv_lora-251110a/model_epoch_50.pt \
+  --lr 5e-5 \
+  --epochs 70 \
+  # ... 其他参数保持不变
+```
+
+### 方案3：调整 Conv-LoRA 参数
+
+```bash
+# 增加rank，提升模型容量
+python seg-rl/heatmap/train.py \
+  --resume outputs/braintumour/peft-conv_lora-251110a/model_epoch_50.pt \
+  --sam_conv_lora_rank 16 \
+  --sam_conv_lora_alpha 32.0 \
+  --lr_scheduler warmup_cosine \
+  --warmup_epochs 3 \
+  --epochs 80 \
+  # ... 其他参数保持不变
+```
+
+注意：修改 Conv-LoRA 参数需要重新创建模型，不能直接 resume。
+
+### 方案4：使用更大的模型架构
+
+```bash
+# 尝试使用更大的backbone
+python seg-rl/heatmap/train.py \
+  --resume outputs/braintumour/peft-conv_lora-251110a/model_epoch_50.pt \
+  --arch unet_m \  # 或 unet_l
+  --lr_scheduler warmup_cosine \
+  --warmup_epochs 3 \
+  --epochs 80 \
+  # ... 其他参数保持不变
+```
+
+## 重新评估收敛预测
+
+基于实际结果：
+
+### 当前状态（Epoch 50）
+- Loss: 1.1468（接近收敛）
+- PCK@20.0: 0.2917（仍有提升空间）
+
+### 修正后的预测
+
+如果继续训练并启用学习率调度器：
+
+| 方案 | Epoch | Loss | PCK@20.0 |
+|------|-------|------|----------|
+| 当前（无调度器） | 50 | 1.15 | 0.29 |
+| 启用调度器继续训练 | 70-80 | 1.10-1.12 | 0.35-0.40 |
+| 降低学习率精细调优 | 70-80 | 1.08-1.10 | 0.33-0.38 |
+
+## 总结
+
+1. 预测偏差：PCK@20.0 预测偏高，主要因未考虑固定学习率的影响
+2. 主要问题：未使用学习率调度器，导致后期优化不充分
+3. 改进方向：启用学习率调度器，可能将 PCK@20.0 提升到 0.35-0.40
+4. 当前性能：Loss 已接近收敛，但 PCK 仍有提升空间
+
+建议优先尝试方案1（启用学习率调度器），这是最直接且可能有效的改进。
+
+```json
+"lr_scheduler": "none",  // ❌ 没有使用学习率调度器
+"lr": 0.0001,            // 固定学习率，50个epoch都是1e-4
+```
+
+```shellscript
+# 从当前checkpoint继续训练，启用warmup_cosine调度器
+python seg-rl/heatmap/train.py \
+  --resume outputs/braintumour/peft-conv_lora-251110a/model_epoch_50.pt \
+  --lr_scheduler warmup_cosine \
+  --warmup_epochs 3 \
+  --epochs 80 \
+  --lr 1e-4 \
+  --weight_decay 1e-4 \
+  # ... 其他参数保持不变
+```
+
+```shellscript
+# 使用更小的学习率进行精细调优
+python seg-rl/heatmap/train.py \
+  --resume outputs/braintumour/peft-conv_lora-251110a/model_epoch_50.pt \
+  --lr 5e-5 \
+  --epochs 70 \
+  # ... 其他参数保持不变
+```
+
+```shellscript
+# 增加rank，提升模型容量
+python seg-rl/heatmap/train.py \
+  --resume outputs/braintumour/peft-conv_lora-251110a/model_epoch_50.pt \
+  --sam_conv_lora_rank 16 \
+  --sam_conv_lora_alpha 32.0 \
+  --lr_scheduler warmup_cosine \
+  --warmup_epochs 3 \
+  --epochs 80 \
+  # ... 其他参数保持不变
+```
+
+```shellscript
+# 尝试使用更大的backbone
+python seg-rl/heatmap/train.py \
+  --resume outputs/braintumour/peft-conv_lora-251110a/model_epoch_50.pt \
+  --arch unet_m \  # 或 unet_l
+  --lr_scheduler warmup_cosine \
+  --warmup_epochs 3 \
+  --epochs 80 \
+  # ... 其他参数保持不变
+```
+
+---
+
+**User**
+
+我尝试了从50个epochs的基础上，启用学习率调度器继续训练到共80个epochs，训练参数如下：{
+  "jsonl": "outputs/braintumour/heuristic_251108.jsonl",
+  "sam_dir": "outputs/braintumour/sam_masks_heuristic",
+  "height": 512,
+  "width": 512,
+  "batch_size": 16,
+  "epochs": 80,
+  "save_every": 15,
+  "lr": 0.0001,
+  "weight_decay": 0.0001,
+  "grad_clip": 0.0,
+  "lr_scheduler": "warmup_cosine",
+  "warmup_epochs": 3,
+  "arch": "unet_s",
+  "loss": "kl",
+  "sigma": 8.0,
+  "tau": 1.0,
+  "label_loss_weight": 0.1,
+  "amp": true,
+  "workers": 8,
+  "out_dir": "outputs/braintumour/peft-conv_lora-251110a-scheduler",
+  "plots_dir": null,
+  "pretrained": false,
+  "resume": "outputs/braintumour/peft-conv_lora-251110a/model_epoch_50.pt",
+  "eval_thresholds": "5,10,15,20",
+  "val_ratio": 0.1,
+  "test_ratio": 0.0,
+  "seed": 42,
+  "vis_mode": "none",
+  "vis_count": 16,
+  "vis_dir": null,
+  "save_heatmaps": false,
+  "save_steps": 2000,
+  "progress": true,
+  "auto_resume": true,
+  "use_sam_encoder": true,
+  "sam_checkpoint": "third_party/sam2/checkpoints/sam2.1_hiera_large.pt",
+  "sam_peft_method": "conv_lora",
+  "sam_lora_enabled": false,
+  "sam_lora_rank": 8,
+  "sam_lora_alpha": 16.0,
+  "sam_lora_dropout": 0.0,
+  "sam_lora_lr": null,
+  "sam_conv_lora_rank": 8,
+  "sam_conv_lora_alpha": 16.0,
+  "sam_conv_lora_kernel_size": 3,
+  "sam_conv_lora_dropout": 0.0,
+  "sam_conv_lora_blocks": null,
+  "command": "/root/autodl-tmp/works/Seg-R0/seg-rl/heatmap/train.py --jsonl outputs/braintumour/heuristic_251108.jsonl --sam_dir outputs/braintumour/sam_masks_heuristic --height 512 --width 512 --arch unet_s --loss kl --sigma 8.0 --tau 1.0 --batch_size 16 --epochs 50 --amp --lr 1e-4 --weight_decay 1e-4 --use_sam_encoder --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt --sam_peft_method conv_lora --sam_conv_lora_rank 8 --sam_conv_lora_alpha 16.0 --sam_conv_lora_kernel_size 3 --out_dir outputs/braintumour/peft-conv_lora-251110a-scheduler --save_every 15 --save_steps 2000 --progress --auto_resume --resume outputs/braintumour/peft-conv_lora-251110a/model_epoch_50.pt --lr_scheduler warmup_cosine --warmup_epochs 3 --epochs 80",
+  "timestamp": "2025-11-11T23:46:00.072675"
+} 然后用训练到75个epochs时的模型做推理，推理脚本的参数如下：{
+  "model_path": "outputs/braintumour/peft-conv_lora-251110a-scheduler/model_epoch_75.pt",
+  "images_dir": "datasets/seg_r1_md/Task01_BrainTumour/canonical/images",
+  "masks_dir": "datasets/seg_r1_md/Task01_BrainTumour/canonical/masks",
+  "output_jsonl": "outputs/braintumour/pred_supervised-convlora-epoch75-251110.jsonl",
+  "sam_masks_dir": "outputs/braintumour/pred_supervised-convlora-epoch75-251110",
+  "sam_checkpoint": "third_party/sam2/checkpoints/sam2.1_hiera_large.pt",
+  "num_points": 17,
+  "device": "cuda",
+  "resize": [
+    512,
+    512
+  ],
+  "skip_existing": false,
+  "height": 512,
+  "width": 512,
+  "tau": 1.0,
+  "amp": false,
+  "predict_script": "seg-rl/heatmap/predict_next_point_from_model.py",
+  "sam_segment_script": "seg-rl/sam2_segment_from_points.py",
+  "command": "seg-rl/heatmap/predict_point_sequence_with_sam.py --model_path outputs/braintumour/peft-conv_lora-251110a-scheduler/model_epoch_75.pt --images_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/images --masks_dir datasets/seg_r1_md/Task01_BrainTumour/canonical/masks --output_jsonl outputs/braintumour/pred_supervised-convlora-epoch75-251110.jsonl --sam_masks_dir outputs/braintumour/pred_supervised-convlora-epoch75-251110 --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt --device cuda --resize 512 512 --num_points 17 --height 512 --width 512",
+  "timestamp": "2025-11-12T11:23:38.486117"
+}。发现实际的效果并没有明显提升：@python (244-266) ，仍然是不如没有用PEFT微调SAM时的效果好：============================================================
+Average Metrics by Number of Prompts:
+============================================================
+Num Prompts  DICE     IOU      PRECISION  RECALL   F1       S_MEASURE 
+----------------------------------------------------------------------
+1            0.4973   0.3857   0.7139     0.6515   0.4973   0.7055    
+2            0.5233   0.4226   0.5641     0.8228   0.5233   0.7479    
+3            0.5903   0.4859   0.6571     0.7890   0.5903   0.7860    
+4            0.6497   0.5446   0.7400     0.7552   0.6497   0.8153    
+5            0.6813   0.5748   0.7735     0.7423   0.6813   0.8352    
+6            0.6916   0.5845   0.7905     0.7248   0.6916   0.8464    
+7            0.6868   0.5787   0.7917     0.7171   0.6868   0.8367    
+8            0.6861   0.5785   0.7939     0.7158   0.6861   0.8344    
+9            0.6891   0.5799   0.8041     0.7012   0.6891   0.8343    
+10           0.6914   0.5806   0.8096     0.6998   0.6914   0.8358    
+11           0.6983   0.5869   0.8222     0.6877   0.6983   0.8384    
+12           0.7015   0.5884   0.8239     0.6854   0.7015   0.8392    
+13           0.6964   0.5826   0.8261     0.6745   0.6964   0.8379    
+14           0.6961   0.5816   0.8282     0.6674   0.6961   0.8367    
+15           0.6967   0.5813   0.8321     0.6610   0.6967   0.8333    
+16           0.6937   0.5775   0.8324     0.6601   0.6937   0.8322    
+17           0.6880   0.5715   0.8287     0.6570   0.6880   0.8289    
+============================================================ 请分析可能哪里有问题，需要做出什么调整？
+
+---
+
+**Cursor**
+
+分析两组实验结果，发现Conv-LoRA微调SAM的效果确实不如冻结SAM的基线方法。让我深入分析问题：
+
+## 关键发现
+
+### 性能对比
+
+| 点数 | Conv-LoRA (Epoch 75) | 冻结SAM (基线) | 差异 |
+|------|---------------------|---------------|------|
+| 1 | 0.4989 | 0.4973 | +0.16% |
+| 5 | 0.6658 | 0.6813 | -2.3% |
+| 10 | 0.6566 | 0.6914 | -5.0% |
+| 17 | **0.6578** | **0.6880** | **-4.4%** ❌ |
+
+**结论**：Conv-LoRA微调SAM不仅没有提升性能，反而在多点场景下性能下降约4-5%。
+
+## 问题诊断
+
+### 1. 学习率调度器问题 ⚠️
+
+从训练参数看到：
+```json
+"lr_scheduler": "warmup_cosine",
+"warmup_epochs": 3,
+"epochs": 80,
+"resume": "model_epoch_50.pt"
+```
+
+**严重问题**：调度器从epoch 50恢复训练，但调度器的`T_max=80`，warmup在前3个epoch已完成。这导致：
+
+1. Epoch 50时，调度器认为是第50/80个epoch，学习率已经衰减到很低
+2. Cosine调度计算：`lr = 0.5 * base_lr * (1 + cos(π * 50/80)) ≈ 0.023 * base_lr`
+3. 实际学习率可能只有 `2.3e-6`，远低于需要的值
+
+验证方法：
+```bash
+# 查看训练日志中的实际学习率
+grep "lr=" training_log.txt | tail -20
+```
+
+### 2. Conv-LoRA配置可能不当
+
+```json
+"sam_conv_lora_rank": 8,
+"sam_conv_lora_alpha": 16.0,
+"sam_conv_lora_kernel_size": 3,
+"sam_conv_lora_blocks": null  // 默认只微调最后一个block
+```
+
+**问题**：
+- rank=8 可能太小，限制了表达能力
+- 只微调最后一个block可能不够
+- Conv-LoRA的卷积操作可能引入了不必要的归纳偏置
+
+### 3. 训练数据不足
+
+BrainTumour数据集可能不够大，无法有效微调SAM这样的大模型，导致：
+- 过拟合到训练集
+- 破坏了SAM的预训练知识
+- 泛化能力下降
+
+### 4. 点预测网络与SAM的训练冲突
+
+同时训练点预测网络和SAM可能导致：
+- 梯度不平衡
+- SAM特征质量下降，影响点预测
+- 训练不稳定
+
+## 解决方案
+
+### 方案1：修正学习率调度器 ⭐（推荐优先尝试）
+
+**问题根源**：从epoch 50继续训练时，调度器状态不正确。
+
+**解决方法**：
+
+#### 选项A：重新训练（从头启用调度器）
+
+```bash
+# 从头开始训练，正确使用warmup_cosine
+python seg-rl/heatmap/train.py \
+  --jsonl outputs/braintumour/heuristic_251108.jsonl \
+  --sam_dir outputs/braintumour/sam_masks_heuristic \
+  --height 512 --width 512 \
+  --arch unet_s --loss kl --sigma 8.0 --tau 1.0 \
+  --batch_size 16 --epochs 80 \
+  --amp --lr 1e-4 --weight_decay 1e-4 \
+  --use_sam_encoder \
+  --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
+  --sam_peft_method conv_lora \
+  --sam_conv_lora_rank 16 \
+  --sam_conv_lora_alpha 32.0 \
+  --sam_conv_lora_kernel_size 3 \
+  --lr_scheduler warmup_cosine \
+  --warmup_epochs 5 \
+  --out_dir outputs/braintumour/peft-conv_lora-251111-fixed \
+  --save_every 10 --save_steps 500 --progress
+```
+
+关键改进：
+- 从头训练，调度器从epoch 0开始
+- rank增加到16，alpha增加到32.0
+- warmup_epochs增加到5
+
+#### 选项B：使用固定的较小学习率继续训练
+
+```bash
+# 不使用调度器，用较小的固定学习率继续优化
+python seg-rl/heatmap/train.py \
+  --resume outputs/braintumour/peft-conv_lora-251110a/model_epoch_50.pt \
+  --lr 3e-5 \  # 更小的学习率
+  --epochs 100 \
+  --lr_scheduler none \  # 不使用调度器
+  # ... 其他参数保持不变
+```
+
+### 方案2：放弃Conv-LoRA，使用Late LoRA
+
+Late LoRA更简单，可能更稳定：
+
+```bash
+python seg-rl/heatmap/train.py \
+  --jsonl outputs/braintumour/heuristic_251108.jsonl \
+  --sam_dir outputs/braintumour/sam_masks_heuristic \
+  --height 512 --width 512 \
+  --arch unet_s --loss kl --sigma 8.0 --tau 1.0 \
+  --batch_size 16 --epochs 80 \
+  --amp --lr 1e-4 --weight_decay 1e-4 \
+  --use_sam_encoder \
+  --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
+  --sam_peft_method late_lora \
+  --sam_lora_rank 16 \
+  --sam_lora_alpha 32.0 \
+  --lr_scheduler warmup_cosine \
+  --warmup_epochs 5 \
+  --out_dir outputs/braintumour/peft-late_lora-251111 \
+  --save_every 10 --save_steps 500 --progress
+```
+
+### 方案3：冻结SAM + 更大的点预测网络 ⭐（最保险）
+
+既然冻结SAM效果更好，那就增强点预测网络：
+
+```bash
+python seg-rl/heatmap/train.py \
+  --jsonl outputs/braintumour/heuristic_251108.jsonl \
+  --sam_dir outputs/braintumour/sam_masks_heuristic \
+  --height 512 --width 512 \
+  --arch unet_m \  # 使用更大的backbone
+  --loss kl --sigma 8.0 --tau 1.0 \
+  --batch_size 16 --epochs 80 \
+  --amp --lr 1e-4 --weight_decay 1e-4 \
+  --use_sam_encoder \
+  --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
+  --sam_peft_method none \  # 冻结SAM，不使用PEFT
+  --lr_scheduler warmup_cosine \
+  --warmup_epochs 5 \
+  --out_dir outputs/braintumour/frozen_sam_unet_m-251111 \
+  --save_every 10 --save_steps 500 --progress
+```
+
+### 方案4：调整Conv-LoRA超参数
+
+```bash
+python seg-rl/heatmap/train.py \
+  --jsonl outputs/braintumour/heuristic_251108.jsonl \
+  --sam_dir outputs/braintumour/sam_masks_heuristic \
+  --height 512 --width 512 \
+  --arch unet_s --loss kl --sigma 8.0 --tau 1.0 \
+  --batch_size 16 --epochs 80 \
+  --amp --lr 5e-5 --weight_decay 1e-4 \  # 更小的学习率
+  --use_sam_encoder \
+  --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
+  --sam_peft_method conv_lora \
+  --sam_conv_lora_rank 32 \  # 更大的rank
+  --sam_conv_lora_alpha 64.0 \  # 更大的alpha
+  --sam_conv_lora_kernel_size 3 \
+  --sam_conv_lora_blocks "-1,-2,-3" \  # 微调最后3个blocks
+  --sam_lora_lr 1e-5 \  # SAM的独立学习率
+  --lr_scheduler warmup_cosine \
+  --warmup_epochs 5 \
+  --out_dir outputs/braintumour/peft-conv_lora-v2-251111 \
+  --save_every 10 --save_steps 500 --progress
+```
+
+## 深层分析
+
+### 为什么Conv-LoRA可能失败？
+
+1. **预训练知识破坏**：SAM在大规模数据上预训练，微调可能破坏了这些知识
+2. **数据分布不匹配**：BrainTumour数据与SAM预训练数据分布差异大
+3. **过拟合**：Conv-LoRA参数虽少，但数据集小，仍可能过拟合
+4. **训练策略不当**：同时训练点预测网络和SAM，梯度可能冲突
+
+### 建议的实验顺序
+
+1. **首选**：方案3（冻结SAM + 更大点预测网络）- 最保险
+2. **备选**：方案1选项A（修正学习率，增大rank）- 给Conv-LoRA一次正确的机会
+3. **尝试**：方案2（Late LoRA）- 更简单的PEFT方法
+4. **高级**：方案4（调整超参数）- 如果前面方案都不满意
+
+## 总结
+
+主要问题是：
+1. ⚠️ **学习率调度器状态错误**：从epoch 50恢复但调度器参数为T_max=80，导致学习率过低
+2. Conv-LoRA配置可能不够优化（rank太小）
+3. 数据集规模可能不足以有效微调SAM
+
+**最保险的做法**：放弃微调SAM，专注于增强点预测网络（方案3）。
+
+如果坚持使用PEFT，建议从头重新训练，正确使用学习率调度器（方案1选项A）。
+
+```json
+"lr_scheduler": "warmup_cosine",
+"warmup_epochs": 3,
+"epochs": 80,
+"resume": "model_epoch_50.pt"
+```
+
+```shellscript
+# 查看训练日志中的实际学习率
+grep "lr=" training_log.txt | tail -20
+```
+
+```json
+"sam_conv_lora_rank": 8,
+"sam_conv_lora_alpha": 16.0,
+"sam_conv_lora_kernel_size": 3,
+"sam_conv_lora_blocks": null  // 默认只微调最后一个block
+```
+
+```shellscript
+# 从头开始训练，正确使用warmup_cosine
+python seg-rl/heatmap/train.py \
+  --jsonl outputs/braintumour/heuristic_251108.jsonl \
+  --sam_dir outputs/braintumour/sam_masks_heuristic \
+  --height 512 --width 512 \
+  --arch unet_s --loss kl --sigma 8.0 --tau 1.0 \
+  --batch_size 16 --epochs 80 \
+  --amp --lr 1e-4 --weight_decay 1e-4 \
+  --use_sam_encoder \
+  --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
+  --sam_peft_method conv_lora \
+  --sam_conv_lora_rank 16 \
+  --sam_conv_lora_alpha 32.0 \
+  --sam_conv_lora_kernel_size 3 \
+  --lr_scheduler warmup_cosine \
+  --warmup_epochs 5 \
+  --out_dir outputs/braintumour/peft-conv_lora-251111-fixed \
+  --save_every 10 --save_steps 500 --progress
+```
+
+```shellscript
+# 不使用调度器，用较小的固定学习率继续优化
+python seg-rl/heatmap/train.py \
+  --resume outputs/braintumour/peft-conv_lora-251110a/model_epoch_50.pt \
+  --lr 3e-5 \  # 更小的学习率
+  --epochs 100 \
+  --lr_scheduler none \  # 不使用调度器
+  # ... 其他参数保持不变
+```
+
+```shellscript
+python seg-rl/heatmap/train.py \
+  --jsonl outputs/braintumour/heuristic_251108.jsonl \
+  --sam_dir outputs/braintumour/sam_masks_heuristic \
+  --height 512 --width 512 \
+  --arch unet_s --loss kl --sigma 8.0 --tau 1.0 \
+  --batch_size 16 --epochs 80 \
+  --amp --lr 1e-4 --weight_decay 1e-4 \
+  --use_sam_encoder \
+  --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
+  --sam_peft_method late_lora \
+  --sam_lora_rank 16 \
+  --sam_lora_alpha 32.0 \
+  --lr_scheduler warmup_cosine \
+  --warmup_epochs 5 \
+  --out_dir outputs/braintumour/peft-late_lora-251111 \
+  --save_every 10 --save_steps 500 --progress
+```
+
+```shellscript
+python seg-rl/heatmap/train.py \
+  --jsonl outputs/braintumour/heuristic_251108.jsonl \
+  --sam_dir outputs/braintumour/sam_masks_heuristic \
+  --height 512 --width 512 \
+  --arch unet_m \  # 使用更大的backbone
+  --loss kl --sigma 8.0 --tau 1.0 \
+  --batch_size 16 --epochs 80 \
+  --amp --lr 1e-4 --weight_decay 1e-4 \
+  --use_sam_encoder \
+  --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
+  --sam_peft_method none \  # 冻结SAM，不使用PEFT
+  --lr_scheduler warmup_cosine \
+  --warmup_epochs 5 \
+  --out_dir outputs/braintumour/frozen_sam_unet_m-251111 \
+  --save_every 10 --save_steps 500 --progress
+```
+
+```shellscript
+python seg-rl/heatmap/train.py \
+  --jsonl outputs/braintumour/heuristic_251108.jsonl \
+  --sam_dir outputs/braintumour/sam_masks_heuristic \
+  --height 512 --width 512 \
+  --arch unet_s --loss kl --sigma 8.0 --tau 1.0 \
+  --batch_size 16 --epochs 80 \
+  --amp --lr 5e-5 --weight_decay 1e-4 \  # 更小的学习率
+  --use_sam_encoder \
+  --sam_checkpoint third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
+  --sam_peft_method conv_lora \
+  --sam_conv_lora_rank 32 \  # 更大的rank
+  --sam_conv_lora_alpha 64.0 \  # 更大的alpha
+  --sam_conv_lora_kernel_size 3 \
+  --sam_conv_lora_blocks "-1,-2,-3" \  # 微调最后3个blocks
+  --sam_lora_lr 1e-5 \  # SAM的独立学习率
+  --lr_scheduler warmup_cosine \
+  --warmup_epochs 5 \
+  --out_dir outputs/braintumour/peft-conv_lora-v2-251111 \
+  --save_every 10 --save_steps 500 --progress
 ```
 
