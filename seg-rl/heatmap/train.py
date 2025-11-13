@@ -108,7 +108,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--loss", type=str, choices=["ce", "kl", "mse"], default="kl")
     p.add_argument("--sigma", type=float, default=3.0, help="Gaussian sigma for KL/MSE targets")
     p.add_argument("--tau", type=float, default=1.0, help="Temperature for KL/model softmax")
-    p.add_argument("--label_loss_weight", type=float, default=0.1, help="Weight for label CE in total loss (recommended: 0.1~0.3)")
+    p.add_argument("--label_loss_weight", type=float, default=0.1, help="Weight for label CE in total loss (recommended: 0.5~1.0 for balanced learning)")
+    p.add_argument("--use_label_class_weights", action="store_true", help="Use class weights for label CE to handle imbalance")
     p.add_argument("--amp", action="store_true")
     p.add_argument("--workers", type=int, default=8)
     p.add_argument("--out_dir", type=str, default="./outputs/seg_rl")
@@ -207,6 +208,23 @@ def main() -> None:
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.workers, pin_memory=True, collate_fn=collate_fn)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True, collate_fn=collate_fn) if val_ds is not None else None
     test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True, collate_fn=collate_fn) if test_ds is not None else None
+
+    # 计算类别权重（如果启用）
+    label_class_weights = None
+    if args.use_label_class_weights:
+        print("\n[Label Weights] Using class weights to handle label imbalance")
+        # 基于经验值：背景56%, 前景44%
+        # 权重反比于频率：背景权重小，前景权重大
+        # weight_i = total / (n_classes * count_i)
+        # 简化计算：background=0.56, foreground=0.44
+        # weight = [1/0.56, 1/0.44] = [1.79, 2.27]，归一化后：
+        weight_0 = 0.44  # 背景少一些权重
+        weight_1 = 0.56  # 前景多一些权重
+        label_class_weights = torch.tensor([weight_0, weight_1]).to(device)
+        
+        print(f"[Label Weights] Class weights: background={weight_0:.2f}, foreground={weight_1:.2f}")
+        print(f"[Label Weights] This gives ~27% more weight to foreground samples")
+        print()
 
     # 创建模型配置
     if args.use_sam_encoder:
@@ -535,7 +553,17 @@ def main() -> None:
                     loss_hm = kl_to_gaussian_targets(logits, tgt, sigma=args.sigma, tau=args.tau)
                 else:
                     loss_hm = mse_to_gaussian_targets(logits, tgt, sigma=args.sigma)
-                loss_label = nn.CrossEntropyLoss()(label_logits, batch["target_label"].to(device))
+                
+                # 标签损失（可选使用类别权重）
+                if label_class_weights is not None:
+                    loss_label = nn.CrossEntropyLoss(weight=label_class_weights)(
+                        label_logits, batch["target_label"].to(device)
+                    )
+                else:
+                    loss_label = nn.CrossEntropyLoss()(
+                        label_logits, batch["target_label"].to(device)
+                    )
+                
                 loss = loss_hm + float(args.label_loss_weight) * loss_label
             scaler.scale(loss).backward()
             if args.grad_clip > 0:
@@ -550,10 +578,12 @@ def main() -> None:
             # Periodic checkpoint
             if args.save_steps > 0 and (global_step % args.save_steps == 0):
                 save_path = os.path.join(args.out_dir, f"step_{global_step}.pt")
-                save_checkpoint(save_path, model, optimizer, scaler, epoch=epoch + 1, step=global_step, scheduler=scheduler)
+                save_checkpoint(save_path, model, optimizer, scaler, epoch=epoch + 1, step=global_step, scheduler=scheduler, 
+                              config_args=vars(args))
                 # also update last.pt symlink-like copy
                 last_path = os.path.join(args.out_dir, "last.pt")
-                save_checkpoint(last_path, model, optimizer, scaler, epoch=epoch + 1, step=global_step, scheduler=scheduler)
+                save_checkpoint(last_path, model, optimizer, scaler, epoch=epoch + 1, step=global_step, scheduler=scheduler,
+                              config_args=vars(args))
 
             # Progress output
             if _tqdm is not None:
@@ -591,9 +621,11 @@ def main() -> None:
         # Save epoch checkpoint and update last.pt
         if ((epoch + 1) % max(1, args.save_every)) == 0:
             save_path = os.path.join(args.out_dir, f"model_epoch_{epoch+1}.pt")
-            save_checkpoint(save_path, model, optimizer, scaler, epoch=epoch+1, step=global_step, scheduler=scheduler)
+            save_checkpoint(save_path, model, optimizer, scaler, epoch=epoch+1, step=global_step, scheduler=scheduler,
+                          config_args=vars(args))
         last_path = os.path.join(args.out_dir, "last.pt")
-        save_checkpoint(last_path, model, optimizer, scaler, epoch=epoch+1, step=global_step, scheduler=scheduler)
+        save_checkpoint(last_path, model, optimizer, scaler, epoch=epoch+1, step=global_step, scheduler=scheduler,
+                      config_args=vars(args))
 
 
 if __name__ == "__main__":

@@ -1148,15 +1148,23 @@ python -m seg-rl.heatmap.train \
    - ✅ 推荐值: 1.0
    - 范围: 0.5-2.0（更小值需要谨慎）
 
-2. **SAM checkpoint**:
+2. **label_loss_weight 参数** 🔴（v2.1.1 重要更新）:
+   - ❌ **不要使用 `--label_loss_weight 0.1`**（会导致标签预测完全失效）
+   - ✅ 推荐值: **1.0**（或配合 `--use_label_class_weights` 使用0.5）
+   - 原因: 权重太小会让模型忽略标签学习
+   - 详见: `LABEL_PREDICTION_FIX.md`
+
+3. **输入尺寸一致性** 🔴（v2.1.1 重要更新）:
+   - ❌ **推理时不要使用 `--height 0 --width 0`**（会导致标签预测错误）
+   - ✅ **必须与训练时一致**（通常是 `--height 512 --width 512`）
+   - 原因: 尺寸不匹配导致BatchNorm和特征异常
+   - 详见: `INPUT_SIZE_MISMATCH_FIX.md`
+
+4. **SAM checkpoint**:
    - 使用 SAM encoder 时**必须提供** `--sam_checkpoint`
    - 训练和推理都需要
 
-3. **图像尺寸**:
-   - 训练和推理应使用**相同尺寸**
-   - SAM 内部使用 1024x1024（自动处理）
-
-4. **Checkpoint 兼容性**:
+5. **Checkpoint 兼容性**:
    - SAM 模型推理需要 SAM checkpoint
    - 自动检测，但需提供正确路径
 
@@ -1552,6 +1560,28 @@ seg-rl/heatmap/
 ---
 
 ## 版本历史
+
+### v2.1.1 (2025-11-13) - Critical Bugfix 🔴
+
+**修复的严重问题**:
+1. ✅ **标签预测完全失效**
+   - 根因：`label_loss_weight=0.1` 太小
+   - 症状：100%标签预测错误
+   - 修复：增大label_loss_weight + 类别加权
+2. ✅ **输入尺寸不匹配检测**
+   - 添加自动检查和警告
+   - Checkpoint保存训练配置
+
+**代码改进**:
+1. ✅ 添加 `--use_label_class_weights` 参数
+2. ✅ 类别加权CrossEntropyLoss
+3. ✅ 输入尺寸自动检查
+4. ✅ Checkpoint包含height/width
+
+**详细文档**:
+- `LABEL_PREDICTION_FIX.md` - 问题详细分析
+- `CRITICAL_FIXES_v2.1.1.md` - 修复说明
+- `train_conv_lora_fixed.sh` - 修复后的训练脚本
 
 ### v2.1 (2025-11-09 下午) - Conv-LoRA Update 🆕
 

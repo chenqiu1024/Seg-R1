@@ -152,8 +152,17 @@ def _device_and_amp(args: argparse.Namespace) -> Tuple[torch.device, bool, str]:
     return device, amp_enabled, autocast_device_type
 
 
-def _load_model(model_path: str, device: torch.device, sam_checkpoint: Optional[str] = None) -> PointHeatmapModel:
-    """Load model with automatic type detection from checkpoint metadata"""
+def _load_model(model_path: str, device: torch.device, sam_checkpoint: Optional[str] = None, 
+                 inference_height: int = 0, inference_width: int = 0) -> PointHeatmapModel:
+    """Load model with automatic type detection from checkpoint metadata
+    
+    Args:
+        model_path: Path to model checkpoint
+        device: Device to load model on
+        sam_checkpoint: Path to SAM checkpoint (if using SAM encoder)
+        inference_height: Inference height (0 = native size)
+        inference_width: Inference width (0 = native size)
+    """
     if not model_path or not os.path.isfile(model_path):
         # No checkpoint, return default model
         cfg = ModelConfig(backbone="unet_s", pretrained=False, main_in_channels=3, cond_in_channels=1)
@@ -172,6 +181,31 @@ def _load_model(model_path: str, device: torch.device, sam_checkpoint: Optional[
         peft_method = "late_lora"
     
     print(f"[Load Model] Checkpoint type: use_sam_encoder={use_sam_encoder}, peft_method={peft_method or 'None'}")
+    
+    # 警告：使用SAM encoder时尺寸不匹配可能导致错误预测
+    if use_sam_encoder:
+        # 从训练参数获取训练时的尺寸
+        train_h = metadata.get("height", 512)
+        train_w = metadata.get("width", 512)
+        
+        if (inference_height == 0 or inference_width == 0) or \
+           (inference_height != train_h or inference_width != train_w):
+            print(f"\n{'='*60}")
+            print("⚠️  WARNING: Input size mismatch detected!")
+            print(f"{'='*60}")
+            print(f"Training size: {train_h}×{train_w}")
+            print(f"Inference size: {inference_height}×{inference_width} (0=native)")
+            print()
+            print("Using different sizes may cause:")
+            print("  - Incorrect label prediction (foreground/background)")
+            print("  - Suboptimal point localization")
+            print("  - BatchNorm statistics mismatch")
+            print()
+            print("STRONGLY RECOMMENDED: Use --height and --width matching training!")
+            print(f"  --height {train_h} --width {train_w}")
+            print(f"{'='*60}\n")
+        else:
+            print(f"[Load Model] ✓ Input size matches training: {train_h}×{train_w}")
     
     if use_sam_encoder:
         # SAM-based model
@@ -279,8 +313,8 @@ def run_initial(args: argparse.Namespace) -> None:
     if not args.masks_dir:
         raise RuntimeError("--masks_dir is required for initial mode to fill 'gt_mask' field")
     device, amp_enabled, autocast_device_type = _device_and_amp(args)
-    model = _load_model(args.model_path, device, args.sam_checkpoint)
     H, W = int(args.height), int(args.width)
+    model = _load_model(args.model_path, device, args.sam_checkpoint, inference_height=H, inference_width=W)
 
     records: List[Dict] = []
     images = _list_images(args.images_dir)
@@ -336,8 +370,8 @@ def run_append(args: argparse.Namespace) -> None:
     if not isinstance(arr, list):
         raise RuntimeError("Append target must be a JSON array")
     device, amp_enabled, autocast_device_type = _device_and_amp(args)
-    model = _load_model(args.model_path, device, args.sam_checkpoint)
     H, W = int(args.height), int(args.width)
+    model = _load_model(args.model_path, device, args.sam_checkpoint, inference_height=H, inference_width=W)
 
     updated = 0
     # progress bar

@@ -30,6 +30,7 @@ def save_checkpoint(
     step: int,
     scheduler: torch.optim.lr_scheduler._LRScheduler | None = None,
     metadata: Dict | None = None,
+    config_args: Dict | None = None,
 ) -> None:
     """保存 checkpoint，包含模型元数据
     
@@ -42,6 +43,7 @@ def save_checkpoint(
         step: 当前步数
         scheduler: 学习率调度器（可选）
         metadata: 模型元数据，如 {"use_sam_encoder": True, "sam_lora_enabled": True, ...}
+        config_args: 训练配置参数（可选，用于保存height/width等关键参数）
     """
     os.makedirs(os.path.dirname(path), exist_ok=True)
     
@@ -64,6 +66,12 @@ def save_checkpoint(
             metadata["use_sam_encoder"] = False
             metadata["sam_lora_enabled"] = False
             metadata["sam_peft_method"] = None
+    
+    # 添加关键训练配置到metadata（用于推理时检查）
+    if config_args is not None:
+        metadata["height"] = config_args.get("height")
+        metadata["width"] = config_args.get("width")
+        metadata["arch"] = config_args.get("arch")
     
     torch.save({
         "model": model.state_dict(),
